@@ -9,8 +9,9 @@
 
 {-# LANGUAGE FlexibleInstances #-}
 module Theory.Text.Parser.Token (
+    lexeme
   -- * Symbols
-    symbol
+  , symbol
   , symbol_
   , dot
   , comma
@@ -167,6 +168,9 @@ parseString srcDesc parser =
 -- Token parsers
 ----------------
 
+lexeme :: ParsecT String MaudeSig Identity a -> ParsecT String MaudeSig Identity a
+lexeme = T.lexeme spthy
+
 -- | Parse a symbol.
 symbol :: String -> Parser String
 symbol sym = try (T.symbol spthy sym) <?> ("\"" ++ sym ++ "\"")
@@ -229,15 +233,15 @@ naturalSubscript = T.lexeme spthy $ do
     subscriptDigitToInteger d = toInteger $ fromEnum d - fromEnum '₀'
 
 
--- | A comma separated list of elements.
+-- | A comma separated list of elements, optionally ended with a comma.
 commaSep :: Parser a -> Parser [a]
-commaSep = T.commaSep spthy
+commaSep = flip sepEndBy comma
 
--- | A comma separated non-empty list of elements.
+-- | A comma separated non-empty list of elements, optionally ended with a comma.
 commaSep1 :: Parser a -> Parser [a]
-commaSep1 = T.commaSep1 spthy
+commaSep1 = flip sepEndBy1 comma
 
--- | Parse a list of items '[' item ',' ... ',' item ']'
+-- | Parse a list of items '[' item ',' ... ',' item ']', or ended with ',]'
 list :: Parser a -> Parser [a]
 list = brackets . commaSep
 
