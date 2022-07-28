@@ -9,6 +9,9 @@
 module Accountability.Generation (
         generateAccountabilityLemmas
       , checkWellformedness
+      , termIsFreeVar
+      , formulaActionFacts
+      , formulaActionTempVars
 ) where
 
 import           Control.Monad.Catch         (MonadThrow)
@@ -106,6 +109,14 @@ formulaActionFacts = foldFormula fAto (const []) id (\_ p q -> p ++ q) (\_ _ p -
     where
         fAto a = case a of
             Action _ f1 -> [f1]
+            _ -> []
+
+-- | Get the actions in a formula and then extract the temporal variables of its facts.
+formulaActionTempVars :: ProtoFormula syn s c v -> [VTerm c (BVar v)]
+formulaActionTempVars = foldFormula fAto (const []) id (\_ p q -> p ++ q) (\_ _ p -> p)
+    where
+        fAto a = case a of
+            Action t _ -> [t]
             _ -> []
 
 -- | Get the facts in the case tests of a theory.
