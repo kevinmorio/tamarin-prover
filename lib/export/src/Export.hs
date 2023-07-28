@@ -93,11 +93,12 @@ translationWarning s cont = unsafePerformIO printWarning
 -- Core Proverif Export
 ------------------------------------------------------------------------------
 
-proverifTemplate :: Document d => [d] -> [d] -> d -> [d] -> [d] -> [d] -> d
-proverifTemplate headers queries process macroproc ruleproc lemmas =
+proverifTemplate :: Document d => [d] -> [d] -> d -> [d] -> [d] -> [d] -> [d] -> d
+proverifTemplate headers queries process macroproc ruleproc lemmas restrictions =
   vcat headers
     $$ vcat queries
     $$ vcat lemmas
+    $$ vcat restrictions
     $$ vcat macroproc
     $$ vcat ruleproc
     $$ text "process"
@@ -108,7 +109,7 @@ prettyProVerifTheory lemSel (thy, typEnv) = do
   headers <- loadHeaders tc thy typEnv
   headers2 <- checkDuplicates $ (S.toList . filterHeaders $ baseHeaders `S.union` headers `S.union` prochd `S.union` macroprochd) ++ S.toList (filterHeaders ruleHeaders)
   let hd = attribHeaders tc headers2
-  return $ proverifTemplate hd queries proc' macroproc ruleproc lemmas
+  return $ proverifTemplate hd queries proc' macroproc ruleproc lemmas restrictions
   where
     tc = emptyTC {predicates = theoryPredicates thy}
     (proc, prochd, hasBoundState, hasUnboundState) = loadProc tc thy
@@ -126,6 +127,7 @@ prettyProVerifTheory lemSel (thy, typEnv) = do
     baseHeaders = if hasUnboundState then stateHeaders else S.empty
     queries = loadQueries thy
     lemmas = loadLemmas lemSel tc typEnv thy
+    restrictions = loadRestrictions typEnv thy
     (macroproc, macroprochd) =
       -- if stateM is not empty, we have inlined the process calls, so we don't reoutput them
       if hasBoundState then ([text ""], S.empty) else loadMacroProc tc thy
@@ -937,12 +939,12 @@ isPropFormula (Not (Ato (EqE _ _))) = True
 isPropFormula (Not _) = True
 isPropFormula (Conn _ p q) = isPropFormula p && isPropFormula q
 
-ppQueryFormula :: (MonadFresh m, Functor s) => TypingEnvironment -> ProtoFormula s (String, LSort) Name LVar -> [LVar] -> m Doc
-ppQueryFormula te fm extravs = do
+ppFormula :: (MonadFresh m, Functor s) => String -> TypingEnvironment -> ProtoFormula s (String, LSort) Name LVar -> [LVar] -> m Doc
+ppFormula ty te fm extravs = do
   (vs, (p, typeVars)) <- ppLFormula te ppNAtom fm
   return $
     sep
-      [ text "query " <> fsep (punctuate comma (map (ppTimeTypeVar typeVars) (S.toList . S.fromList $ extravs ++ vs))) <> text ";",
+      [ text ty <> text " " <> fsep (punctuate comma (map (ppTimeTypeVar typeVars) (S.toList . S.fromList $ extravs ++ vs))) <> text ";",
         nest 1 p,
         text "."
       ]
@@ -954,12 +956,12 @@ ppTimeTypeVar te lvar =
     Nothing -> ppLVar lvar <> text ":bitstring"
     Just t -> ppLVar lvar <> text ":" <> text (ppType t)
 
-ppQueryFormulaEx :: TypingEnvironment -> LNFormula -> [LVar] -> Doc
-ppQueryFormulaEx te fm vs =
-  Precise.evalFresh (ppQueryFormula te fm vs) (avoidPrecise fm)
+ppFormulaEx :: String -> TypingEnvironment -> LNFormula -> [LVar] -> Doc
+ppFormulaEx ty te fm vs =
+  Precise.evalFresh (ppFormula ty te fm vs) (avoidPrecise fm)
 
-ppRestrictFormula :: TypingEnvironment -> ProtoFormula Unit2 (String, LSort) Name LVar -> Precise.FreshT Data.Functor.Identity.Identity Doc
-ppRestrictFormula te =
+ppRestrictFormula :: String -> TypingEnvironment -> ProtoFormula Unit2 (String, LSort) Name LVar -> Precise.FreshT Data.Functor.Identity.Identity Doc
+ppRestrictFormula ty te =
   pp
   where
     pp (Not fm@(Qua Ex _ _)) = do
@@ -980,7 +982,7 @@ ppRestrictFormula te =
       (_, _, fm') <- openFormulaPrefix fm
       pp2 fm fm'
     pp fm = return $ ppFail fm
-    ppOk = ppQueryFormulaEx te
+    ppOk = ppFormulaEx ty te
     ppFail fm = text "(*" <> prettyLNFormula fm <> text "*)"
 
     pp2 fm_original fm | isPropFormula fm = return $ ppOk fm_original []
@@ -1024,7 +1026,7 @@ ppRestrictFormula te =
 ppLemma :: TypingEnvironment -> Lemma ProofSkeleton -> Doc
 ppLemma te p =
   text "(*" <> text (L.get lName p) <> text "*)"
-    $$ Precise.evalFresh (ppRestrictFormula te fm) (avoidPrecise fm)
+    $$ Precise.evalFresh (ppRestrictFormula "query" te fm) (avoidPrecise fm)
   where
     fm = L.get lFormula p
 
@@ -1040,6 +1042,16 @@ loadLemmas lemSel tc te thy = map (ppLemma te) proverifLemmas
               ls -> exportModule (trans tc) `elem` ls
         )
         thyLemmas
+
+ppRestriction :: TypingEnvironment -> Restriction -> Doc
+ppRestriction te r =
+  text "(*" <> text (L.get rstrName r) <> text "*)"
+    $$ Precise.evalFresh (ppRestrictFormula "restriction" te fm) (avoidPrecise fm)
+  where
+    fm = L.get rstrFormula r
+
+loadRestrictions :: TypingEnvironment -> OpenTheory -> [Doc]
+loadRestrictions te thy = ppRestriction te <$> theoryRestrictions thy
 
 ------------------------------------------------------------------------------
 -- Header Generation
