@@ -16,15 +16,9 @@ module.exports = grammar({
   conflicts: $ => [
       // Conflict between quantifiers and variables:
       // e.g. ∀ msg_var #temp_var.5. T
-      [$.pub_var], [$.fresh_var], [$.temporal_var], [$.nat_var],
+      [$.nat_var], [$.pub_var], [$.fresh_var], [$.temporal_var],
       [$.pub_var, $.fresh_var, $.msg_var_or_nullary_fun, $.temporal_var, $.nat_var],
       [$.pub_var, $.fresh_var, $.msg_var_or_nullary_fun, $.nat_var],
-
-      // Conflict since both look alike, but they don't appear in the same scenarios.
-      [$.nary_app, $.predicate_ref],
-
-      // Conflict since parser cannot decide how to parse ident
-      [$.nullary_fun, $.nary_app, $.msg_var_or_nullary_fun]
   ],
 
   externals: $ => [
@@ -45,13 +39,13 @@ module.exports = grammar({
           'MULTIPLY',
           'ADD',
           'MUL_SET',
+          'EXCLUSIVE_OR',
           'TUPLE',
           'NULLARY_FUN',
 
           // Formula
           'ATOM',
           'LOGICAL_NOT',
-          'EXCLUSIVE_OR',
           'LOGICAL_AND',
           'LOGICAL_OR',
           'LOGICAL_IMPLICATION',
@@ -77,9 +71,9 @@ module.exports = grammar({
 
 
   rules: {
-      theory: $ => seq(
+      theory_file: $ => seq(
           'theory',
-          field('theory_name', $.ident),
+          field('theory_identifier', $.ident),
           optional(seq('configuration', ':', '"', $.commandline , '"')),
           'begin',
           repeat($._body_item),
@@ -272,9 +266,9 @@ module.exports = grammar({
       )),
 
       equation: $ => seq(
-          field('left', $.mset_term),
+          field('left', $.term),
           '=',
-          field('right', $.mset_term)
+          field('right', $.term)
       ),
 
       // Predicates:
@@ -480,7 +474,7 @@ module.exports = grammar({
           $.premise,
           choice(
               '-->',
-              $.action_fact
+              $.actions
           ),
           $.conclusion,
           optional(seq(';', $._process))
@@ -491,7 +485,7 @@ module.exports = grammar({
           '(', $._process, ')'
       ),
 
-      predefined_process: $ => prec.left('PROCESS', $.mset_term),
+      predefined_process: $ => prec.left('PROCESS', $.term),
 
       // elementary processes:
       binding: $ => prec.right(seq(
@@ -501,22 +495,22 @@ module.exports = grammar({
 
       output: $ => prec.right(choice(
           seq(
-              'out', '(', $.mset_term, ',', $.mset_term, ')',
+              'out', '(', $.term, ',', $.term, ')',
               optional(seq(';', $._process))
           ),
           seq(
-              'out', '(', $.mset_term, ')',
+              'out', '(', $.term, ')',
               optional(seq(';', $._process))
           )
       )),
 
       input: $ => prec.right(choice(
           seq(
-              'in', '(', $.mset_term, ',', $.mset_term, ')',
+              'in', '(', $.term, ',', $.term, ')',
               optional(seq(';', $._process))
           ),
           seq(
-              'in', '(', $.mset_term, ')',
+              'in', '(', $.term, ')',
               optional(seq(';', $._process))
           )
       )),
@@ -561,18 +555,18 @@ module.exports = grammar({
       // stateful processes:
       set_state: $ => prec.right(seq(
           'insert',
-          field('from', $.mset_term), ',',
-          field('to', $.mset_term),
+          field('from', $.term), ',',
+          field('to', $.term),
           optional(seq(';', $._process))
       )),
 
       delete_state: $ => prec.right(seq(
-          'delete', $.mset_term,
+          'delete', $.term,
           optional(seq(';', $._process))
       )),
 
       read_state: $ => prec.right('LOOKUP', seq(
-          'lookup', field('from', $.mset_term),
+          'lookup', field('from', $.term),
           'as', field('to',$._lvar),
           'in', field('in', $._process),
           optional(seq('else', field('else', $._process))),
@@ -580,12 +574,12 @@ module.exports = grammar({
       )),
 
       set_lock: $ => prec.right(seq(
-          'lock', $.mset_term,
+          'lock', $.term,
           optional(seq(';', $._process))
       )),
 
       remove_lock: $ => prec.right(seq(
-          'unlock', $.mset_term,
+          'unlock', $.term,
           optional(seq(';', $._process))
       )),
 
@@ -596,11 +590,11 @@ module.exports = grammar({
       ),
 
       equality_check: $ => seq(
-          choice($.mset_term, $._formula), token(prec(1, '=')), choice($.mset_term, $._formula)
+          choice($.term, $._formula), token(prec(1, '=')), choice($.term, $._formula)
       ),
 
       lesser_check: $ => seq(
-          $.mset_term, choice('(<)', '<<'), $.mset_term
+          $.term, choice('(<)', '<<'), $.term
       ),
 
 
@@ -609,7 +603,7 @@ module.exports = grammar({
        */
       let: $ => seq(
           'let',
-          field('let_identifier', $.mset_term), '=',
+          field('let_identifier', $.term), '=',
           $._process
       ),
 
@@ -651,7 +645,7 @@ module.exports = grammar({
           $.premise,
           choice(
               '-->',
-              $.action_fact
+              $.actions
           ),
           $.conclusion
       ),
@@ -660,7 +654,7 @@ module.exports = grammar({
           '[', optional($._facts), ']'
       ),
 
-      action_fact: $ => seq(
+      actions: $ => seq(
           '--[', optional($._facts_restrictions), ']->'
       ),
 
@@ -699,9 +693,12 @@ module.exports = grammar({
             $.rule_attr_color,
             'no_derivcheck',
             'issapicrule',
+            'no-decomp',
             $.rule_process,
-            $.rule_role
-            ),
+            $.rule_role,
+            $.rule_trigger,
+            $.rule_hint
+      ),
 
       rule_attr_color: $ => seq(
           choice(
@@ -715,6 +712,30 @@ module.exports = grammar({
           'role',
           '=',
           '"', field('role_identifier', $.ident), '"'
+      ),
+
+      rule_trigger: $ => seq(
+          'trigger',
+          '=',
+          '[',
+          field('trigger', $.tuple_term),
+          repeat(seq(
+            ',',
+            field('trigger', $.tuple_term)
+          )),
+          ']'
+      ),
+
+      rule_hint: $ => seq(
+          'hint',
+          '=',
+          '[',
+          field('hint', $.tuple_term),
+          repeat(seq(
+            ',',
+            field('hint', $.tuple_term)
+          )),
+          ']'
       ),
 
       rule_process: $ => seq(
@@ -732,7 +753,7 @@ module.exports = grammar({
       rule_let_term: $ => seq(
           field('left', choice($.msg_var_or_nullary_fun, $.nat_var)),
           '=',
-          field('right', $.mset_term)
+          field('right', $.term)
       ),
 
       macros: $ => seq(
@@ -757,7 +778,7 @@ module.exports = grammar({
           )),
           ')',
           '=',
-          field('term', $.mset_term)
+          field('term', $.term)
       ),
 
       embedded_restriction: $ => seq(
@@ -791,10 +812,8 @@ module.exports = grammar({
       ),
 
       fact: $ => prec.left(seq(
-          field('fact_identifier', $.ident),
-          '(',
-          optional($.arguments),
-          ')',
+          field('fact_identifier', $.capitalized_ident),
+          field('arguments', $.argument_list),
           optional($.fact_annotes)
       )),
 
@@ -1024,11 +1043,11 @@ module.exports = grammar({
           $.temporal_var
       ),
 
-      action_constraint: $ => seq(
+      action_constraint: $ => prec.left(10, seq(
           $._fact,
-          '@',
-          $.temporal_var
-      ),
+          '@@',
+          $.ident,
+      )),
 
       chain_constraint: $ => seq(
           '(', $.temporal_var, ',', $.natural, ')',
@@ -1052,98 +1071,92 @@ module.exports = grammar({
           /*
        * Term:
        */
-      _term: $ => choice(
-          $.tuple_term,
-          $.nested_term,
-          $.nullary_fun,
-          $.binary_app,
-          $.nary_app,
-          $._literal
+      term: $ => choice(
+        $._literal,
+
+        $.tuple_term,
+        $.mset_term,
+        $.nat_term,
+        $.xor_term,
+        $.mul_term,
+        $.exp_term,
+        $.nested_term,
+
+        $.binary_app,
+        $.nary_app,
       ),
 
-      tuple_term: $ => prec('TUPLE', seq(
+      _term: $ => choice(
+          $.tuple_term,
+      ),
+
+      tuple_term: $ => prec.left('TUPLE', seq(
           '<',
-          field('left', $.mset_term),
-          repeat(seq(
+          $.term,
+          repeat1(seq(
             ',',
-            field('right', $.mset_term)
+            $.term
           )),
           '>'
       )),
 
       mset_term: $ => prec.left('MUL_SET', seq(
-          field('left', $.nat_term),
-          repeat(seq(
-            choice('++', '+'),
-            field('right', $.nat_term)
-          ))
+          field("left", $.term),
+          choice('++', '+'),
+          field("right", $.term),
       )),
 
       nat_term: $ => prec.left('ADD', seq(
-          field('left', $.xor_term),
-          repeat(seq(
-            '%+',
-            field('right', $.xor_term)
-          ))
+          field('left', $.term),
+          '%+',
+          field('right', $.term)
       )),
 
       xor_term: $ => prec.left('EXCLUSIVE_OR', seq(
-          field('left', $.mul_term),
-          repeat(seq(
-            choice('XOR', '⊕'),
-            field('right', $.mul_term)
-          ))
+          field('left', $.term),
+          choice('XOR', '⊕'),
+          field('right', $.term)
       )),
 
       mul_term: $ => prec.left('MULTIPLY', seq(
-          field('left', $.exp_term),
-          repeat(seq(
-            '*',
-            field('right', $.exp_term)
-          ))
+          field('left', $.term),
+          '*',
+          field('right', $.term)
       )),
 
       exp_term: $ => prec.right('EXPONENTIAL', seq(
-          field('base', $._term),
-          repeat(seq(
-             '^',
-            field('exponent', $._term)
-          ))
+          field('base', $.term),
+          '^',
+          field('exponent', $.term)
       )),
 
       nested_term: $ => prec('NESTED', seq(
-          '(', $.mset_term, ')'
+          '(', $.term, ')'
       )),
 
-      nullary_fun: $ => prec('NULLARY_FUN', choice(
-          field('function_identifier', $.ident),
-          seq(
-              field('function_identifier', $.ident), '(', ')'
-          )
-      )),
 
       binary_app: $ => prec('FUNCTION', seq(
           field('function_identifier', $.ident),
           '{',
-          field('argument', $.arguments),
+          field('arguments', optional(commaSep1($.term))),
           '}',
-          field('argument', $.mset_term)
+          field('argument', $.term)
       )),
 
       nary_app: $ => prec('FUNCTION', seq(
           field('function_identifier', $.ident),
-          '(', $.arguments, ')'
+          field('arguments', $.argument_list),
       )),
 
       arguments: $ => seq(
-          field('argument', choice($.mset_term, $.temporal_var)),
-          repeat(seq(
-              ',', field('argument', $.mset_term)
-          ))
+        'a', 'b'
       ),
 
-
-
+      argument_list: $ => seq(
+          '(',
+          optional(seq($.term, repeat(seq(',', $.term)))),
+          ')'
+      ),
 
       // Variable:
       _literal: $ => choice(
@@ -1312,8 +1325,7 @@ module.exports = grammar({
           $.subterm_rel,
           $.quantified_formula,
           $.atom,
-          $.predicate_ref,
-          $.pre_defined
+          $.predicate_ref
       ),
 
       iff: $ => prec.left('LOGICAL_IFF', seq(
@@ -1372,21 +1384,21 @@ module.exports = grammar({
       )),
 
       action_constraint: $ => prec('ATOM', seq(
-          field('fact', $._fact),
+          field('fact', $.fact),
           '@',
-          field('variable', alias($.temporal_var_optional_prefix, $.temporal_var))
+          field('variable', $.temporal_var_optional_prefix)
       )),
 
       term_eq: $ => prec('ATOM', seq(
-          field('left', $.mset_term),
+          field('left', $.term),
           '=',
-          field('right', $.mset_term)
+          field('right', $.term)
       )),
 
       subterm_rel: $ => prec('ATOM', seq(
-          field('left', $.mset_term),
+          field('left', $.term),
           choice('<<', '⊏'),
-          field('right', $.mset_term)
+          field('right', $.term)
       )),
 
       quantified_formula: $ => prec('ATOM', seq(
@@ -1407,8 +1419,8 @@ module.exports = grammar({
 
       // predicate reference that is substituted with the predicate by Tamarin
       predicate_ref: $ => prec('FUNCTION', seq(
-          field('predicate_identifier', $.ident),
-          '(', optional($.arguments), ')'
+          field('predicate_identifier', $.capitalized_ident),
+          field('arguments', $.argument_list)
       )),
 
       // some predefined function, let_block, ...
@@ -1431,6 +1443,7 @@ module.exports = grammar({
       ),
 
       ident: $ => /[A-Za-z0-9]\w*/,
+      capitalized_ident: $ => /[A-Z][A-Za-z0-9_]*/,
 
       param: $ => /[^"]*/,
 
@@ -1453,7 +1466,36 @@ module.exports = grammar({
               /[^*]*\*+([^}*][^*]*\*+)*/,
               '}'
           ))
-      )
+      ),
 
-  }
+  },
+
+  inline: $ => [
+    $.term
+  ],
+
 });
+
+/**
+ * Creates a rule to match one or more of the rules separated by a comma
+ *
+ * @param {RuleOrLiteral} rule
+ *
+ * @returns {SeqRule}
+ */
+function commaSep1(rule) {
+    return sep1(rule, ',');
+}
+
+  /**
+ * Creates a rule to match one or more occurrences of `rule` separated by `sep`
+ *
+ * @param {RuleOrLiteral} rule
+ *
+ * @param {RuleOrLiteral} separator
+ *
+ * @returns {SeqRule}
+ */
+function sep1(rule, separator) {
+    return seq(rule, repeat(seq(separator, rule)));
+}

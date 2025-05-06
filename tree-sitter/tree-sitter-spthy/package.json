@@ -1,8 +1,8 @@
 {
   "name": "tree-sitter-spthy",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "description": "Spthy grammar for tree-sitter",
-  "repository": "github:tamarin-prover/tamarin-prover/tree-sitter/tree-sitter-spthy",
+  "repository": "github:kevinmorio/tree-sitter-spthy",
   "license": "MIT",
   "main": "bindings/node",
   "types": "bindings/node",

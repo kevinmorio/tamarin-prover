@@ -1,4 +1,4 @@
-module github.com/tree-sitter/tree-sitter-spthy
+module github.com/kevinmorio/tree-sitter-spthy
 
 go 1.23
 
