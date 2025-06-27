@@ -1,73 +1,71 @@
-# Build image
-# based on bullseye, since system-ghc is too old in buster
-FROM debian:bullseye-slim AS tamarin-build
-# install build dependencies
-RUN apt-get update && \
-    DEBIAN_FRONTEND=noninteractive \
-    apt-get -y --no-install-recommends install \
-        haskell-stack \
-        ca-certificates \
-        build-essential \
-        netbase \
-        locales \
-        ghc \
-        zlib1g \
-        zlib1g-dev
-WORKDIR /workspace
-# copy dependency specifications first (need stack.yaml for resolver spec)
-RUN mkdir -p lib/export lib/theory lib/sapic lib/tools lib/term lib/accountability
+# Tamarin
+ARG STACK_RESOLVER=lts-22.39
+
+#----------------------------------------------------
+FROM fpco/stack-build-small:${STACK_RESOLVER} AS tamarin-dependencies
+
+WORKDIR /opt/build
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      libncurses-dev \
+      zlib1g-dev \
+      pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+# Build from local directory
 COPY stack.yaml tamarin-prover.cabal ./
-
-COPY lib/sapic/tamarin-prover-sapic.cabal lib/sapic/
-COPY lib/term/tamarin-prover-term.cabal lib/term/
-COPY lib/theory/tamarin-prover-theory.cabal lib/theory/
-COPY lib/utils/tamarin-prover-utils.cabal lib/utils/
-COPY lib/export/tamarin-prover-export.cabal lib/export/
-COPY lib/accountability/tamarin-prover-accountability.cabal lib/accountability
-# cache stack package index
-RUN stack update
-RUN stack upgrade
-# > Compiling language-javascript requires a UTF-8 locale.
-# (https://github.com/erikd/language-javascript/issues/86)
-# thankfully we're only in a temporary build container, so let's change that real quick
-RUN sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && locale-gen
-ENV LANG en_US.UTF-8
-ENV LANGUAGE en_US:en
-ENV LC_ALL en_US.UTF-8
-
-# build dependencies first, for caching
-RUN stack build --system-ghc --dependencies-only --ghc-options="+RTS -M600M"
-# now copy rest of source code
 COPY LICENSE ./
-# lib needs special handling since it already exists
 COPY lib/. ./lib/
 COPY src ./src
 COPY data ./data
 COPY images ./images
 
-# build the entire thing
-RUN stack build --system-ghc
-RUN stack install --system-ghc --local-bin-path /usr/local/bin
+RUN stack build --system-ghc --dependencies-only
 
-# Assemble final image
-# again, based on buillseye, since our build linked to bullseye libs
-FROM debian:bullseye-slim
+#---------------------------------------------------
+FROM fpco/stack-build-small:${STACK_RESOLVER} AS tamarin-build
+
+COPY --from=tamarin-dependencies /root/.stack /root/.stack
+COPY --from=tamarin-dependencies /opt/build /opt/build
+
+WORKDIR /opt/build
+
+RUN stack install --system-ghc --local-bin-path /opt/build/bin
+
+# Strip debugging symbols to reduce binary size
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends binutils && \
+    strip /opt/build/bin/tamarin-prover && \
+    rm -rf /var/lib/apt/lists/*
+
+#---------------------------------------------------
+FROM debian:bullseye-slim AS tamarin
+
 # Metadata
 LABEL version="1.0" \
       description="The Tamarin prover for security protocol verification" \
       org.opencontainers.image.authors="The Tamarin prover authors"
-# install runtime dependencies
-RUN apt-get update && \
-    DEBIAN_FRONTEND=noninteractive \
-    apt-get -y --no-install-recommends install \
-        maude \
-        graphviz
-COPY --from=tamarin-build /usr/local/bin /usr/local/bin
+
+ENV LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8
+
+RUN apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      maude graphviz \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY --from=tamarin-build /opt/build/bin /usr/local/bin
+
 COPY etc/docker/res/entrypoint.sh /usr/local/bin/
+
 RUN chmod 755 /usr/local/bin/entrypoint.sh
+
 RUN useradd -ms /bin/bash tamarin
 USER tamarin
+
 WORKDIR /home/tamarin
-EXPOSE 3001
 COPY etc/docker/res/README .
+
+EXPOSE 3001
+
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
