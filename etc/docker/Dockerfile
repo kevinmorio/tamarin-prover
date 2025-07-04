@@ -34,24 +34,29 @@ RUN stack install --system-ghc --local-bin-path /opt/build/bin
 
 # Strip debugging symbols to reduce binary size
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends binutils && \
+    apt-get install -y --no-install-recommends binutils unzip && \
     strip /opt/build/bin/tamarin-prover && \
     rm -rf /var/lib/apt/lists/*
 
+# Retrieve Maude from Git repo as APT source for bookworm is incompatible with Tamarin
+RUN wget https://github.com/maude-lang/Maude/releases/download/Maude3.5/Maude-3.5-linux-x86_64.zip && unzip Maude-3.5-linux-x86_64.zip -d /opt/build/bin 
+
 #---------------------------------------------------
-FROM debian:bullseye-slim AS tamarin
+FROM debian:bookworm-slim AS tamarin
 
 # Metadata
 LABEL version="1.0" \
       description="The Tamarin prover for security protocol verification" \
       org.opencontainers.image.authors="The Tamarin prover authors"
 
+ENV PATH="/usr/local/bin:$PATH"
+
 ENV LANG=C.UTF-8 \
     LC_ALL=C.UTF-8
 
 RUN apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-      maude graphviz \
+      graphviz \
  && rm -rf /var/lib/apt/lists/*
 
 COPY --from=tamarin-build /opt/build/bin /usr/local/bin
