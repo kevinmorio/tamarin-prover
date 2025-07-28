@@ -1,8 +1,8 @@
 # Tamarin
-ARG STACK_RESOLVER=lts-22.39
+ARG GHC_VERSION=9.6.6
 
 #----------------------------------------------------
-FROM fpco/stack-build-small:${STACK_RESOLVER} AS tamarin-dependencies
+FROM haskell:${GHC_VERSION} AS tamarin-dependencies
 
 WORKDIR /opt/build
 
@@ -23,7 +23,7 @@ COPY images ./images
 RUN stack build --system-ghc --dependencies-only
 
 #---------------------------------------------------
-FROM fpco/stack-build-small:${STACK_RESOLVER} AS tamarin-build
+FROM haskell:${GHC_VERSION} AS tamarin-build
 
 COPY --from=tamarin-dependencies /root/.stack /root/.stack
 COPY --from=tamarin-dependencies /opt/build /opt/build
