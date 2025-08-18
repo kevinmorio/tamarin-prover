@@ -107,6 +107,7 @@ ENV MAUDE_LIB=/usr/local/share \
 
 RUN apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    python3 \
     graphviz \
     libbdd0c2 \
     libtecla1 \
