@@ -25,7 +25,6 @@ where
 import Term.Maude.Signature
 import           Prelude
 import qualified Data.ByteString.Char8      as BC
-import           Data.Either
 -- import           Data.Monoid                hiding (Last)
 import qualified Data.Set                   as S
 import           Data.Maybe                 (fromMaybe)
@@ -51,6 +50,12 @@ import Data.Label.Mono (Lens)
 import Theory.Sapic
 import qualified Data.Functor
 
+data FunctionAttribute
+  = FunctionPrivate
+  | FunctionConstructor
+  | FunctionDestructor
+  | FunctionData
+  deriving (Eq, Show)
 
 
  -- Describes the mapping between Maude Signatures and the builtin Name
@@ -160,11 +165,12 @@ functionType = try (do
                     )
 
 -- | Parse a 'FunctionAttribute'.
-functionAttribute :: Parser (Either Privacy Constructability)
+functionAttribute :: Parser FunctionAttribute
 functionAttribute = asum
-  [ symbol "private" Data.Functor.$> Left Private
-  , symbol "constructor" Data.Functor.$> Right Constructor
-  , symbol "destructor" Data.Functor.$> Right Destructor
+  [ symbol "private" Data.Functor.$> FunctionPrivate
+  , symbol "constructor" Data.Functor.$> FunctionConstructor
+  , symbol "destructor" Data.Functor.$> FunctionDestructor
+  , symbol "data" Data.Functor.$> FunctionData
   ]
 
 getReservedNames :: MaudeSig -> [String]
@@ -176,43 +182,131 @@ builtinReservedNames :: [(String, [String])]
 builtinReservedNames = 
   [(name, getReservedNames msig) | (name, Just msig, _) <- builtinsNames]
 
-function :: Parser SapicFunSym
-function = do
+functionDecls :: Parser [SapicFunSym]
+functionDecls = do
         f <- BC.pack <$> identifier
         (argTypes,outType) <- functionType
         atts <- option [] $ list functionAttribute
         st <- getState
         sign <- sig <$> getState
         let k = length argTypes
-        let priv = if Private `elem` lefts atts then Private else Public
-        let destr = if Destructor `elem` rights atts then Destructor else Constructor
-        let requested = (k, priv, destr)
+        let priv = if FunctionPrivate `elem` atts then Private else Public
+        let destr = if FunctionDestructor `elem` atts then Destructor else Constructor
+        let isData = FunctionData `elem` atts
+        validateFunctionAttributes f atts
+        ensureNameAllowed st sign f (k, priv, destr)
+        baseSym <- addOrLookupDeclaredFunction sign f (k, priv, destr)
+        if isData
+          then do
+            let accessorInfos = mkDataAccessorInfos baseSym argTypes outType
+            mapM_ (ensureGeneratedAccessorNameAvailable sign . accessorName) accessorInfos
+            modifyStateSig $ \sig0 ->
+              let sig1 = foldl (flip addFunSym) sig0 (map fst3 accessorInfos)
+              in foldl (flip addCtxtStRule) sig1 (mkDataAccessorRules baseSym (map fst3 accessorInfos))
+            return ((baseSym, argTypes, outType) : accessorInfos)
+          else
+            return [(baseSym, argTypes, outType)]
+  where
+    fst3 (x, _, _) = x
+    accessorName ((name, _), _, _) = name
 
-        -- Check specifically for conflicts with builtins to give a precise error message.
-        let allReservedNames = reservedBuiltinNames st
-        when (BC.unpack f `elem` allReservedNames) $ do
-          let conflictingBuiltins = [b | (b, names) <- builtinReservedNames, BC.unpack f `elem` names]
-          case lookup f (S.toList $ stFunSyms sign) of
-            Just builtinSig | builtinSig /= requested ->
-              fail $ "`" ++ BC.unpack f ++ "` conflicts with builtin(s) "
-                  ++ show conflictingBuiltins
-                  ++ " (builtin: " ++ show builtinSig ++ ", requested: " ++ show requested ++ ")"
-            _ -> return ()
+    validateFunctionAttributes name attrs = do
+      when (countAttr FunctionData attrs > 1) $
+        fail $ "duplicate `data` attribute for `" ++ BC.unpack name ++ "`"
+      when (FunctionData `elem` attrs && FunctionDestructor `elem` attrs) $
+        fail $ "`" ++ BC.unpack name ++ "` cannot be both `[data]` and `[destructor]`"
+      when (FunctionData `elem` attrs && FunctionPrivate `elem` attrs) $
+        fail $ "`" ++ BC.unpack name ++ "` cannot be both `[data]` and `[private]`"
 
-        -- Check for any conflict with existing functions.
-        case lookup f (S.toList (stFunSyms sign) ++ S.toList(macroNames sign)) of
-          Just kp' | kp' /= (k,priv,destr) && (BC.unpack f /= "fst" || k /= 1 || priv == Private) && (BC.unpack f /= "snd" || k /= 1 || priv == Private) ->
-            fail $ "conflicting arities/options " ++
-                   show kp' ++ " and " ++ show (k,priv,destr) ++
-                   " for `" ++ BC.unpack f ++ "`. Please choose a different name for this function."
-          _ -> do
-                modifyStateSig $ addFunSym (f,(k,priv,destr))
-                return ((f,(k,priv,destr)),argTypes,outType)
+    countAttr attr = length . filter (== attr)
+
+    ensureNameAllowed st' sign' name requested = do
+      let allReservedNames = reservedBuiltinNames st'
+      when (BC.unpack name `elem` allReservedNames) $ do
+        let conflictingBuiltins =
+              [ builtin
+              | (builtin, names) <- builtinReservedNames
+              , BC.unpack name `elem` names
+              ]
+        case lookup name (S.toList $ stFunSyms sign') of
+          Just builtinSig | builtinSig /= requested ->
+            fail $ "`" ++ BC.unpack name ++ "` conflicts with builtin(s) "
+                ++ show conflictingBuiltins
+                ++ " (builtin: " ++ show builtinSig
+                ++ ", requested: " ++ show requested ++ ")"
+          _ -> pure ()
+      case lookup name (S.toList (macroNames sign')) of
+        Just _ ->
+          fail $ "conflicting definition for `" ++ BC.unpack name ++ "`: this name is already used by a macro"
+        Nothing ->
+          pure ()
+
+    addOrLookupDeclaredFunction sign' name desired = do
+      let (arity, privacy, _) = desired
+      case lookup name (S.toList (stFunSyms sign')) of
+        Just kp'
+          | kp' /= desired
+          && (BC.unpack name /= "fst" || arity /= 1 || privacy == Private)
+          && (BC.unpack name /= "snd" || arity /= 1 || privacy == Private) ->
+          fail $ "conflicting arities/options "
+              ++ show kp' ++ " and " ++ show desired
+              ++ " for `" ++ BC.unpack name
+              ++ "`. Please choose a different name for this function."
+        _ -> do
+          let sym = (name, desired)
+          modifyStateSig $ addFunSym sym
+          return sym
+
+    ensureGeneratedAccessorNameAvailable sign' name = do
+      st' <- getState
+      let allReservedNames = reservedBuiltinNames st'
+      when (BC.unpack name `elem` allReservedNames) $ do
+        let conflictingBuiltins =
+              [ builtin
+              | (builtin, names) <- builtinReservedNames
+              , BC.unpack name `elem` names
+              ]
+        fail $ "generated accessor `" ++ BC.unpack name
+            ++ "` conflicts with builtin(s) " ++ show conflictingBuiltins
+      when (BC.unpack name `elem` reservedBuiltins) $
+        fail $ "generated accessor `" ++ BC.unpack name
+            ++ "` is a reserved function name for builtins"
+      case lookup name (S.toList (stFunSyms sign') ++ S.toList (macroNames sign')) of
+        Just _ ->
+          fail $ "generated accessor `" ++ BC.unpack name ++ "` conflicts with an existing function or macro"
+        Nothing ->
+          pure ()
+
+    mkDataAccessorInfos funSym@(_, (arity, _, _)) argTypes outType =
+      [ ( accessorSym i
+        , [outType]
+        , argTypes !! (i - 1)
+        )
+      | i <- [1 .. arity]
+      ]
+      where
+        accessorSym i = (mkAccessorName (fst funSym) i, (1, Public, Destructor))
+
+    mkDataAccessorRules funSym@(_, (arity, _, _)) accessorSyms =
+      [ accessorRule i accessorSym
+      | (i, accessorSym) <- zip [1 .. arity] accessorSyms
+      ]
+      where
+        vars =
+          [ varTerm $ LVar "x" LSortMsg (fromIntegral i)
+          | i <- [1 .. arity]
+          ]
+        funTerm = fAppNoEq funSym vars
+        accessorRule i accessorSym =
+          fAppNoEq accessorSym [funTerm] `CtxtStRule`
+            StRhs [[0, i - 1]] (vars !! (i - 1))
+
+    mkAccessorName base idx = base <> BC.pack ('_' : show idx)
 
 
 functions :: Parser [SapicFunSym]
 functions =
-    (try (symbol "functions") <|> symbol "function") *> colon *> commaSep1 function
+    (try (symbol "functions") <|> symbol "function") *> colon *> fmap concat (commaSep1 functionDecls)
 
 equations :: Parser ()
 equations = do
