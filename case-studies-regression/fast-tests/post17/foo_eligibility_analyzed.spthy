@@ -35,7 +35,7 @@ rule (modulo E) V_1:
   Created_commit_V_1( blind(commit($vote, ~r), ~b) )
   ]->
    [
-   Out( <blind(commit($vote, ~r), ~b),
+   Out( <blind(commit($vote, ~r), ~b), 
          sign(blind(commit($vote, ~r), ~b), ~ltkV)>
    ),
    St_V_1( V, $vote, ~r, ~b )
@@ -52,7 +52,7 @@ rule (modulo E) A_1:
 
 rule (modulo E) V_2:
    [
-   In( <blind(commit(vote, ~r), ~b),
+   In( <blind(commit(vote, ~r), ~b), 
         sign(blind(commit(vote, ~r), ~b), ~ltkA)>
    ),
    St_V_1( V, vote, ~r, ~b ), !AdminLtk( A, ~ltkA )
@@ -103,7 +103,7 @@ rule (modulo E) C_2:
     1. r     = r.5
        x     = x.5
        z     = open(x.5, r.5)
-
+    
     2. r     = x.5
        x     = commit(x.6, x.5)
        z     = x.6
@@ -350,8 +350,8 @@ summary of summaries:
 analyzed: examples/post17/foo_eligibility.spthy
 
   output:          examples/post17/foo_eligibility.spthy.tmp
-  processing time: 0.22s
-
+  processing time: 0.24s
+  
   types (all-traces): verified (43 steps)
   exec (exists-trace): verified (9 steps)
   eligibility (all-traces): verified (11 steps)
