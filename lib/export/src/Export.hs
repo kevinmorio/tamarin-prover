@@ -880,7 +880,7 @@ ppSapic tc (ProcessComb (Cond a) _ pl pr) =
     ppFact' p =
       case expandFormula (predicates tc) (toLFormula p) of
         Left _ -> translationFail "Export does not support tamarin predicates in conditionnals."
-        Right form -> (fst . snd $ Precise.evalFresh (ppLFormula emptyTypeEnv (ppNAtom S.empty) form) (avoidPrecise form), S.empty)
+        Right form -> (fst . snd $ Precise.evalFresh (ppLFormula emptyTypeEnv (ppNAtom M.empty S.empty) form) (avoidPrecise form), S.empty)
     addElseBranch (d, s) = case pr of
       ProcessNull _ -> (d, s)
       _ ->
@@ -1046,7 +1046,7 @@ addAttackerReportProc tc thy p =
         theoryPredicates thy
     (_, (formula, _)) = case reportPreds of
       Nothing -> translationFail "Translation Error, the Report predicate must be defined."
-      Just (Predicate _ form) -> Precise.evalFresh (ppLFormula emptyTypeEnv (ppNAtom S.empty) form) (avoidPrecise form)
+      Just (Predicate _ form) -> Precise.evalFresh (ppLFormula emptyTypeEnv (ppNAtom M.empty S.empty) form) (avoidPrecise form)
 
 ------------------------------------------------------------------------------
 -- Main printer for processes
@@ -1183,6 +1183,7 @@ typeVarsEvent TypingEnvironment {events = ev} tag ts =
 
 ppProtoAtom ::
   (HighlightDocument d, Ord k, Show k, Show c) =>
+  (Term (Lit c k) -> Maybe d) -> -- per-occurrence rule-id variable of a timepoint variable, if any
   S.Set String -> -- events requiring rule identifiers
   TypingEnvironment ->
   Bool ->
@@ -1190,7 +1191,7 @@ ppProtoAtom ::
   (Term (Lit c k) -> d) ->
   ProtoAtom s (Term (Lit c k)) ->
   (d, M.Map k SapicType)
-ppProtoAtom ruleIdEvents te _ _ ppT (Action v f@(Fact tag _ ts))
+ppProtoAtom ridOf ruleIdEvents te _ _ ppT (Action v f@(Fact tag _ ts))
   | factTagArity tag /= length ts = translationFail $ "MALFORMED function" ++ show tag
   | (tag == KUFact) || isKLogFact f -- treat KU() and K() facts the same
     =
@@ -1208,25 +1209,37 @@ ppProtoAtom ruleIdEvents te _ _ ppT (Action v f@(Fact tag _ ts))
     useRuleId = factName `S.member` ruleIdEvents
     ppFactL n t = nestShort' (n ++ "(") ")" . fsep . punctuate comma $ map ppT t
     eventArgs n t
-      | useRuleId = nestShort' (n ++ "(") ")" . fsep . punctuate comma $ (text "rid" : map ppT t)
+      | useRuleId = nestShort' (n ++ "(") ")" . fsep . punctuate comma $ (ridDoc : map ppT t)
       | otherwise = ppFactL n t
-ppProtoAtom _ _ _ ppS _ (Syntactic s) = (ppS s, M.empty)
-ppProtoAtom _ _ False _ ppT (EqE l r) =
-  (sep [ppT l <-> opEqual, ppT r], M.empty)
-ppProtoAtom _ _ True _ ppT (EqE l r) =
-  (sep [ppT l <-> text "<>", ppT r], M.empty)
+    ridDoc = fromMaybe (text "rid") (ridOf v)
+ppProtoAtom _ _ _ _ ppS _ (Syntactic s) = (ppS s, M.empty)
+-- A temporal equality between rule-id instrumented events is translated as an
+-- equality of their rule-id variables: distinct ProVerif events never share a
+-- timepoint, while in Tamarin equal timepoints mean "same rule instance".
+ppProtoAtom ridOf _ _ False _ ppT (EqE l r) =
+  case (ridOf l, ridOf r) of
+    (Just dl, Just dr) -> (sep [dl <-> opEqual, dr], M.empty)
+    _ -> (sep [ppT l <-> opEqual, ppT r], M.empty)
+ppProtoAtom ridOf _ _ True _ ppT (EqE l r) =
+  case (ridOf l, ridOf r) of
+    (Just dl, Just dr) -> (sep [dl <-> text "<>", dr], M.empty)
+    _ -> (sep [ppT l <-> text "<>", ppT r], M.empty)
 -- sep [ppNTerm l <-> text "≈", ppNTerm r]
-ppProtoAtom _ _ _ _ ppT (Less u v) = (ppT u <-> opLess <-> ppT v, M.empty)
-ppProtoAtom _ _ _ _ ppT (Subterm u v) = (text "subterm(" <> ppT u <> comma <> ppT v <> text ")", M.empty)
-ppProtoAtom _ _ _ _ _ (Last i) = (operator_ "last" <> parens (text (show i)), M.empty)
+ppProtoAtom _ _ _ _ _ ppT (Less u v) = (ppT u <-> opLess <-> ppT v, M.empty)
+ppProtoAtom _ _ _ _ _ ppT (Subterm u v) = (text "subterm(" <> ppT u <> comma <> ppT v <> text ")", M.empty)
+ppProtoAtom _ _ _ _ _ _ (Last i) = (operator_ "last" <> parens (text (show i)), M.empty)
 
-ppAtom :: S.Set String -> TypingEnvironment -> Bool -> (LNTerm -> Doc) -> ProtoAtom s LNTerm -> (Doc, M.Map LVar SapicType)
-ppAtom ruleIdEvents te b = ppProtoAtom ruleIdEvents te b (const emptyDoc)
+ppAtom :: M.Map String String -> S.Set String -> TypingEnvironment -> Bool -> (LNTerm -> Doc) -> ProtoAtom s LNTerm -> (Doc, M.Map LVar SapicType)
+ppAtom ridNames ruleIdEvents te b = ppProtoAtom ridOf ruleIdEvents te b (const emptyDoc)
+  where
+    ridOf t = case viewTerm t of
+      Lit (Var (LVar n LSortNode _)) -> text <$> M.lookup n ridNames
+      _ -> Nothing
 
 -- only used for ProVerif queries display
 -- the Bool is set to False when we must negate the atom
-ppNAtom :: S.Set String -> TypingEnvironment -> Bool -> ProtoAtom s LNTerm -> (Doc, M.Map LVar SapicType)
-ppNAtom ruleIdEvents te b = ppAtom ruleIdEvents te b (fst . ppLNTerm emptyTC)
+ppNAtom :: M.Map String String -> S.Set String -> TypingEnvironment -> Bool -> ProtoAtom s LNTerm -> (Doc, M.Map LVar SapicType)
+ppNAtom ridNames ruleIdEvents te b = ppAtom ridNames ruleIdEvents te b (fst . ppLNTerm emptyTC)
 
 mapLits :: (Ord a, Ord b) => (a -> b) -> Term a -> Term b
 mapLits f t = case viewTerm t of
@@ -1308,17 +1321,27 @@ countQuantifierAlternations = go Nothing
     go ctx (Conn _ p q) = max (go ctx p) (go ctx q)
 
 ppQueryFormula ::
-  (MonadFresh m, Functor s) =>
+  (MonadFresh m) =>
+  M.Map String String ->
   S.Set String ->
   TypingEnvironment ->
-  ProtoFormula s (String, LSort) Name LVar ->
+  ProtoFormula Unit2 (String, LSort) Name LVar ->
   [LVar] ->
   String ->
   m Doc
-ppQueryFormula ruleIdEvents te fm extravs attrs = do
-  (vs, (p, typeVars)) <- ppLFormula te (ppNAtom ruleIdEvents) fm
-  let includeRuleId = formulaUsesRuleIdEvents ruleIdEvents fm
+ppQueryFormula ridNames ruleIdEvents te fm extravs attrs = do
+  (vs, (p, typeVars)) <- ppLFormula te (ppNAtom ridNames ruleIdEvents) fm
+  -- The shared "rid" variable is needed for rule-id instrumented events
+  -- without a per-occurrence rule-id variable (see ridOccurrenceNames);
+  -- the per-occurrence variables are declared separately below.
+  let includeRuleId
+        | M.null ridNames = formulaUsesRuleIdEvents ruleIdEvents fm
+        | otherwise =
+            any
+              (\(tv, tag) -> tag `S.member` ruleIdEvents && tv `M.notMember` ridNames)
+              (collectEventTimeVars fm)
   let ruleIdVar = text "rid:bitstring"
+  let ridEqVars = [text (n ++ ":bitstring") | n <- S.toList . S.fromList $ M.elems ridNames]
   let allVarsList = S.toList . S.fromList $ extravs ++ vs
   -- Check for name collisions between term and timepoint variables
   -- In Tamarin, t and #t are different, but in ProVerif they'd both be 't'
@@ -1331,9 +1354,7 @@ ppQueryFormula ruleIdEvents te fm extravs attrs = do
     else do
       let allVars = map (ppTimeTypeVar typeVars) allVarsList
       let quantifiedVars =
-            if includeRuleId
-              then ruleIdVar : allVars
-              else allVars
+            [ruleIdVar | includeRuleId] ++ ridEqVars ++ allVars
       let queryLine =
             case quantifiedVars of
               [] -> text "query;"
@@ -1352,17 +1373,18 @@ ppTimeTypeVar te lvar =
     Nothing -> ppLVar lvar <> text ":bitstring"
     Just t -> ppLVar lvar <> text ":" <> text (ppType t)
 
-ppQueryFormulaEx :: S.Set String -> TypingEnvironment -> LNFormula -> [LVar] -> String -> Doc
-ppQueryFormulaEx ruleIdEvents te fm vs attrs =
-  Precise.evalFresh (ppQueryFormula ruleIdEvents te fm vs attrs) (avoidPrecise fm)
+ppQueryFormulaEx :: M.Map String String -> S.Set String -> TypingEnvironment -> LNFormula -> [LVar] -> String -> Doc
+ppQueryFormulaEx ridNames ruleIdEvents te fm vs attrs =
+  Precise.evalFresh (ppQueryFormula ridNames ruleIdEvents te fm vs attrs) (avoidPrecise fm)
 
 ppRestrictFormula ::
+  M.Map String String ->
   S.Set String ->
   TypingEnvironment ->
   ProtoFormula Unit2 (String, LSort) Name LVar ->
   String ->
   Precise.FreshT Data.Functor.Identity.Identity (Doc, Bool)
-ppRestrictFormula ruleIdEvents te frm attrs =
+ppRestrictFormula ridNames ruleIdEvents te frm attrs =
   if any (\(Fact tag _ _) -> factTagName tag == "KU") $ formulaFacts frm
     then -- todo: Add all translation warnings to the wellformedness report.
       pure (ppFail (Just "lemma contains KU fact") frm, False)
@@ -1395,7 +1417,7 @@ ppRestrictFormula ruleIdEvents te frm attrs =
       (_, _, fm') <- openFormulaPrefix fm
       handleUniversalFormula fm fm'
     renderFormula fm = pure (ppFail (Just "Lemma outside of logic fragment") fm, False)
-    ppOk f l = ppQueryFormulaEx ruleIdEvents te f l attrs
+    ppOk f l = ppQueryFormulaEx ridNames ruleIdEvents te f l attrs
     ppFail Nothing fm = text "(* Lemma outside of logic fragment *)" $$ text "(*" <> prettyLNFormula fm <> text "*)"
     ppFail (Just reason) fm = text "(*" <> text reason <> text "*)" $$ text "(*" <> prettyLNFormula fm <> text "*)"
 
@@ -1461,15 +1483,19 @@ ppLemma ruleIdEvents te p =
     -- Finally applies pnf to flatten nested quantifiers (e.g., Ex x. A & Ex y. B -> Ex x y. A & B)
     --
     -- Order of transformations:
-    -- 1. Eliminate double negations
-    -- 2. Convert negated existentials with time constraints to implications
+    -- 1. Eliminate temporal equality constraints by unifying the equated
+    --    timepoints (Ex #j. B@j & #i=#j → B@i), so the shared-timepoint
+    --    splitting applies to them
+    -- 2. Eliminate double negations
+    -- 3. Convert negated existentials with time constraints to implications
     --    (not(Ex vars. A & not(#i=#j)) → All vars. A ==> #i=#j)
-    -- 3. Move negated actions from premise to conclusion (enables pattern matching)
-    -- 4. Classify formula shape
-    -- 5. Apply shape-specific transformation
-    -- 6. Flatten nested quantifiers
+    -- 4. Move negated actions from premise to conclusion (enables pattern matching)
+    -- 5. Classify formula shape
+    -- 6. Apply shape-specific transformation
+    -- 7. Flatten nested quantifiers
     applyRewriteTransformations fm =
-      let fm1 = eliminateDoubleNegations fm
+      let fm0 = eliminateTemporalEqualities fm
+          fm1 = eliminateDoubleNegations fm0
           -- Move negated actions/existentials from premise to conclusion FIRST
           -- This transforms: (not(Ex r. A@r) & B@i) ==> C into B@i ==> (C | (Ex r. A@r))
           -- This MUST run before convertNegExWithTimeConstraint so that not(Ex...) in premise
@@ -1524,7 +1550,14 @@ ppLemma ruleIdEvents te p =
     hasNestedEx (Conn And left right) = hasNestedEx left || hasNestedEx right
     hasNestedEx _ = False
 
-    formula f' = Precise.evalFresh (ppRestrictFormula ruleIdEvents te f' useInduction) (avoidPrecise f')
+    -- Rule-id instrumented events get per-occurrence rule-id variables, and
+    -- temporal equalities that survive rewriting are translated as rule-id
+    -- equalities. Lemmas whose timepoints were split keep the shared "rid"
+    -- scheme throughout, since the split copies are tied together by that
+    -- shared variable.
+    formula f' =
+      let ridNames = if hadTimepointSplit then M.empty else ridOccurrenceNames ruleIdEvents f'
+       in Precise.evalFresh (ppRestrictFormula ridNames ruleIdEvents te f' useInduction) (avoidPrecise f')
 
     -- Lemma name comment (always shown)
     lemmaNameComment = text "(*" <> text p._lName <> text "*)"
@@ -1728,6 +1761,166 @@ transformWithPullNots f = case pullNegationsToTop f of
 -- ===========================================================================
 -- SECTION 9: Timepoint Variable Handling
 -- ===========================================================================
+
+-- | Eliminate temporal equality constraints by unifying the equated timepoint
+-- variables (one-point rule). In Tamarin, @Ex #j. B()\@j & #i = #j@ is
+-- equivalent to @B()\@i@; rewriting the explicit-equality form into the
+-- shared-variable form lets the shared-timepoint splitting (rule-id
+-- instrumentation) apply, instead of leaving behind an equality between two
+-- distinct ProVerif timepoints, which is never satisfiable there (every
+-- ProVerif event has a unique timepoint).
+-- Dually for universals: @All #j. (A()\@j & #i = #j) ==> C@ becomes
+-- @A()\@i ==> C@. Both rewrites are equivalences, so they are sound at any
+-- polarity.
+eliminateTemporalEqualities :: LNFormula -> LNFormula
+eliminateTemporalEqualities fm0 =
+  let fm' = go fm0
+   in if fm' == fm0 then fm0 else simplifyFormula fm'
+  where
+    go (Qua q v@(_, LSortNode) body) =
+      let body' = go body
+       in case pinningEq q body' of
+            Just repl -> substituteBinder repl body'
+            Nothing -> Qua q v body'
+    go (Qua q v body) = Qua q v (go body)
+    go (Conn c p q) = Conn c (go p) (go q)
+    go (Not p) = Not (go p)
+    go fm = fm
+
+    -- Find an equality that pins the binder being eliminated (Bound 0 at the
+    -- binder level) to a variable bound outside of it, in a position where the
+    -- equality is definite: a positive conjunct under an existential,
+    -- respectively a positive premise conjunct of the implication under a
+    -- universal. Returns the replacement variable, indexed relative to the
+    -- position of the binder with the binder itself removed.
+    pinningEq :: Quantifier -> LNFormula -> Maybe (BVar LVar)
+    pinningEq Ex body = findPin 0 body
+    pinningEq All body = descendAll 0 body
+      where
+        descendAll d (Qua All _ b) = descendAll (d + 1) b
+        descendAll d (Conn Imp prem _) = findPin d prem
+        descendAll _ _ = Nothing
+
+    -- Search positive conjunct positions (through conjunctions and nested
+    -- existentials) at depth d below the binder being eliminated.
+    findPin :: Integer -> LNFormula -> Maybe (BVar LVar)
+    findPin d (Conn And p q) = findPin d p `orElse` findPin d q
+    findPin d (Qua Ex _ p) = findPin (d + 1) p
+    findPin d (Ato (EqE s t)) = pin d s t `orElse` pin d t s
+    findPin _ _ = Nothing
+
+    pin d s t = case (viewTerm s, viewTerm t) of
+      (Lit (Var (Bound i)), Lit (Var other))
+        | i == d -> case other of
+            Bound k | k > d -> Just (Bound (k - d - 1))
+            Free v | lvarSort v == LSortNode -> Just (Free v)
+            _ -> Nothing
+      _ -> Nothing
+
+    orElse m@(Just _) _ = m
+    orElse Nothing n = n
+
+    -- Substitute the eliminated binder by repl (indexed relative to the
+    -- binder's position, with the binder itself already removed) and shift the
+    -- indices of all enclosing binders down accordingly. The pinning equality
+    -- itself becomes trivial (t = t) and is removed by the final
+    -- simplifyFormula.
+    substituteBinder :: BVar LVar -> LNFormula -> LNFormula
+    substituteBinder repl = mapAtoms (\d a -> fmap (mapLits (fmap (adjust d))) a)
+      where
+        adjust d (Bound i)
+          | i == d = case repl of
+              Bound r -> Bound (r + d)
+              Free v -> Free v
+          | i > d = Bound (i - 1)
+        adjust _ v = v
+
+-- | Resolve a timepoint term to its variable name if it is a node-sorted
+-- variable: bound (resolved through the given quantifier context) or free.
+timeVarNameIn :: [(String, LSort)] -> VTerm Name (BVar LVar) -> Maybe String
+timeVarNameIn ctx t = case viewTerm t of
+  Lit (Var (Bound i)) -> case drop (fromIntegral i) ctx of
+    (n, LSortNode) : _ -> Just n
+    _ -> Nothing
+  Lit (Var (Free v)) | lvarSort v == LSortNode -> Just (lvarName v)
+  _ -> Nothing
+
+-- | Collect (time variable name, fact tag name) pairs for all action atoms
+-- that are translated to ProVerif events (i.e. excluding K/KU facts).
+collectEventTimeVars :: LNFormula -> [(String, String)]
+collectEventTimeVars = go []
+  where
+    go ctx (Ato (Action tv f@(Fact tag _ _)))
+      | tag == KUFact || isKLogFact f = []
+      | otherwise = maybe [] (\n -> [(n, factTagName tag)]) (timeVarNameIn ctx tv)
+    go ctx (Not p) = go ctx p
+    go ctx (Conn _ p q) = go ctx p ++ go ctx q
+    go ctx (Qua _ v p) = go (v : ctx) p
+    go _ _ = []
+
+-- | Collect pairs of time-variable names linked by a temporal equality:
+-- an equality atom #i = #j (possibly negated), or a negated strict
+-- comparison not(#i < #j), which is expanded later into a disjunction
+-- containing the equality.
+collectTemporalEqPairs :: LNFormula -> [(String, String)]
+collectTemporalEqPairs = go []
+  where
+    go ctx (Ato (EqE l r)) = pairOf ctx l r
+    go ctx (Not (Ato (Less l r))) = pairOf ctx l r
+    go ctx (Not p) = go ctx p
+    go ctx (Conn _ p q) = go ctx p ++ go ctx q
+    go ctx (Qua _ v p) = go (v : ctx) p
+    go _ _ = []
+
+    pairOf ctx l r = case (timeVarNameIn ctx l, timeVarNameIn ctx r) of
+      (Just a, Just b) | a /= b -> [(a, b)]
+      _ -> []
+
+-- | Per-occurrence rule-id variable names for rule-id instrumented events in
+-- formulas without split timepoints. The shared "rid" variable is only
+-- meaningful for split-timepoint groups, whose copies it ties to the same
+-- rule instance; reusing it across independent event occurrences would
+-- silently constrain them to the same rule instance. Instead, each event
+-- occurrence gets its own rule-id variable, named after its time variable.
+--
+-- This also gives temporal equalities that survive rewriting (e.g. in
+-- disjunctions such as at-or-before: #j < #i | #j = #i) a translation: in
+-- ProVerif, distinct events never share a timepoint, so a timepoint equality
+-- would be unsatisfiable there. Since in Tamarin equal timepoints mean "same
+-- rule instance", such an equality is translated as an equality between the
+-- rule-id variables of the two events instead.
+--
+-- Only time variables used by exactly one instrumented event are mapped;
+-- anything else falls back to the shared "rid" scheme.
+ridOccurrenceNames :: S.Set String -> LNFormula -> M.Map String String
+ridOccurrenceNames ruleIdEvents fm = M.fromSet ("rid_" ++) mapped
+  where
+    eventTVs = collectEventTimeVars fm
+    tagsOf n = [tag | (n', tag) <- eventTVs, n' == n]
+    mapped =
+      S.fromList
+        [ n
+        | (n, _) <- eventTVs,
+          case tagsOf n of
+            [tag] -> tag `S.member` ruleIdEvents
+            _ -> False
+        ]
+
+-- | Event tags linked by temporal equalities that survive rewriting; these
+-- need rule-id instrumentation so the equality can be translated as a
+-- rule-id equality (see 'ridEqualityNames').
+temporalEqualityLinkedEvents :: LNFormula -> S.Set String
+temporalEqualityLinkedEvents fm =
+  S.fromList $
+    concat
+      [ tagsOf a ++ tagsOf b
+      | (a, b) <- collectTemporalEqPairs fm,
+        not (null (tagsOf a)),
+        not (null (tagsOf b))
+      ]
+  where
+    eventTVs = collectEventTimeVars fm
+    tagsOf n = [tag | (n', tag) <- eventTVs, n' == n]
 
 -- | Make time variables distinct for each action occurrence in a formula.
 -- This ensures that events with shared timepoints in Tamarin get distinct time variables in ProVerif.
@@ -2396,7 +2589,15 @@ formulaUsesRuleIdEvents ruleIdEvents =
 -- Returns a set of fact tag names that need rule IDs.
 detectSharedTimepointEvents :: [ProtoLemma LNFormula ProofSkeleton] -> S.Set String
 detectSharedTimepointEvents lemmas =
-  S.unions $ map (eventsSharingTimepoints . L.get lFormula) lemmas
+  S.unions $ map (analyze . L.get lFormula) lemmas
+  where
+    -- Definite temporal equalities are eliminated by unifying the equated
+    -- timepoints, turning them into shared timepoints; equalities that
+    -- survive (e.g. in disjunctions) are translated as rule-id equalities,
+    -- so their events need rule-id instrumentation as well.
+    analyze fm =
+      let fm' = eliminateTemporalEqualities fm
+       in eventsSharingTimepoints fm' `S.union` temporalEqualityLinkedEvents fm'
 
 loadLemmas ::
   S.Set String ->  -- sharedEventTags: events that need rule IDs
@@ -3165,24 +3366,30 @@ ppLFormulaR keepTimeVars _ruleIdEvents te ppAt =
         pure (filter (\v -> keepTimeVars || lvarSort v /= LSortNode) (vs ++ vsp), d')
 
 ppQueryFormulaR ::
-  (MonadFresh m, Functor s) =>
+  (MonadFresh m) =>
   Bool -> -- True if we want to remove timepoint declarations.
   PVElement ->
+  M.Map String String ->
   S.Set String -> -- events requiring rule identifiers
   TypingEnvironment ->
-  ProtoFormula s (String, LSort) Name LVar ->
+  ProtoFormula Unit2 (String, LSort) Name LVar ->
   [LVar] ->
   String ->
   m Doc
-ppQueryFormulaR keepTimeVars pe ruleIdEvents te fm extravs attrs = do
-  (vs, (p, typeVars)) <- ppLFormulaR keepTimeVars ruleIdEvents te (if keepTimeVars then ppNAtom ruleIdEvents else ppNAtomR ruleIdEvents) fm
-  let includeRuleId = formulaUsesRuleIdEvents ruleIdEvents fm
+ppQueryFormulaR keepTimeVars pe ridNames0 ruleIdEvents te fm extravs attrs = do
+  -- Per-occurrence rule-id variables only make sense while timepoints are kept.
+  let ridNames = if keepTimeVars then ridNames0 else M.empty
+  (vs, (p, typeVars)) <- ppLFormulaR keepTimeVars ruleIdEvents te (if keepTimeVars then ppNAtom ridNames ruleIdEvents else ppNAtomR ruleIdEvents) fm
+  let includeRuleId
+        | M.null ridNames = formulaUsesRuleIdEvents ruleIdEvents fm
+        | otherwise =
+            any
+              (\(tv, tag) -> tag `S.member` ruleIdEvents && tv `M.notMember` ridNames)
+              (collectEventTimeVars fm)
   let ruleIdVar = text "rid:bitstring"
+  let ridEqVars = [text (n ++ ":bitstring") | n <- S.toList . S.fromList $ M.elems ridNames]
   let allVars = map (ppTimeTypeVar typeVars) (S.toList . S.fromList $ extravs ++ vs)
-  let quantifiedVars =
-        if includeRuleId
-          then ruleIdVar : allVars
-          else allVars
+  let quantifiedVars = [ruleIdVar | includeRuleId] ++ ridEqVars ++ allVars
   pure $
     sep
       [ text word <> fsep (punctuate comma quantifiedVars) <> text ";",
@@ -3195,18 +3402,19 @@ ppQueryFormulaR keepTimeVars pe ruleIdEvents te fm extravs attrs = do
       R -> "restriction "
       RSL -> "axiom "
 
-ppQueryFormulaExR :: Bool -> PVElement -> S.Set String -> TypingEnvironment -> LNFormula -> [LVar] -> String -> Doc
-ppQueryFormulaExR keepTimeVars pe ruleIdEvents te fm vs attrs =
-  Precise.evalFresh (ppQueryFormulaR keepTimeVars pe ruleIdEvents te fm vs attrs) (avoidPrecise fm)
+ppQueryFormulaExR :: Bool -> PVElement -> M.Map String String -> S.Set String -> TypingEnvironment -> LNFormula -> [LVar] -> String -> Doc
+ppQueryFormulaExR keepTimeVars pe ridNames ruleIdEvents te fm vs attrs =
+  Precise.evalFresh (ppQueryFormulaR keepTimeVars pe ridNames ruleIdEvents te fm vs attrs) (avoidPrecise fm)
 
 ppRestrictFormulaR ::
   PVElement ->
+  M.Map String String ->
   S.Set String -> -- events requiring rule identifiers
   TypingEnvironment ->
   LNFormula ->
   String ->
   Precise.FreshT Data.Functor.Identity.Identity Doc
-ppRestrictFormulaR pe ruleIdEvents te frm attrs =
+ppRestrictFormulaR pe ridNames ruleIdEvents te frm attrs =
   if any (\(Fact tag _ _) -> factTagName tag == "KU") (formulaFacts frm) -- don't allow KU facts, nothing corresponding in PV
     || (hasLessOrTmpEqInPremise frm && not (hasDistinctFact frm)) -- by this point we have stripped the less if that was possible in the 1st place
     then pure $ ppFail frm
@@ -3259,7 +3467,7 @@ ppRestrictFormulaR pe ruleIdEvents te frm attrs =
       (_, _, fm') <- openFormulaPrefix fm
       handleUniversalFormula fm fm'
     pp fm = pure $ ppFail fm
-    ppOk f l = ppQueryFormulaExR keepTimeVars pe ruleIdEvents te f l attrs
+    ppOk f l = ppQueryFormulaExR keepTimeVars pe ridNames ruleIdEvents te f l attrs
       where
         keepTimeVars = case pe of
           R -> True
@@ -3378,7 +3586,7 @@ ppRestr ruleIdEvents te rstr =
          Just rewritten ->
            -- Successfully rewrote the negated restriction
            text "(* Original: " <> prettyLNFormula rstr._rstrFormula <> text " *)"
-           $$ Precise.evalFresh (ppRestrictFormulaR R ruleIdEvents te rewritten "") (avoidPrecise rewritten)
+           $$ Precise.evalFresh (ppRestrictFormulaR R (ridNamesFor rewritten) ruleIdEvents te rewritten "") (avoidPrecise rewritten)
          Nothing ->
            -- Check for unsupported patterns
            if hasNestedImplicationInConjunction fm
@@ -3396,16 +3604,18 @@ ppRestr ruleIdEvents te rstr =
            then text "(* " <> prettyLNFormula fm <> text " *)"
                 $$ text "(* Restriction has negated event which is not supported in ProVerif. *)"
                 $$ text ""
-           else Precise.evalFresh (ppRestrictFormulaR R ruleIdEvents te fm "") (avoidPrecise fm)
+           else Precise.evalFresh (ppRestrictFormulaR R (ridNamesFor fm) ruleIdEvents te fm "") (avoidPrecise fm)
   where
     -- Apply transformations for restrictions:
     -- 1. First simplify (converts A => F to Not A)
-    -- 2. Then move constraints to conclusion
-    -- 3. Then move negated actions to conclusion: (A & not(B)) => C -> A => (C | B)
-    -- 4. Then expand negated timepoint comparisons
-    -- 5. Then flatten nested implications: A => (B => C) -> (A & B) => C
+    -- 2. Then eliminate temporal equalities by unifying the equated timepoints
+    --    (must happen before constraints are moved to the conclusion)
+    -- 3. Then move constraints to conclusion
+    -- 4. Then move negated actions to conclusion: (A & not(B)) => C -> A => (C | B)
+    -- 5. Then expand negated timepoint comparisons
+    -- 6. Then flatten nested implications: A => (B => C) -> (A & B) => C
     --    (ProVerif doesn't allow nested implications in restrictions)
-    -- 6. Finally pull negations to top (converts All x. Not A to Not (Ex x. A))
+    -- 7. Finally pull negations to top (converts All x. Not A to Not (Ex x. A))
     -- This order is important: simplify first so A => F becomes Not A,
     -- then pullNegationsToTop can pull that Not to the top level
     simplifiedFormula =
@@ -3415,6 +3625,7 @@ ppRestr ruleIdEvents te rstr =
         $ expandNegatedTimepointComparisons
         $ moveNegatedActionsToConclusion
         $ moveConstraintsToConclusion
+        $ eliminateTemporalEqualities
         $ simplifyFormula rstr._rstrFormula
     needsRuleId = formulaHasSharedTimepoints simplifiedFormula
     timepointComment = if needsRuleId
@@ -3423,6 +3634,10 @@ ppRestr ruleIdEvents te rstr =
     fm = if needsRuleId
          then makeTimeVarsDistinct simplifiedFormula
          else simplifiedFormula
+    -- Per-occurrence rule-id variables (and rule-id equalities for surviving
+    -- temporal equalities, e.g. uniqueness restrictions on instrumented
+    -- events); split-timepoint restrictions keep the shared "rid" scheme.
+    ridNamesFor f = if needsRuleId then M.empty else ridOccurrenceNames ruleIdEvents f
 
     -- Check if a formula has a problematic negation (negated event at top level)
     hasProblematicNegation (Not f) = hasEventAnywhere f
@@ -3477,24 +3692,29 @@ ppAxiomLemma ruleIdEvents te l =
        then text "(* " <> prettyLNFormula l._lFormula <> text " *)"
             $$ text "(* Axiom has negated event (not(...event...)) which is not supported in ProVerif. *)"
             $$ text ""
-       else Precise.evalFresh (ppRestrictFormulaR RSL ruleIdEvents te fm "") (avoidPrecise fm)
+       else Precise.evalFresh (ppRestrictFormulaR RSL ridNames ruleIdEvents te fm "") (avoidPrecise fm)
   where
+    -- Per-occurrence rule-id variables, as for restrictions.
+    ridNames = if needsRuleId then M.empty else ridOccurrenceNames ruleIdEvents fm
     -- Apply same transformations as for restrictions
     -- Order matters:
-    -- 1. First move negated actions from premise to conclusion BEFORE pullNots
+    -- 1. First eliminate temporal equalities by unifying the equated timepoints
+    --    (must happen before constraints are moved to the conclusion)
+    -- 2. Then move negated actions from premise to conclusion BEFORE pullNots
     --    (pullNots combines negations via De Morgan, making individual movement impossible)
-    -- 2. Then move constraints to conclusion
-    -- 3. Then apply pullNots to normalize negations
-    -- 4. Then flatten nested implications: A => (B => C) -> (A & B) => C
-    -- 5. Then expand negated timepoint comparisons: not(i < j) -> (j < i) | (i = j)
-    -- 6. Finally simplify
+    -- 3. Then move constraints to conclusion
+    -- 4. Then apply pullNots to normalize negations
+    -- 5. Then flatten nested implications: A => (B => C) -> (A & B) => C
+    -- 6. Then expand negated timepoint comparisons: not(i < j) -> (j < i) | (i = j)
+    -- 7. Finally simplify
     simplifiedFormula =
       simplifyFormula
         $ flattenNestedImplications
         $ expandNegatedTimepointComparisons
         $ transformWithPullNots
         $ moveConstraintsToConclusion
-        $ moveNegatedActionsToConclusion l._lFormula
+        $ moveNegatedActionsToConclusion
+        $ eliminateTemporalEqualities l._lFormula
     needsRuleId = formulaHasSharedTimepoints simplifiedFormula
     timepointComment = if needsRuleId
                        then text "(* Timepoints in lemma have been split *)\n"
@@ -3592,4 +3812,4 @@ loadRestrictions sharedEventTags _ te thy =
 -- | Detect events that share timepoints in restrictions
 detectSharedTimepointEventsRestrictions :: [Restriction] -> S.Set String
 detectSharedTimepointEventsRestrictions restrictions =
-  S.unions $ map (eventsSharingTimepoints . _rstrFormula) restrictions
+  S.unions $ map (eventsSharingTimepoints . eliminateTemporalEqualities . _rstrFormula) restrictions
