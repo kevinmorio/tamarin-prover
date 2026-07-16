@@ -2976,21 +2976,28 @@
                   "value": "\""
                 },
                 {
-                  "type": "FIELD",
-                  "name": "role_identifier",
-                  "content": {
-                    "type": "CHOICE",
-                    "members": [
-                      {
-                        "type": "SYMBOL",
-                        "name": "ident"
-                      },
-                      {
-                        "type": "STRING",
-                        "value": "*"
+                  "type": "CHOICE",
+                  "members": [
+                    {
+                      "type": "FIELD",
+                      "name": "role_identifier",
+                      "content": {
+                        "type": "ALIAS",
+                        "content": {
+                          "type": "IMMEDIATE_TOKEN",
+                          "content": {
+                            "type": "PATTERN",
+                            "value": "[^\"\\r\\n]+"
+                          }
+                        },
+                        "named": true,
+                        "value": "ident"
                       }
-                    ]
-                  }
+                    },
+                    {
+                      "type": "BLANK"
+                    }
+                  ]
                 },
                 {
                   "type": "STRING",
@@ -3006,21 +3013,28 @@
                   "value": "'"
                 },
                 {
-                  "type": "FIELD",
-                  "name": "role_identifier",
-                  "content": {
-                    "type": "CHOICE",
-                    "members": [
-                      {
-                        "type": "SYMBOL",
-                        "name": "ident"
-                      },
-                      {
-                        "type": "STRING",
-                        "value": "*"
+                  "type": "CHOICE",
+                  "members": [
+                    {
+                      "type": "FIELD",
+                      "name": "role_identifier",
+                      "content": {
+                        "type": "ALIAS",
+                        "content": {
+                          "type": "IMMEDIATE_TOKEN",
+                          "content": {
+                            "type": "PATTERN",
+                            "value": "[^'\\r\\n]+"
+                          }
+                        },
+                        "named": true,
+                        "value": "ident"
                       }
-                    ]
-                  }
+                    },
+                    {
+                      "type": "BLANK"
+                    }
+                  ]
                 },
                 {
                   "type": "STRING",

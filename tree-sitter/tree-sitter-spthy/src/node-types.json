@@ -6057,12 +6057,8 @@
     "fields": {
       "role_identifier": {
         "multiple": false,
-        "required": true,
+        "required": false,
         "types": [
-          {
-            "type": "*",
-            "named": false
-          },
           {
             "type": "ident",
             "named": true

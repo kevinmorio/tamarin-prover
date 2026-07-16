@@ -720,8 +720,16 @@ module.exports = grammar({
           'role',
           '=',
           choice(
-              seq('"', field('role_identifier', choice($.ident, '*')), '"'),
-              seq("'", field('role_identifier', choice($.ident, '*')), "'")
+              seq(
+                  '"',
+                  optional(field('role_identifier', alias(token.immediate(/[^"\r\n]+/), $.ident))),
+                  '"'
+              ),
+              seq(
+                  "'",
+                  optional(field('role_identifier', alias(token.immediate(/[^'\r\n]+/), $.ident))),
+                  "'"
+              )
           )
       ),
 
