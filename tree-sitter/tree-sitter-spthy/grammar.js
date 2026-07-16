@@ -797,7 +797,8 @@ module.exports = grammar({
           repeat(seq(
               ',',
               choice($._fact, $.embedded_restriction)
-          ))
+          )),
+          optional(',')
       )),
 
       _facts: $ => prec.left(seq(
@@ -805,7 +806,8 @@ module.exports = grammar({
           repeat(seq(
               ',',
               $._fact
-          ))
+          )),
+          optional(',')
       )),
 
       _fact: $ => choice(
