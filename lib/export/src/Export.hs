@@ -117,11 +117,14 @@ buildDisjunction [] = TF False
 buildDisjunction [f] = f
 buildDisjunction fs = foldr1 (.||.) fs
 
--- | Wrap a formula with quantifiers of the given type.
--- Applies quantifiers from outer to inner (first element becomes outermost quantifier).
-wrapWithQuantifiers :: Quantifier -> [(String, LSort)] -> LNFormula -> LNFormula
-wrapWithQuantifiers _ [] body = body
-wrapWithQuantifiers q (v:vs) body = Qua q v (wrapWithQuantifiers q vs body)
+-- | Rebuild a quantifier prefix around a body that already contains the
+-- corresponding de Bruijn-bound variables. This deliberately uses 'Qua'
+-- directly: 'forAll' and 'exists' quantify free variables instead.
+-- Quantifiers are applied from outer to inner, so the first hint becomes the
+-- outermost quantifier.
+rewrapBoundPrefix :: Quantifier -> [(String, LSort)] -> LNFormula -> LNFormula
+rewrapBoundPrefix _ [] body = body
+rewrapBoundPrefix q (v:vs) body = Qua q v (rewrapBoundPrefix q vs body)
 
 -- | Check if a formula represents a valid existential disjunction pattern.
 -- Valid patterns include:
@@ -1290,8 +1293,7 @@ isQuantifierFree :: LNFormula -> Bool
 isQuantifierFree (Qua {}) = False
 isQuantifierFree (Ato _) = True
 isQuantifierFree (TF _) = True
-isQuantifierFree (Not (Ato (EqE _ _))) = True
-isQuantifierFree (Not _) = True
+isQuantifierFree (Not p) = isQuantifierFree p
 isQuantifierFree (Conn _ p q) = isQuantifierFree p && isQuantifierFree q
 
 -- | Count the number of quantifier alternations in a formula.
@@ -1731,7 +1733,7 @@ applyRewriteForShape shape fm = case shape of
             atoms = collectNegatedAtoms body
             -- Build the conjunction and wrap with existentials, then negate
             conjunction = buildConjunction atoms
-            existential = wrapWithQuantifiers Ex quants conjunction
+            existential = rewrapBoundPrefix Ex quants conjunction
         in Not existential
 
     collectQuantifiers :: LNFormula -> ([(String, LSort)], LNFormula)
@@ -2147,7 +2149,7 @@ convertNegExWithTimeConstraint fm = case fm of
             -- For #i < #j, conclusion is not(#i < #j) which we'll expand later
             conclusion = buildConclusionFromConstraints constraints
             -- Wrap with all the universal quantifiers (converted from existential)
-         in wrapWithQuantifiers All vars (Conn Imp premise conclusion)
+         in rewrapBoundPrefix All vars (Conn Imp premise conclusion)
       _ -> Not (convertNegExWithTimeConstraint fm')
 
   -- Recurse through other structures

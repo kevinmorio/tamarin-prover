@@ -385,7 +385,8 @@ translateRuleDocs ruleIdEvents maybeRname initialVars rprems racts rconcls destr
       tailDocs = rulePrefixDocs ++ docs4 ++ docs5 ++ docs6 ++ docs7 ++ docs8
    in (headDocs, tailDocs, destr3)
 
--- Sorts the actions by putting actions from embedded restrictions, then Eq and Neq, and then the remaming actions.
+-- | Put embedded restrictions first, equality checks second, and all remaining
+-- actions last. 'partition' preserves the source order within each group.
 sortActionsByPriority :: [LNFact] -> [LNFact]
 sortActionsByPriority facts = restrictionFacts ++ eqNeqFacts ++ otherFacts
   where
@@ -395,9 +396,12 @@ sortActionsByPriority facts = restrictionFacts ++ eqNeqFacts ++ otherFacts
     hasRstrPrefix :: String -> LNFact -> Bool
     hasRstrPrefix prefix fact = prefix `isPrefixOf` factTagName (factTag fact)
 
-    -- TOOD: Which ones to add?
     isEqOrNeqFact :: LNFact -> Bool
-    isEqOrNeqFact fact = factTagName (factTag fact) `elem` ["Eq", "Equal", "Neq", "Unequal"]
+    isEqOrNeqFact fact = factTagName (factTag fact) `elem` equalityActionNames
+
+    -- "Eq" is produced by SAPIC. Keep the corresponding negative name and
+    -- the long-form spellings for hand-written embedded MSR actions.
+    equalityActionNames = ["Eq", "Neq", "Equal", "Unequal"]
 
 combineActionDocs :: (HighlightDocument d) => [d] -> [d] -> d
 combineActionDocs rd1 rd2 = vcat rd1 $-$ separateActionDocs rd2
