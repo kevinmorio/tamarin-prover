@@ -217,6 +217,14 @@ functionDecls = do
         fail $ "`" ++ BC.unpack name ++ "` cannot be both `[data]` and `[destructor]`"
       when (FunctionData `elem` attrs && FunctionPrivate `elem` attrs) $
         fail $ "`" ++ BC.unpack name ++ "` cannot be both `[data]` and `[private]`"
+      let conflictingBuiltins =
+            [ builtin
+            | (builtin, names) <- builtinReservedNames
+            , BC.unpack name `elem` names
+            ]
+      when (FunctionData `elem` attrs && not (null conflictingBuiltins)) $
+        fail $ "`" ++ BC.unpack name ++ "` cannot use `[data]` because it is "
+            ++ "reserved by the following builtins: " ++ show conflictingBuiltins
 
     countAttr attr = length . filter (== attr)
 
