@@ -4,8 +4,8 @@ begin
 
 // Function signature and definition of the equational theory E
 
-functions: check_rep/2[destructor], fst/1, get_rep/1[destructor], list/2,
-           pair/2, prog/3, rep/2[private,constructor], report/1, snd/1
+functions: check_rep/2 [destructor], fst/1, get_rep/1 [destructor],
+           list/2, pair/2, prog/3, rep/2 [private,constructor], report/1, snd/1
 equations:
     check_rep(rep(x.1, x.2), x.2) = x.1,
     fst(<x.1, x.2>) = x.1,
@@ -1098,9 +1098,9 @@ restriction locking_1:
 /*
 Generated from:
 Tamarin version 1.13.0
-Maude version 3.4
-Git revision: 1deff12bd69c96308abb2463d4de5f2c7610c191 (with uncommited changes), branch: develop
-Compiled at: 2026-03-09 07:36:56.194364 UTC
+Maude version 3.5.1
+Git revision: abcb0ff3eca770d7b7f58a583b2616eafe845e15, branch: fix-derivation-check-warnings
+Compiled at: 2026-07-22 11:02:46.6864 UTC
 */
 
 end
@@ -1112,7 +1112,7 @@ summary of summaries:
 analyzed: examples/sapic/slow/feature-locations/AC_sid_with_attack.spthy
 
   output:          examples/sapic/slow/feature-locations/AC_sid_with_attack.spthy.tmp
-  processing time: 0.83s
+  processing time: 0.49s
   
   attested_comput (exists-trace): falsified - no trace found (2 steps)
 
