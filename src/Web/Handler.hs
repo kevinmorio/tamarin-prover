@@ -29,7 +29,10 @@ module Web.Handler
   , getTheoryPathDiffMR
   -- , getTheoryPathDR
   , getTheoryGraphR
+  , getTheoryGraphJsonR
   , getTheoryInteractiveGraphR
+  , getTheoryGraphJsonDiffR
+  , getTheoryGraphJsonMirrorDiffR
   , getTheoryGraphDiffR
   , getTheoryMirrorDiffR
   , getTheoryInteractiveGraphDiffR
@@ -897,7 +900,7 @@ getInteractiveOverviewR idx path = withTheory idx ( \ti -> do
 getInteractiveDotGraphR :: TheoryIdx -> TheoryPath -> Handler Html
 getInteractiveDotGraphR idx path = withTheory idx ( \ti -> do
   renderF <- getUrlRender
-  let dotPath = T.unpack $ renderF (TheoryInteractiveGraphR idx path)
+  let dotPath = T.unpack $ renderF (TheoryGraphJsonR idx path)
   intdotLayout $ do 
       setTitle (toHtml $ "Theory: " ++ ti.theory._thyName)
       toWidget
@@ -908,8 +911,8 @@ getInteractiveDotGraphR idx path = withTheory idx ( \ti -> do
 getInteractiveDotGraphDiffR :: TheoryIdx -> DiffTheoryPath -> Handler Html
 getInteractiveDotGraphDiffR idx path = withDiffTheory idx (\ti -> do
   renderF <- getUrlRender
-  let dotPath = T.unpack $ renderF (TheoryInteractiveGraphDiffR idx path)
-  intdotLayout $ do 
+  let dotPath = T.unpack $ renderF (TheoryGraphJsonDiffR idx path)
+  intdotLayout $ do
       setTitle (toHtml $ "DiffTheory: " ++ ti.theory._diffThyName)
       toWidget
         [hamlet|
@@ -919,8 +922,8 @@ getInteractiveDotGraphDiffR idx path = withDiffTheory idx (\ti -> do
 getInteractiveDotGraphMirrorDiffR :: TheoryIdx -> DiffTheoryPath -> Handler Html
 getInteractiveDotGraphMirrorDiffR idx path = withDiffTheory idx (\ti -> do
   renderF <- getUrlRender
-  let dotPath = T.unpack $ renderF (TheoryInteractiveMirrorDiffR idx path)
-  intdotLayout $ do 
+  let dotPath = T.unpack $ renderF (TheoryGraphJsonMirrorDiffR idx path)
+  intdotLayout $ do
       setTitle (toHtml $ "DiffTheory: " ++ ti.theory._diffThyName)
       toWidget
         [hamlet|
@@ -1365,6 +1368,35 @@ getTheoryGraphR idx path = withTheory idx $ \ti -> do
   case img' of
     Nothing -> notFound
     Just img -> sendFile (fromString . imageFormatMIME $ yesod.imageFormat) img
+
+-- | Get the graph as JSON for theory and given path.
+getTheoryGraphJsonR :: TheoryIdx -> TheoryPath -> Handler ()
+getTheoryGraphJsonR idx path = withTheory idx (\ti -> do
+    yesod <- getYesod
+    (graphOptions, dotOptions) <- getOptions
+    -- abbreviate is False iff "abbreviate-in-backend" is not set
+    abbreviate <- isJust <$> lookupGetParam "abbrevInBackend"
+    jsonStr <- liftIO $ traceExceptions "getTheoryGraphJsonR" $
+        graphJsonThyPath (yesod.cacheDir) (\label system -> sequentsToJSONPretty graphOptions [(label, system)]) abbreviate (ti.theory) path
+
+    sendFile (fromString ".json") jsonStr)
+
+-- | Get the graph as JSON for diff theory and given path.
+getTheoryGraphJsonDiffR :: TheoryIdx -> DiffTheoryPath -> Handler ()
+getTheoryGraphJsonDiffR idx path = getTheoryGraphJsonDiffR' idx path False
+
+-- | Get the mirror graph as JSON for diff theory and given path.
+getTheoryGraphJsonMirrorDiffR :: TheoryIdx -> DiffTheoryPath -> Handler ()
+getTheoryGraphJsonMirrorDiffR idx path = getTheoryGraphJsonDiffR' idx path True
+
+getTheoryGraphJsonDiffR' :: TheoryIdx -> DiffTheoryPath -> Bool -> Handler ()
+getTheoryGraphJsonDiffR' idx path mirror = withDiffTheory idx $ \ti -> do
+    yesod <- getYesod
+    (graphOptions, dotOptions) <- getOptions
+    abbreviate <- isJust <$> lookupGetParam "abbrevInBackend"
+    jsonStr <- liftIO $ traceExceptions "getTheoryGraphJsonDiffR" $
+        graphJsonDiffThyPath (yesod.cacheDir) (\label system -> sequentsToJSONPretty graphOptions [(label, system)]) abbreviate (ti.theory) path mirror
+    sendFile (fromString ".json") jsonStr
 
 -- | Get rendered interactive dot graph for theory and given path.
 getTheoryInteractiveGraphR:: TheoryIdx -> TheoryPath -> Handler T.Text
