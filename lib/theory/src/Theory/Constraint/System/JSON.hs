@@ -31,7 +31,9 @@ module Theory.Constraint.System.JSON (
     sequentsToJSON,                     
     writeSequentAsJSONToFile,
     sequentsToJSONPretty,
-    writeSequentAsJSONPrettyToFile
+    writeSequentAsJSONPrettyToFile,
+    JSONGraph(..),
+    JSONGraphs(..)
   ) where
 import           Extension.Data.Label       as L (get)
 import           Data.Aeson
@@ -144,7 +146,46 @@ data JSONGraphs = JSONGraphs
     } deriving (Show)
 
 -- | Derive ToJSON and FromJSON. 
-concat <$> mapM (deriveJSON defaultOptions) [''JSONGraphNodeFact, ''JSONGraphNodeMetadata, ''JSONGraphEdge, ''JSONGraphCluster, ''JSONGraphAbbrev, ''JSONGraph, ''JSONGraphs]
+concat <$> mapM (deriveJSON defaultOptions) [''JSONGraphNodeFact, ''JSONGraphNodeMetadata, ''JSONGraphCluster, ''JSONGraphAbbrev, ''JSONGraphs]
+
+-- Some JSON graph exports omit the presentation-only edge color. The frontend
+-- already treats an empty color as the default black, so accept that format too.
+instance FromJSON JSONGraphEdge where
+  parseJSON = withObject "JSONGraphEdge" $ \o -> JSONGraphEdge
+      <$> o .: "jgeSource"
+      <*> o .: "jgeRelation"
+      <*> o .: "jgeTarget"
+      <*> o .:? "jgeColor" .!= ""
+
+instance ToJSON JSONGraphEdge where
+  toJSON (JSONGraphEdge source relation target color) = object
+      [ "jgeSource" .= source
+      , "jgeRelation" .= relation
+      , "jgeTarget" .= target
+      , "jgeColor" .= color
+      ]
+
+-- Cluster and abbreviation collections are optional.
+instance FromJSON JSONGraph where
+  parseJSON = withObject "JSONGraph" $ \o -> JSONGraph
+      <$> o .: "jgDirected"
+      <*> o .: "jgType"
+      <*> o .: "jgLabel"
+      <*> o .: "jgNodes"
+      <*> o .: "jgEdges"
+      <*> o .:? "jgClusters" .!= []
+      <*> o .:? "jgAbbrevs" .!= []
+
+instance ToJSON JSONGraph where
+  toJSON (JSONGraph directed graphType label nodes edges clusters abbrevs) = object
+      [ "jgDirected" .= directed
+      , "jgType" .= graphType
+      , "jgLabel" .= label
+      , "jgNodes" .= nodes
+      , "jgEdges" .= edges
+      , "jgClusters" .= clusters
+      , "jgAbbrevs" .= abbrevs
+      ]
 
 -- | Optional fields are not handled correctly with automatically derived instances
 -- hence, we have our own here.
