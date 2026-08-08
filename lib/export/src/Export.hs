@@ -68,6 +68,14 @@ data LemmaTranslationMode
   | ExcludeLemma  -- ^ Don't translate at all
   deriving (Eq, Ord, Show)
 
+-- | How the evaluation harness reconstructs a Tamarin lemma result from the
+-- generated ProVerif query result. This is query metadata: it must not be
+-- inferred later from the rendered query's superficial syntax.
+data QueryPolarity
+  = DirectResult
+  | InvertResult
+  deriving (Eq, Ord, Show)
+
 -- | Information needed during translation.
 data TranslationContext = TranslationContext
   { trans :: Translation,
@@ -117,6 +125,97 @@ buildDisjunction [] = TF False
 buildDisjunction [f] = f
 buildDisjunction fs = foldr1 (.||.) fs
 
+-- | Positive formulas accepted in a correspondence premise.  The predicate
+-- is deliberately structural: action names and protocol vocabulary play no
+-- role in normalization.
+isSupportedPositivePremise :: LNFormula -> Bool
+isSupportedPositivePremise (Ato (Action _ _)) = True
+isSupportedPositivePremise (Ato (EqE _ _)) = True
+isSupportedPositivePremise (Ato (Less _ _)) = True
+isSupportedPositivePremise (Not (Ato (EqE _ _))) = True
+isSupportedPositivePremise (Not (Ato (Less _ _))) = True
+isSupportedPositivePremise (Conn And left right) =
+  isSupportedPositivePremise left && isSupportedPositivePremise right
+isSupportedPositivePremise (Conn Or left right) =
+  isSupportedPositivePremise left && isSupportedPositivePremise right
+isSupportedPositivePremise (TF True) = True
+isSupportedPositivePremise _ = False
+
+-- | Positive formulas accepted in a correspondence conclusion.  Existential
+-- quantifiers are allowed, but positive universals and negated actions are
+-- not part of ProVerif's correspondence fragment.
+isSupportedPositiveConclusion :: LNFormula -> Bool
+isSupportedPositiveConclusion (Qua Ex _ body) =
+  isSupportedPositiveConclusion body
+isSupportedPositiveConclusion (Ato (Action _ _)) = True
+isSupportedPositiveConclusion (Ato (EqE _ _)) = True
+isSupportedPositiveConclusion (Ato (Less _ _)) = True
+isSupportedPositiveConclusion (Not (Ato (EqE _ _))) = True
+isSupportedPositiveConclusion (Not (Ato (Less _ _))) = True
+isSupportedPositiveConclusion (Conn And left right) =
+  isSupportedPositiveConclusion left && isSupportedPositiveConclusion right
+isSupportedPositiveConclusion (Conn Or left right) =
+  isSupportedPositiveConclusion left && isSupportedPositiveConclusion right
+isSupportedPositiveConclusion (TF True) = True
+isSupportedPositiveConclusion (TF False) = True
+isSupportedPositiveConclusion _ = False
+
+formulaContainsAction :: LNFormula -> Bool
+formulaContainsAction =
+  foldFormula
+    (\atom -> case atom of Action _ _ -> True; _ -> False)
+    (const False)
+    id
+    (\_ left right -> left || right)
+    (\_ _ body -> body)
+
+-- | Knowledge atoms need separate fragment checks before any query rewriting.
+-- KU is an internal message-deduction annotation and is outside the formal
+-- translation.  K is supported for all-trace properties only when every K
+-- occurrence is positive in NNF(not phi), exactly as required by T-UKF.
+-- Restrictions and reuse/source axioms are assumptions, so their direct
+-- preservation instead requires positive K occurrences in NNF(phi).
+formulaContainsKUFact :: LNFormula -> Bool
+formulaContainsKUFact =
+  any (\(Fact tag _ _) -> tag == KUFact) . formulaFacts
+
+formulaContainsKFact :: LNFormula -> Bool
+formulaContainsKFact =
+  any isKLogFact . formulaFacts
+
+isKnowledgeFact :: Fact t -> Bool
+isKnowledgeFact fact@(Fact tag _ _) = tag == KUFact || isKLogFact fact
+
+hasNegativeKInNNF :: LNFormula -> Bool
+hasNegativeKInNNF = go . nnf . simplifyFormula
+  where
+    go (Not (Ato (Action _ fact))) = isKLogFact fact
+    go (Not body) = go body
+    go (Conn _ left right) = go left || go right
+    go (Qua _ _ body) = go body
+    go _ = False
+
+hasNegativeKInNegatedNNF :: LNFormula -> Bool
+hasNegativeKInNegatedNNF = hasNegativeKInNNF . Not
+
+queryKnowledgeFragmentFailure :: TraceQuantifier -> LNFormula -> Maybe String
+queryKnowledgeFragmentFailure traceQuantifier formula
+  | formulaContainsKUFact formula =
+      Just "formula contains KU fact, which is outside the supported formal semantics"
+  | traceQuantifier == ExistsTrace && formulaContainsKFact formula =
+      Just "exists-trace formula contains K fact; completeness is only proved for K-free formulas"
+  | hasNegativeKInNegatedNNF formula =
+      Just "formula is outside T-UKF: NNF(not(phi)) contains a negative K atom"
+  | otherwise = Nothing
+
+assumptionKnowledgeFragmentFailure :: LNFormula -> Maybe String
+assumptionKnowledgeFragmentFailure formula
+  | formulaContainsKUFact formula =
+      Just "formula contains KU fact, which is outside the supported formal semantics"
+  | hasNegativeKInNNF formula =
+      Just "NNF(phi) contains a negative K atom, which cannot be translated soundly as an assumption"
+  | otherwise = Nothing
+
 -- | Rebuild a quantifier prefix around a body that already contains the
 -- corresponding de Bruijn-bound variables. This deliberately uses 'Qua'
 -- directly: 'forAll' and 'exists' quantify free variables instead.
@@ -125,6 +224,113 @@ buildDisjunction fs = foldr1 (.||.) fs
 rewrapBoundPrefix :: Quantifier -> [(String, LSort)] -> LNFormula -> LNFormula
 rewrapBoundPrefix _ [] body = body
 rewrapBoundPrefix q (v:vs) body = Qua q v (rewrapBoundPrefix q vs body)
+
+-- | Apply the structural rewrites shared by query rendering and
+-- property-driven instrumentation analysis. Keeping this as one pipeline is
+-- important: completion demand must be computed from the correspondence that
+-- is actually rendered, after negative premise actions have moved to the
+-- conclusion.
+rewriteFormulaForQuery :: TraceQuantifier -> LNFormula -> LNFormula
+rewriteFormulaForQuery traceQuantifier fm =
+  let fmInj
+        | traceQuantifier == AllTraces = rewriteInjectiveAgreement fm
+        | otherwise = fm
+      fm0 = eliminateTemporalEqualities fmInj
+      fm1 = eliminateDoubleNegations fm0
+      fm1a = moveNegatedActionsToConclusion fm1
+      fm1b = convertNegExWithTimeConstraint fm1a
+      shape = classifyFormulaShape traceQuantifier fm1b
+   in flattenNestedQuantifiers (applyRewriteForShape shape fm1b)
+  where
+    flattenNestedQuantifiers (Qua All x body) =
+      case flattenNestedQuantifiers body of
+        Conn Imp prem concl
+          | needsFlatteningInConclusion concl -> Qua All x (Conn Imp prem (pnf concl))
+          | otherwise -> Qua All x (Conn Imp prem concl)
+        body' -> Qua All x body'
+    flattenNestedQuantifiers (Conn Imp prem concl)
+      | needsFlatteningInConclusion concl = Conn Imp prem (pnf concl)
+      | otherwise = Conn Imp prem concl
+    flattenNestedQuantifiers formula@(Qua Ex _ _) = pnf formula
+    flattenNestedQuantifiers (Not formula@(Qua Ex _ _)) = Not (pnf formula)
+    flattenNestedQuantifiers (Conn And left right) =
+      Conn And
+        (flattenNestedQuantifiers left)
+        (flattenNestedQuantifiers right)
+    flattenNestedQuantifiers formula = formula
+
+    needsFlatteningInConclusion (Qua Ex _ body) =
+      needsFlatteningInConclusion body
+    needsFlatteningInConclusion (Conn And left right) =
+      hasNestedEx left || hasNestedEx right
+    needsFlatteningInConclusion (Conn Or _ _) = False
+    needsFlatteningInConclusion _ = False
+
+    hasNestedEx (Qua Ex _ _) = True
+    hasNestedEx (Conn And left right) =
+      hasNestedEx left || hasNestedEx right
+    hasNestedEx _ = False
+
+-- | Axiom-side equivalent of 'rewriteFormulaForQuery'.  Completion analysis
+-- uses this exact transformation before deciding which rule actions need the
+-- internal completion event.
+rewriteFormulaForAxiom :: LNFormula -> LNFormula
+rewriteFormulaForAxiom =
+  simplifyFormula
+    . flattenNestedImplications
+    . expandNegatedTimepointComparisons
+    . transformWithPullNots
+    . moveConstraintsToConclusion
+    . moveNegatedActionsToConclusion
+    . eliminateTemporalEqualities
+
+mapTopLevelConjunctsFormula :: (LNFormula -> LNFormula) -> LNFormula -> LNFormula
+mapTopLevelConjunctsFormula f (Conn And left right) =
+  Conn And
+    (mapTopLevelConjunctsFormula f left)
+    (mapTopLevelConjunctsFormula f right)
+mapTopLevelConjunctsFormula f fm = f fm
+
+-- | Make quantifier hints unique throughout a formula without changing any
+-- de Bruijn references. Some equivalence-preserving rewrites duplicate closed
+-- quantified scopes or move independently scoped formulas next to each other.
+-- The later shared-timepoint analysis uses binder hints to recover occurrence
+-- groups, so equal hints from independent scopes must not be conflated.
+makeBinderHintsGloballyUnique :: LNFormula -> LNFormula
+makeBinderHintsGloballyUnique formula = snd (go S.empty formula)
+  where
+    reserved = collectHintNames formula
+
+    go used (Qua q (name, srt) body) =
+      let name'
+            | name `S.notMember` used = name
+            | otherwise = freshName name used
+          (used', body') = go (S.insert name' used) body
+       in (used', Qua q (name', srt) body')
+    go used (Not body) =
+      let (used', body') = go used body
+       in (used', Not body')
+    go used (Conn conn left right) =
+      let (used', left') = go used left
+          (used'', right') = go used' right
+       in (used'', Conn conn left' right')
+    go used body = (used, body)
+
+    collectHintNames (Qua _ (name, _) body) =
+      S.insert name (collectHintNames body)
+    collectHintNames (Not body) = collectHintNames body
+    collectHintNames (Conn _ left right) =
+      collectHintNames left `S.union` collectHintNames right
+    collectHintNames _ = S.empty
+
+    freshName name used =
+      head
+        [ candidate
+        | i <- [(1 :: Integer) ..],
+          let candidate = name ++ "_" ++ show i,
+          candidate `S.notMember` reserved,
+          candidate `S.notMember` used
+        ]
 
 -- | Check if a formula represents a valid existential disjunction pattern.
 -- Valid patterns include:
@@ -165,6 +371,7 @@ isExistentialDisjunction (Conn And fm1 fm2) = do
   pure $ b1 && b2
 isExistentialDisjunction fm | isConstraintAtom fm = pure True
 isExistentialDisjunction fm | isBareActionAtom fm = pure True
+isExistentialDisjunction (TF _) = pure True
 isExistentialDisjunction _ = pure False
 
 -- | Check if a formula is a temporal or equality constraint
@@ -245,7 +452,7 @@ prettyProVerifTheory ::
   (OpenTheory, TypingEnvironment) ->
   IO Doc
 prettyProVerifTheory m noReuseLemmas noSourceLemmas noRestrictions noMultiset noPrecise hasSpecificLemmas lemSel (thy', typEnv) = do
-  headersTheory <- loadHeaders sharedEventTags tc thy typEnv -- load headers from theory
+  headersTheory <- loadHeaders propertyEventTags tc thy typEnv -- load headers from theory
   let headersTranslation =
         [ baseHeaders, -- base headers for translation
           prochd, -- headers from the process
@@ -274,17 +481,86 @@ prettyProVerifTheory m noReuseLemmas noSourceLemmas noRestrictions noMultiset no
       | null (theoryRules thy) = proc
       | otherwise = proc <-> text "|" <-> ruleComb
     baseHeaders = if hasUnboundState then stateHeaders else S.empty
-    -- Compute shared events from both lemmas and restrictions
-    lemmaSharedEvents = detectSharedTimepointEvents (filter lemSel (theoryLemmas thy))
+    -- Analyze every included query and helper axiom after the same generic
+    -- all-trace normalization used by their renderers.  Instrumentation is
+    -- therefore driven solely by the translated properties, including
+    -- helper axioms that were not selected on the command line.
+    selectedQueryLemmas =
+      [ lemma
+      | lemma <- theoryLemmas thy,
+        classifyLemma hasSpecificLemmas tc lemSel lemma == AsQuery
+      ]
+    propertyAnalysisFormula lemma =
+      let simplified = simplifyFormula lemma._lFormula
+          dualized
+            | lemma._lTraceQuantifier == ExistsTrace =
+                rewritePositiveWitnessExistsTrace simplified
+            | otherwise = Nothing
+          normalized
+            | lemma._lTraceQuantifier == AllTraces =
+                normalizeAllTraceFormula simplified
+            | otherwise = Nothing
+          formula =
+            fromMaybe
+              (fromMaybe simplified normalized)
+              dualized
+       in if isJust normalized
+            then
+              mapTopLevelConjunctsFormula
+                (rewriteFormulaForQuery lemma._lTraceQuantifier)
+                formula
+            else rewriteFormulaForQuery lemma._lTraceQuantifier formula
+    propertyBaseFormula lemma =
+      let simplified = simplifyFormula lemma._lFormula
+       in if lemma._lTraceQuantifier == AllTraces
+            then fromMaybe simplified (normalizeAllTraceFormula simplified)
+            else simplified
+    normalizedAxiomFormulas =
+      [ normalized
+      | lemma <- theoryLemmas thy,
+        classifyLemma hasSpecificLemmas tc lemSel lemma == AsAxiom,
+        Just normalized <-
+          [normalizeAllTraceFormula (simplifyFormula lemma._lFormula)]
+      ]
+    rewrittenAxiomFormulas =
+      map
+        (mapTopLevelConjunctsFormula rewriteFormulaForAxiom)
+        normalizedAxiomFormulas
+    lemmaSharedEvents =
+      S.unions
+        ( [ eventsRequiringRuleIds lemma._lFormula
+              `S.union` eventsRequiringRuleIds (propertyBaseFormula lemma)
+              `S.union` translatedTemporalEqualityEvents lemma
+          | lemma <- selectedQueryLemmas
+          ]
+            ++ map eventsRequiringRuleIds normalizedAxiomFormulas
+        )
+    translatedTemporalEqualityEvents lemma =
+      let rewritten = propertyAnalysisFormula lemma
+       in if countQuantifierAlternations rewritten <= 1
+            then temporalEqualityLinkedEventsByBinder rewritten
+            else S.empty
+    completionTriggerEvents =
+      S.unions
+        ( [ completionTriggersForFormula (propertyAnalysisFormula lemma)
+          | lemma <- selectedQueryLemmas
+          ]
+            ++ map completionTriggersForFormula rewrittenAxiomFormulas
+        )
     restrictionSharedEvents = detectSharedTimepointEventsRestrictions (theoryRestrictions thy)
     sharedEventTags = lemmaSharedEvents `S.union` restrictionSharedEvents
+    propertyEventTags
+      | S.null completionTriggerEvents = sharedEventTags
+      | otherwise = S.insert ruleCompletedEvent sharedEventTags
     (restrictions, restrictionHeaders) =
       if skipRestrictions tc
         then ([], S.empty)
         else loadRestrictions sharedEventTags tc typEnv thy
     queries = loadQueries thy
-    (axioms, lemmas, lemmaHeaders) = loadLemmas sharedEventTags hasSpecificLemmas lemSel tc typEnv thy
-    (ruleproc, ruleComb, ruleHeaders) = loadRules sharedEventTags thy m
+    (axioms, lemmas, lemmaHeaders) =
+      loadLemmas propertyEventTags hasSpecificLemmas lemSel tc typEnv thy
+    (ruleproc, ruleComb, ruleHeaders) =
+      loadRules sharedEventTags completionTriggerEvents thy m
     (macroproc, macroprochd) =
       -- if stateM is not empty, we have inlined the process calls, so we don't reoutput them
       if hasBoundState then ([text ""], S.empty) else loadMacroProc tc thy
@@ -1197,8 +1473,8 @@ ppProtoAtom ::
   (d, M.Map k SapicType)
 ppProtoAtom ridOf ruleIdEvents te _ _ ppT (Action v f@(Fact tag _ ts))
   | factTagArity tag /= length ts = translationFail $ "MALFORMED function" ++ show tag
-  | (tag == KUFact) || isKLogFact f -- treat KU() and K() facts the same
-    =
+  | tag == KUFact = translationFail "KU facts are outside the supported formula translation"
+  | isKLogFact f =
       (ppFactL "attacker" ts <> opAction <> ppT v, M.empty)
   | otherwise =
       ( text "event("
@@ -1333,7 +1609,7 @@ ppQueryFormula ::
   String ->
   m Doc
 ppQueryFormula ridNames ruleIdEvents te fm extravs attrs = do
-  (vs, (p, typeVars)) <- ppLFormula te (ppNAtom ridNames ruleIdEvents) fm
+  (vs, (p, typeVars)) <- renderQuery fm
   -- The shared "rid" variable is needed for rule-id instrumented events
   -- without a per-occurrence rule-id variable (see ridOccurrenceNames);
   -- the per-occurrence variables are declared separately below.
@@ -1368,6 +1644,23 @@ ppQueryFormula ridNames ruleIdEvents te fm extravs attrs = do
           [ queryLine,
             nest 1 p <> attrsDoc <> text "."
           ]
+  where
+    -- ProVerif has no 'true' query premise. In queries only, attacker(())
+    -- supplies an always-true premise accepted by the evaluation build.
+    renderQuery (Conn Imp (TF True) conclusion) = do
+      (vs, (conclusionDoc, typeVars)) <-
+        ppLFormula te (ppNAtom ridNames ruleIdEvents) conclusion
+      pure
+        ( vs,
+          ( sep
+              [ opParens (text "attacker(())") <-> text "==>",
+                opParens conclusionDoc
+              ],
+            typeVars
+          )
+        )
+    renderQuery formula =
+      ppLFormula te (ppNAtom ridNames ruleIdEvents) formula
 
 ppTimeTypeVar :: M.Map LVar SapicType -> LVar -> Doc
 ppTimeTypeVar _ lvar@(LVar _ LSortNode _) = ppLVar lvar <> text ":time"
@@ -1376,9 +1669,136 @@ ppTimeTypeVar te lvar =
     Nothing -> ppLVar lvar <> text ":bitstring"
     Just t -> ppLVar lvar <> text ":" <> text (ppType t)
 
+-- | Rename timepoint variables whose name collides with a term variable.
+-- Tamarin keeps term variables ('t') and timepoint variables ('#t') in
+-- separate namespaces, but a ProVerif query has a single namespace. The term
+-- variable keeps its name; the colliding timepoint gets a fresh name
+-- ('#t' -> '#t1'). Timepoints still bound in the formula are renamed at their
+-- binder; timepoints already opened by the caller are renamed as free
+-- variables and in the extra query variables. Returns the renaming so that
+-- keys of per-occurrence rule-id maps can be remapped alongside.
+renameCollidingTimepoints :: LNFormula -> [LVar] -> (M.Map String String, LNFormula, [LVar])
+renameCollidingTimepoints fm extravs
+  | M.null renaming = (renaming, fm, extravs)
+  | otherwise = (renaming, renameFrees (renameHints fm), map renameVar extravs)
+  where
+    hints = collectHints fm
+    freeVars = frees fm ++ extravs
+    termNames =
+      S.fromList $
+        [n | (n, s) <- hints, s /= LSortNode]
+          ++ [n | LVar n s _ <- freeVars, s /= LSortNode]
+    nodeNames =
+      S.fromList $
+        [n | (n, LSortNode) <- hints]
+          ++ [n | LVar n LSortNode _ <- freeVars]
+    usedNames = S.fromList (map fst hints) `S.union` S.fromList (map lvarName freeVars)
+    renaming =
+      M.fromList . snd $
+        List.mapAccumL freshen usedNames (S.toList (termNames `S.intersection` nodeNames))
+    freshen used n =
+      let n' = head [c | i <- [(1 :: Integer) ..], let c = n ++ show i, c `S.notMember` used]
+       in (S.insert n' used, (n, n'))
+
+    collectHints (Qua _ h p) = h : collectHints p
+    collectHints (Not p) = collectHints p
+    collectHints (Conn _ p q) = collectHints p ++ collectHints q
+    collectHints _ = []
+
+    renameHints (Qua q (n, s) p)
+      | s == LSortNode, Just n' <- M.lookup n renaming = Qua q (n', s) (renameHints p)
+      | otherwise = Qua q (n, s) (renameHints p)
+    renameHints (Not p) = Not (renameHints p)
+    renameHints (Conn c p q) = Conn c (renameHints p) (renameHints q)
+    renameHints f = f
+
+    renameFrees = apply substRename
+    substRename :: LNSubst
+    substRename =
+      substFromList
+        [ (v, varTerm (renameVar v))
+          | v@(LVar n LSortNode _) <- List.nub (frees fm),
+            n `M.member` renaming
+        ]
+
+    renameVar v@(LVar n LSortNode _)
+      | Just n' <- M.lookup n renaming = v {lvarName = n'}
+    renameVar v = v
+
+-- | Sibling quantifiers that reuse a binder name collapse to one query
+-- variable when the formula is flattened into a single ProVerif query. For
+-- binders separated by a (positive) disjunction this is harmless: the merged
+-- variable is used once per disjunct, and distributing an existential over a
+-- disjunction is an equivalence. Binders whose scopes can be active on the
+-- same conjunctive path must stay distinct, however: merging them equates
+-- independent timepoints, and ProVerif rejects the result outright for time
+-- variables ("Time variable also assigned"). Rename every later duplicate
+-- that is not separated from all earlier same-named binders by a
+-- disjunction.
+renameConjunctiveDuplicateBinders :: LNFormula -> [LVar] -> LNFormula
+renameConjunctiveDuplicateBinders fm extravs = snd (go True M.empty st0 fm)
+  where
+    st0 = (0 :: Int, M.empty :: M.Map String [M.Map Int Bool], used0)
+    -- Avoid both the raw names and the printed forms ('n_i' for index i) of
+    -- all binders and free variables.
+    used0 =
+      S.fromList (map fst hints)
+        `S.union` S.fromList (map printedName (frees fm ++ extravs))
+    printedName (LVar n _ 0) = n
+    printedName (LVar n _ i) = n ++ "_" ++ show i
+    hints = collectHints fm
+    collectHints (Qua _ h p) = h : collectHints p
+    collectHints (Not p) = collectHints p
+    collectHints (Conn _ p q) = collectHints p ++ collectHints q
+    collectHints _ = []
+
+    -- A positive disjunction separates its branches; under negation the roles
+    -- of conjunction and disjunction swap. Implication premises count as
+    -- negated; premise and conclusion are not separated from each other.
+    go pos w st (Conn Or p q)
+      | pos = branch pos w st Or p q
+    go pos w st (Conn And p q)
+      | not pos = branch pos w st And p q
+    go pos w st (Conn Imp p q) =
+      let (st1, p') = go (not pos) w st p
+          (st2, q') = go pos w st1 q
+       in (st2, Conn Imp p' q')
+    go pos w st (Conn c p q) =
+      let (st1, p') = go pos w st p
+          (st2, q') = go pos w st1 q
+       in (st2, Conn c p' q')
+    go pos w st (Not p) = let (st1, p') = go (not pos) w st p in (st1, Not p')
+    go pos w (oid, kept, used) (Qua q (n, s) p) =
+      let conflicts = any (conflicting w) (M.findWithDefault [] n kept)
+          (n', used') =
+            if conflicts
+              then let c = freshName n used in (c, S.insert c used)
+              else (n, used)
+          kept' = M.insertWith (++) n' [w] kept
+          (st1, p') = go pos w (oid, kept', used') p
+       in (st1, Qua q (n', s) p')
+    go _ _ st f = (st, f)
+
+    branch pos w (oid, kept, used) c p q =
+      let (st1, p') = go pos (M.insert oid True w) (oid + 1, kept, used) p
+          (st2, q') = go pos (M.insert oid False w) st1 q
+       in (st2, Conn c p' q')
+
+    -- Two binders conflict unless some disjunction on both their paths
+    -- separates them (same node, different sides).
+    conflicting w w' = and (M.elems (M.intersectionWith (==) w w'))
+    -- 'n_i' matches how the freshness machinery would have printed a
+    -- disambiguated duplicate, keeping the output stable for formulas it
+    -- already handled (nested duplicates).
+    freshName n used = head [c | i <- [(1 :: Integer) ..], let c = n ++ "_" ++ show i, c `S.notMember` used]
+
 ppQueryFormulaEx :: M.Map String String -> S.Set String -> TypingEnvironment -> LNFormula -> [LVar] -> String -> Doc
-ppQueryFormulaEx ridNames ruleIdEvents te fm vs attrs =
+ppQueryFormulaEx ridNames0 ruleIdEvents te fm0 vs0 attrs =
   Precise.evalFresh (ppQueryFormula ridNames ruleIdEvents te fm vs attrs) (avoidPrecise fm)
+  where
+    (renaming, fm1, vs) = renameCollidingTimepoints fm0 vs0
+    fm = renameConjunctiveDuplicateBinders fm1 vs
+    ridNames = M.mapKeys (\k -> M.findWithDefault k k renaming) ridNames0
 
 ppRestrictFormula ::
   M.Map String String ->
@@ -1388,9 +1808,8 @@ ppRestrictFormula ::
   String ->
   Precise.FreshT Data.Functor.Identity.Identity (Doc, Bool)
 ppRestrictFormula ridNames ruleIdEvents te frm attrs =
-  if any (\(Fact tag _ _) -> factTagName tag == "KU") $ formulaFacts frm
-    then -- todo: Add all translation warnings to the wellformedness report.
-      pure (ppFail (Just "lemma contains KU fact") frm, False)
+  if formulaContainsKUFact frm
+    then pure (ppFail (Just "formula contains KU fact") frm, False)
     else renderFormula frm
   where
     -- attrs contains lemma attributes like "[induction]" but these don't affect
@@ -1460,106 +1879,107 @@ ppRestrictFormula ridNames ruleIdEvents te frm attrs =
 -- 3. Split top-level connectives (AND for all-traces, OR for exists-trace)
 -- 4. Apply final transformations and print each subformula
 ppLemma :: S.Set String -> TypingEnvironment -> Lemma ProofSkeleton -> Doc
+ppLemma _ruleIdEvents _te p
+  | Just reason <- queryKnowledgeFragmentFailure p._lTraceQuantifier p._lFormula =
+      text "(*" <> text p._lName <> text "*)"
+        $$ text ("(* Lemma translation failed: " ++ reason ++ ". *)")
+        $$ text "(*" <> prettyLNFormula p._lFormula <> text "*)"
+        $$ text ""
 ppLemma ruleIdEvents te p =
-  let subformulas = vcat (intersperse (text "") (zipWith (curry renderSubformula) fms hadNegationFlags))
+  let subformulas = vcat (intersperse (text "") (zipWith (curry renderSubformula) fms queryPolarities))
   in if isEmpty comments
      then subformulas $$ text ""
      else subformulas $$ text "" $$ reconstructionComment
   where
     simplifiedFormula = simplifyFormula p._lFormula
+    positiveWitnessDualization
+      | p._lTraceQuantifier == ExistsTrace,
+        standardTranslationRejected =
+          rewritePositiveWitnessExistsTrace simplifiedFormula
+      | otherwise = Nothing
+    allTraceNormalization
+      | p._lTraceQuantifier == AllTraces,
+        standardTranslationRejected =
+          normalizeAllTraceFormula simplifiedFormula
+      | otherwise = Nothing
+    -- This dualization is a fallback, not an alternative rendering for
+    -- formulas the exporter already supports. Preserve every established
+    -- translation byte-for-byte by enabling it only when all subformulas in
+    -- the standard pipeline would be rejected.
+    standardTranslationRejected =
+      not (null standardQueryPlans)
+        && all (not . standardSubformulaSucceeds . fst) standardQueryPlans
+    standardRewrittenFormula =
+      rewriteFormulaForQuery p._lTraceQuantifier simplifiedFormula
+    standardNeedsRuleId =
+      formulaHasSharedTimepoints standardRewrittenFormula
+    standardFormulaForProcessing =
+      if standardNeedsRuleId
+        then makeTimeVarsDistinct standardRewrittenFormula
+        else standardRewrittenFormula
+    (standardFms, _, _) =
+      splitTopLvlConns p._lTraceQuantifier 1 standardFormulaForProcessing
+    standardQueryPlans = map (transformFm DirectResult) standardFms
+    standardSubformulaSucceeds fm =
+      let (fmToTranslate, _) = formulaToTranslate fm
+       in countQuantifierAlternations fmToTranslate <= 1
+            && not (hasNegatedActionInFormula fmToTranslate)
+            && snd (renderFormula standardNeedsRuleId fmToTranslate)
+    formulaBeforeRewrites =
+      fromMaybe
+        (fromMaybe simplifiedFormula allTraceNormalization)
+        positiveWitnessDualization
+    initialQueryPolarity =
+      case positiveWitnessDualization of
+        Just _ -> InvertResult
+        Nothing -> DirectResult
     -- Apply rewriting transformations FIRST before time splitting
     -- This ensures De Bruijn indices remain correct when quantifiers are moved
-    rewrittenFormula = applyRewriteTransformations simplifiedFormula
+    rewrittenFormulaBeforeCompletion
+      | isJust allTraceNormalization =
+          mapTopLevelConjunctsFormula
+            (rewriteFormulaForQuery p._lTraceQuantifier)
+            formulaBeforeRewrites
+      | otherwise =
+          rewriteFormulaForQuery p._lTraceQuantifier formulaBeforeRewrites
+    -- ProVerif emits the action facts of one Tamarin rule sequentially.  If a
+    -- final correspondence observes a fact from the premise's Tamarin action
+    -- in its conclusion, delay the trigger until the generic completion event
+    -- for that rule instance has occurred.
+    (rewrittenFormula, _) =
+      guardSameActionConclusions rewrittenFormulaBeforeCompletion
     needsRuleId = formulaHasSharedTimepoints rewrittenFormula
     hadTimepointSplit = needsRuleId
-    formulaForProcessing =
+    (formulaForProcessing, splitTimeOrigins) =
       if needsRuleId
-        then makeTimeVarsDistinct rewrittenFormula
-        else rewrittenFormula
-    fmsWithFlags = map transformFm fms'
-    fms = map fst fmsWithFlags
-    hadNegationFlags = map snd fmsWithFlags
-
-    -- Apply all rewriting transformations that change formula structure
-    -- This must happen BEFORE makeTimeVarsDistinct to avoid De Bruijn index corruption
-    -- Uses FormulaShape classification to determine which transformation to apply
-    -- Finally applies pnf to flatten nested quantifiers (e.g., Ex x. A & Ex y. B -> Ex x y. A & B)
-    --
-    -- Order of transformations:
-    -- 1. Eliminate temporal equality constraints by unifying the equated
-    --    timepoints (Ex #j. B@j & #i=#j → B@i), so the shared-timepoint
-    --    splitting applies to them
-    -- 2. Eliminate double negations
-    -- 3. Convert negated existentials with time constraints to implications
-    --    (not(Ex vars. A & not(#i=#j)) → All vars. A ==> #i=#j)
-    -- 4. Move negated actions from premise to conclusion (enables pattern matching)
-    -- 5. Classify formula shape
-    -- 6. Apply shape-specific transformation
-    -- 7. Flatten nested quantifiers
-    applyRewriteTransformations fm =
-      let fm0 = eliminateTemporalEqualities fm
-          fm1 = eliminateDoubleNegations fm0
-          -- Move negated actions/existentials from premise to conclusion FIRST
-          -- This transforms: (not(Ex r. A@r) & B@i) ==> C into B@i ==> (C | (Ex r. A@r))
-          -- This MUST run before convertNegExWithTimeConstraint so that not(Ex...) in premise
-          -- gets moved to conclusion rather than being transformed in place
-          fm1a = moveNegatedActionsToConclusion fm1
-          -- Convert negated existentials with trailing time constraints to implications
-          -- This transforms: not(Ex vars. A & not(#i=#j)) into All vars. A ==> #i=#j
-          -- avoiding the need for a "leading negation" interpretation
-          -- Now this only handles not(Ex...) at top level or in conclusion, not in premise
-          fm1b = convertNegExWithTimeConstraint fm1a
-          fm2 = fm1b
-          shape = classifyFormulaShape p._lTraceQuantifier fm2
-          transformed = applyRewriteForShape shape fm2
-          -- Note: transformWithPullNots was removed as it can undo implication conversion
-          -- Apply pnf to flatten nested quantifiers in the conclusion
-          -- This handles cases like: All x. P => Ex y. A & Ex z. B -> All x. P => Ex y z. A & B
-          -- And: Ex x. A & Ex y. B -> Ex x y. A & B
-      in flattenNestedQuantifiers transformed
-
-    -- Flatten nested quantifiers using pnf, but preserve the structure for implications
-    -- For implications, only apply pnf to the conclusion if it has nested existentials
-    -- that need flattening (e.g., Ex x. A & Ex y. B), NOT if it's already a disjunction
-    flattenNestedQuantifiers :: LNFormula -> LNFormula
-    flattenNestedQuantifiers (Qua All x body) =
-      case flattenNestedQuantifiers body of
-        Conn Imp prem concl
-          | needsFlatteningInConclusion concl -> Qua All x (Conn Imp prem (pnf concl))
-          | otherwise -> Qua All x (Conn Imp prem concl)
-        body' -> Qua All x body'
-    flattenNestedQuantifiers (Conn Imp prem concl)
-      | needsFlatteningInConclusion concl = Conn Imp prem (pnf concl)
-      | otherwise = Conn Imp prem concl
-    flattenNestedQuantifiers fm@(Qua Ex _ _) = pnf fm
-    -- Handle Not(Qua Ex ...) - flatten the inner existential and wrap with Not
-    flattenNestedQuantifiers (Not fm@(Qua Ex _ _)) = Not (pnf fm)
-    -- Handle Conn And - recursively flatten each part (needed after splitting)
-    flattenNestedQuantifiers (Conn And left right) =
-      Conn And (flattenNestedQuantifiers left) (flattenNestedQuantifiers right)
-    flattenNestedQuantifiers fm = fm
-
-    -- Check if conclusion needs flattening (has nested Ex inside conjunction)
-    -- We DON'T want to flatten disjunctions of existentials - those are already in the right form
-    needsFlatteningInConclusion :: LNFormula -> Bool
-    needsFlatteningInConclusion (Qua Ex _ body) = needsFlatteningInConclusion body
-    needsFlatteningInConclusion (Conn And left right) = hasNestedEx left || hasNestedEx right
-    needsFlatteningInConclusion (Conn Or _ _) = False  -- Disjunctions don't need flattening
-    needsFlatteningInConclusion _ = False
-
-    -- Check if formula has a nested existential
-    hasNestedEx :: LNFormula -> Bool
-    hasNestedEx (Qua Ex _ _) = True
-    hasNestedEx (Conn And left right) = hasNestedEx left || hasNestedEx right
-    hasNestedEx _ = False
+        then makeTimeVarsDistinctWithOrigins rewrittenFormula
+        else (rewrittenFormula, M.empty)
+    queryPlans = map (transformFm initialQueryPolarity) fms'
+    fms = map fst queryPlans
+    queryPolarities = map snd queryPlans
 
     -- Rule-id instrumented events get per-occurrence rule-id variables, and
     -- temporal equalities that survive rewriting are translated as rule-id
-    -- equalities. Lemmas whose timepoints were split keep the shared "rid"
-    -- scheme throughout, since the split copies are tied together by that
-    -- shared variable.
+    -- equalities.
+    renderFormula timepointsWereSplit f' =
+      let ridNames =
+            if timepointsWereSplit
+              then M.empty
+              else ridOccurrenceNames ruleIdEvents f'
+       in Precise.evalFresh (ppRestrictFormula ridNames ruleIdEvents te f' useInduction) (avoidPrecise f')
     formula f' =
-      let ridNames = if hadTimepointSplit then M.empty else ridOccurrenceNames ruleIdEvents f'
+      let ridNames
+            | isJust positiveWitnessDualization =
+                ridOccurrenceNamesWithOrigins
+                  ruleIdEvents
+                  splitTimeOrigins
+                  f'
+            | hadTimepointSplit =
+                ridOccurrenceNamesWithOriginsPreservingSingle
+                  ruleIdEvents
+                  splitTimeOrigins
+                  f'
+            | otherwise = ridOccurrenceNames ruleIdEvents f'
        in Precise.evalFresh (ppRestrictFormula ridNames ruleIdEvents te f' useInduction) (avoidPrecise f')
 
     -- Lemma name comment (always shown)
@@ -1571,9 +1991,16 @@ ppLemma ruleIdEvents te p =
       | otherwise = ""
 
     -- assuming all formulas we are concerned with have quantifiers at their top level (after splitTopLvlConns)
-    -- Returns (transformed formula, hadLeadingNegation flag)
-    -- Note: Main rewriting has already been done by applyRewriteTransformations
-    transformFm fm =
+    -- Returns the transformed formula together with the polarity needed to
+    -- reconstruct the original Tamarin result.
+    -- Note: Main rewriting has already been done by rewriteFormulaForQuery
+    transformFm :: QueryPolarity -> LNFormula -> (LNFormula, QueryPolarity)
+    transformFm inheritedPolarity fm
+      | inheritedPolarity == DirectResult,
+        p._lTraceQuantifier == ExistsTrace,
+        Just dualized <- rewriteEventFreeExistsTrace fm =
+          (dualized, InvertResult)
+    transformFm inheritedPolarity fm =
       let -- Detect if formula has leading negation
           -- Check for simple Not (Ex ...) pattern as well as complex patterns
           hasLeadingNotEx = case fm of
@@ -1605,27 +2032,30 @@ ppLemma ruleIdEvents te p =
             _ -> False
           -- Combine both checks: original detection OR negation introduced by transformation
           finalHadLeadingNegation = hadLeadingNegation || hasLeadingNegationAfterTransform
-          result = (finalFormula, finalHadLeadingNegation)
-      in finalHadLeadingNegation `seq` result  -- Force evaluation of finalHadLeadingNegation
+          queryPolarity =
+            if inheritedPolarity == InvertResult || finalHadLeadingNegation
+              then InvertResult
+              else DirectResult
+          result = (finalFormula, queryPolarity)
+      in queryPolarity `seq` result
 
     -- Split top-level connectives for the formula
     (fms', comments, _) = splitTopLvlConns p._lTraceQuantifier 1 formulaForProcessing
 
     -- Render a single subformula with appropriate comments
-    renderSubformula :: (LNFormula, Bool) -> Doc
-    renderSubformula (fm, hadNegation) =
+    renderSubformula :: (LNFormula, QueryPolarity) -> Doc
+    renderSubformula (fm, transformedPolarity) =
       let timepointComment = if hadTimepointSplit
             then Just $ text "(* Timepoints in lemma have been split *)"
             else Nothing
           -- Get the formula to translate (inner formula for leading negation)
           -- For Not (Qua Ex ...), strip the Not and emit the inner existential as a reachability query
           -- ProVerif will check if it's reachable; if "true" (not reachable), the original property holds
-          (fmToTranslate, isExistentialNegation) = case fm of
-            Not fm'@(Qua Ex _ _) -> (fm', True)  -- Strip Not for any Not(Ex...) pattern
-            Not fm' | isAllImpliesExists fm' && p._lTraceQuantifier == ExistsTrace -> (fm', True)
-            _ -> (fm, False)
-          -- Check for existentially quantified K facts (not supported in ProVerif)
-          hasExistentialK = hasExistentiallyQuantifiedKFact fmToTranslate
+          (fmToTranslate, isExistentialNegation) = formulaToTranslate fm
+          queryPolarity =
+            if isExistentialNegation
+              then InvertResult
+              else transformedPolarity
           -- Check for too many quantifier alternations AFTER all rewrites
           alternations = countQuantifierAlternations fmToTranslate
           -- Check if the formula to translate contains negated actions that will produce not(event(...))
@@ -1633,9 +2063,6 @@ ppLemma ruleIdEvents te p =
           -- and can't be transformed into a valid ProVerif query (ProVerif can't find a trace without an action)
           hasNegatedActionInQuery = hasNegatedActionInFormula fmToTranslate
           (queryDoc, succeeded)
-            | hasExistentialK =
-                (text "(* Lemma contains existentially quantified K fact which is not supported *)"
-                 $$ text "(*" <> prettyLNFormula fmToTranslate <> text "*)", False)
             | alternations > 1 =
                 (text "(* Lemma has " <> text (show alternations) <> text " quantifier alternations (e.g., All-Ex-All). ProVerif only supports at most 1 alternation. *)"
                  $$ text "(*" <> prettyLNFormula fmToTranslate <> text "*)", False)
@@ -1646,13 +2073,31 @@ ppLemma ruleIdEvents te p =
           -- Determine negation warning (no lemma name, that's separate)
           negationWarning
             | isExistentialNegation && succeeded = Just $ text "(* Existential lemma has a leading negation, interpret ProVerif's answers accordingly! *)"
-            | hadNegation && succeeded = Just $ text "(* Lemma has a leading negation, interpret ProVerif's answers accordingly! *)"
+            | queryPolarity == InvertResult && succeeded = Just $ text "(* Lemma has a leading negation, interpret ProVerif's answers accordingly! *)"
             | otherwise = Nothing
           -- Build output: lemma name, timepoint comment, negation warning, query
           parts = [lemmaNameComment]
                   ++ catMaybes [timepointComment, negationWarning]
                   ++ [queryDoc]
       in vcat parts
+
+    formulaToTranslate fm =
+      case fm of
+        Not fm'@(Qua Ex _ _) -> (fm', True)
+        Not fm'
+          | isAllImpliesExists fm'
+              && p._lTraceQuantifier == ExistsTrace ->
+              (fm', True)
+        -- All x1..xn. not(F) is not(Ex x1..xn. F): same reachability query.
+        -- Rendering the negation literally would be rejected by ProVerif.
+        -- Only sound for all-traces lemmas: an exists-trace lemma of this
+        -- shape asks for a trace WITHOUT the events, which a reachability
+        -- query cannot establish (the negated-event check rejects it).
+        _
+          | p._lTraceQuantifier == AllTraces,
+            Just ex <- universalNegationAsExists fm ->
+              (ex, True)
+        _ -> (fm, False)
 
     -- Reconstruction comment for split lemmas
     reconstructionComment =
@@ -1775,6 +2220,259 @@ transformWithPullNots f = case pullNegationsToTop f of
 -- Dually for universals: @All #j. (A()\@j & #i = #j) ==> C@ becomes
 -- @A()\@i ==> C@. Both rewrites are equivalences, so they are sound at any
 -- polarity.
+-- | Split a conditional safety property by whether a witness exists.  The
+-- source formula is a negated existential attack whose safety conditions
+-- contain:
+--
+--   * a universal condition for every matching witness; and
+--   * an implication that supplies a fallback condition when no witness
+--     exists.
+--
+-- Writing Base for the positive attack premise, OuterBad for its direct
+-- violations, M for the witness predicate, BadM for violations attached to a
+-- witness, and H for the no-witness fallback, the attack is excluded exactly
+-- when both of these correspondences hold:
+--
+--   Base & M ==> OuterBad | BadM
+--   Base     ==> OuterBad | M | not(H)
+--
+-- The positive M branch in the second correspondence is essential. This
+-- recognizer depends only on formula structure, polarity, scoping, and the
+-- supported positive correspondence fragment.  It never inspects fact names.
+rewriteConditionalExistenceCase :: LNFormula -> Maybe LNFormula
+rewriteConditionalExistenceCase fm0@(Not outerEx@(Qua Ex _ _)) =
+  Precise.evalFresh attempt (avoidPrecise fm0)
+  where
+    attempt = do
+      (outerVars, _, body) <- openFormulaPrefix outerEx
+      let conjuncts = flattenAndList body
+          indexed = zip [0 :: Int ..] conjuncts
+          outerNegatives =
+            [ (idx, positive)
+            | (idx, Not positive@(Qua Ex _ _)) <- indexed
+            ]
+          matchingGuards =
+            [ (idx, guarded)
+            | (idx, guarded@(Qua All _ _)) <- indexed
+            ]
+          noMatchGuards =
+            [ (idx, (matching, fallback))
+            | (idx, Conn Imp (Not matching@(Qua Ex _ _)) fallback) <- indexed
+            ]
+      case (matchingGuards, noMatchGuards) of
+        ( [(matchingIdx, matchingGuard)],
+          [(noMatchIdx, (matchingExists, fallback))]
+          ) -> do
+            parsedMatching <- parseMatchingGuard matchingGuard
+            let fallbackViolations = positiveNegatedExistentials fallback
+                recognized =
+                  S.fromList
+                    ([matchingIdx, noMatchIdx] ++ map fst outerNegatives)
+                baseParts =
+                  [ formula
+                  | (idx, formula) <- indexed,
+                    idx `S.notMember` recognized
+                  ]
+                outerViolations = map snd outerNegatives
+            case (parsedMatching, fallbackViolations) of
+              (Just (matchingVars, matchingPremise, matchingViolations), Just fallbackBad)
+                | not (null baseParts),
+                  all isSupportedPositivePremise baseParts,
+                  formulaContainsAction (buildConjunction baseParts),
+                  isSupportedPositivePremise matchingPremise,
+                  formulaContainsAction matchingPremise,
+                  all isSupportedPositiveConclusion
+                    (outerViolations ++ matchingViolations ++ fallbackBad),
+                  sameMatchingExistence matchingGuard matchingExists -> do
+                    let base = buildConjunction baseParts
+                        first =
+                          Conn Imp
+                            (Conn And base matchingPremise)
+                            (buildDisjunction (outerViolations ++ matchingViolations))
+                        second =
+                          Conn Imp
+                            base
+                            (buildDisjunction (outerViolations ++ [matchingExists] ++ fallbackBad))
+                        firstClosed =
+                          foldr (hinted forAll) first (outerVars ++ matchingVars)
+                        secondClosed = foldr (hinted forAll) second outerVars
+                    pure $
+                      Just $
+                        makeBinderHintsGloballyUnique
+                          (Conn And firstClosed secondClosed)
+              _ -> pure Nothing
+        _ -> pure Nothing
+
+    parseMatchingGuard guarded = do
+      (matchingVars, _, guardedBody) <- openFormulaPrefix guarded
+      pure $ case guardedBody of
+        Conn Imp matchingPremise safeMatching ->
+          case positiveNegatedExistentials safeMatching of
+            Just violations ->
+              Just (matchingVars, matchingPremise, violations)
+            Nothing -> Nothing
+        _ -> Nothing
+
+    -- The universal guard and the no-match premise must quantify the same
+    -- matching-session predicate. Compare their de Bruijn bodies directly,
+    -- ignoring only the All/Ex quantifier kinds and binder hints.
+    sameMatchingExistence guarded matching =
+      case (stripQuantifierPrefix All guarded, stripQuantifierPrefix Ex matching) of
+        ((guardSorts, Conn Imp guardedPremise _), (matchSorts, matchingBody)) ->
+          guardSorts == matchSorts && guardedPremise == matchingBody
+        _ -> False
+
+    stripQuantifierPrefix quantifier = go []
+      where
+        go sorts (Qua q (_, srt) body)
+          | q == quantifier = go (srt : sorts) body
+        go sorts body = (reverse sorts, body)
+
+    positiveNegatedExistentials formula =
+      traverse positiveOf (flattenAndList formula)
+      where
+        positiveOf (Not positive@(Qua Ex _ _))
+          | isSupportedPositiveConclusion positive = Just positive
+        positiveOf _ = Nothing
+
+    flattenAndList (Conn And left right) =
+      flattenAndList left ++ flattenAndList right
+    flattenAndList formula = [formula]
+rewriteConditionalExistenceCase _ = Nothing
+
+-- | Rewrite the standard injective-agreement idiom into an equivalent
+-- conjunction of two fragment-supported lemmas.
+--
+-- The idiom (Lowe's injective agreement, as encoded throughout the example
+-- corpus; fact symbols vary per model):
+--
+--   All xs #i. P(as)@i ==>
+--     (Ex #j. W(bs)@j & #j < #i
+--        & not(Ex ys #i2. P(cs)@i2 & not(#i2 = #i)))
+--     | R1 | .. | Rn
+--
+-- is rewritten to the conjunction of
+--
+--   (a) All xs #i. P(as)@i ==> (Ex #j. W(bs)@j & #j < #i) | R1 | .. | Rn
+--   (b) All xs ys #i #i2. P(as)@i & P(cs)@i2 ==> #i = #i2 | R1 | .. | Rn
+--
+-- (a) is the non-injective correspondence; (b) states that no two distinct
+-- P-instances share the session parameters unless one of the escape
+-- disjuncts (typically key reveals) applies; the timepoint equality is
+-- rendered as a rule-id equality. Note the escape disjuncts must be carried
+-- into (b): the original lemma excuses duplicated commits through them.
+-- The conjunction is equivalent: the original implies (a) by weakening,
+-- and (b) because for a second P with the same parameters at a different
+-- timepoint the witness branch is contradicted, leaving the escapes;
+-- conversely, given P and no escape, (a) provides the witness and (b)
+-- discharges the negated existential. The top-level-connective splitting
+-- then emits two ProVerif queries whose results are recombined with a
+-- conjunction.
+--
+-- The variant that states uniqueness as a universal implication
+-- 'All ys #i2. P(cs)@i2 ==> #i2 = #i' is handled identically.
+--
+-- The rewrite only fires on this exact shape: a single positive
+-- (non-attacker) action premise over the correspondence's only outer
+-- timepoint binder, and exactly one uniqueness conjunct (over the premise's
+-- fact symbol) in exactly one conclusion disjunct. Top-level conjunctions
+-- are handled recursively, one correspondence at a time.
+rewriteInjectiveAgreement :: LNFormula -> LNFormula
+rewriteInjectiveAgreement (Conn And left right) =
+  Conn And
+    (rewriteInjectiveAgreement left)
+    (rewriteInjectiveAgreement right)
+rewriteInjectiveAgreement fm0@(Qua All _ _) =
+  let rewritten =
+        fromMaybe fm0 $ Precise.evalFresh attempt (avoidPrecise fm0)
+   in
+    if rewritten /= fm0 && formulaHasSharedTimepoints fm0
+      then makeBinderHintsGloballyUnique rewritten
+      else rewritten
+  where
+    attempt = do
+      (allVars, _, body) <- openFormulaPrefix fm0
+      case body of
+        Conn Imp (Ato prem@(Action pTime pf@(Fact ptag _ _))) concl
+          | [iP] <- [v | v <- allVars, lvarSort v == LSortNode],
+            pTime == varTerm (Free iP),
+            ptag /= KUFact && not (isKLogFact pf) -> do
+              let disjs = flattenOrList concl
+              results <- mapM (matchInjDisjunct iP ptag) disjs
+              case [(k, r) | (k, Just r) <- zip [0 :: Int ..] results] of
+                [(k, (d', dup, nVars, i2))] -> do
+                  let concl' = rebuildOr [if idx == k then d' else d | (idx, d) <- zip0 disjs]
+                      lemA = foldr (hinted forAll) (Conn Imp (Ato prem) concl') allVars
+                      -- The escape disjuncts (all disjuncts except the
+                      -- witness) also excuse duplicated P-instances.
+                      escapes = [d | (idx, d) <- zip0 disjs, idx /= k]
+                      uniq =
+                        Conn Imp
+                          (Conn And (Ato prem) (Ato dup))
+                          (rebuildOr (Ato (EqE (varTerm (Free iP)) (varTerm (Free i2))) : escapes))
+                      lemB = foldr (hinted forAll) uniq (allVars ++ nVars)
+                  pure (Just (Conn And lemA lemB))
+                _ -> pure Nothing
+        _ -> pure Nothing
+
+    -- Match one conclusion disjunct: an existential witness conjunction with
+    -- exactly one uniqueness conjunct over the premise's fact symbol.
+    -- Returns the disjunct without that conjunct, the generalised second
+    -- premise atom, and its quantified variables.
+    matchInjDisjunct iP ptag d@(Qua Ex _ _) = do
+      (dVars, _, dBody) <- openFormulaPrefix d
+      let conjs = flattenAndList dBody
+      results <- mapM (matchUniqConjunct iP ptag) conjs
+      case [(k, r) | (k, Just r) <- zip [0 :: Int ..] results] of
+        [(k, (dup, nVars, i2))]
+          | rest@(_ : _) <- [c | (idx, c) <- zip0 conjs, idx /= k],
+            -- the second premise atom must not mention the witness variables
+            all (`notElem` dVars) (frees (Ato dup :: LNFormula)) ->
+              pure (Just (foldr (hinted exists) (rebuildAnd rest) dVars, dup, nVars, i2))
+        _ -> pure Nothing
+    matchInjDisjunct _ _ _ = pure Nothing
+
+    -- The uniqueness conjunct: not(Ex ys #i2. P(cs)@i2 & not(#i2 = #i)),
+    -- or the universal variant All ys #i2. P(cs)@i2 ==> #i2 = #i.
+    matchUniqConjunct iP ptag (Not nEx@(Qua Ex _ _)) = do
+      (nVars, _, nBody) <- openFormulaPrefix nEx
+      pure $ case List.partition isNegEq (flattenAndList nBody) of
+        ([Not (Ato (EqE e1 e2))], [Ato dup@(Action dTime (Fact dtag _ _))])
+          | dtag == ptag,
+            Just i2 <- timeVarOf nVars dTime,
+            sameTimepoints iP i2 e1 e2 ->
+              Just (dup, nVars, i2)
+        _ -> Nothing
+      where
+        isNegEq (Not (Ato (EqE _ _))) = True
+        isNegEq _ = False
+    matchUniqConjunct iP ptag nAll@(Qua All _ _) = do
+      (nVars, _, nBody) <- openFormulaPrefix nAll
+      pure $ case nBody of
+        Conn Imp (Ato dup@(Action dTime (Fact dtag _ _))) (Ato (EqE e1 e2))
+          | dtag == ptag,
+            Just i2 <- timeVarOf nVars dTime,
+            sameTimepoints iP i2 e1 e2 ->
+              Just (dup, nVars, i2)
+        _ -> Nothing
+    matchUniqConjunct _ _ _ = pure Nothing
+
+    timeVarOf nVars t =
+      case [v | v <- nVars, lvarSort v == LSortNode, t == varTerm (Free v)] of
+        [v] -> Just v
+        _ -> Nothing
+    sameTimepoints iP i2 e1 e2 =
+      S.fromList [e1, e2] == S.fromList [varTerm (Free iP), varTerm (Free i2)]
+
+    flattenOrList (Conn Or a b) = flattenOrList a ++ flattenOrList b
+    flattenOrList f = [f]
+    flattenAndList (Conn And a b) = flattenAndList a ++ flattenAndList b
+    flattenAndList f = [f]
+    rebuildOr = foldr1 (Conn Or)
+    rebuildAnd = foldr1 (Conn And)
+    zip0 = zip [0 :: Int ..]
+rewriteInjectiveAgreement fm0 = fm0
+
 eliminateTemporalEqualities :: LNFormula -> LNFormula
 eliminateTemporalEqualities fm0 =
   let fm' = go fm0
@@ -1861,6 +2559,117 @@ collectEventTimeVars = go []
     go ctx (Qua _ v p) = go (v : ctx) p
     go _ _ = []
 
+-- | Add an internal completion event to correspondence premises whose
+-- conclusions observe another event from the same original Tamarin action.
+-- The completion event uses the premise action's timepoint only as
+-- provenance: shared-timepoint splitting gives it a distinct ProVerif time
+-- while retaining the same rule identifier.
+--
+-- The returned fact tags are the rule actions whose presence demands
+-- completion emission.  No rule or protocol name is inspected.
+guardSameActionConclusions :: LNFormula -> (LNFormula, S.Set String)
+guardSameActionConclusions fm =
+  let unique = makeBinderHintsGloballyUnique fm
+      (guarded, triggers, changed) = go unique
+   in if changed then (guarded, triggers) else (fm, S.empty)
+  where
+    go (Conn And left right) =
+      let (left', leftTriggers, leftChanged) = go left
+          (right', rightTriggers, rightChanged) = go right
+       in ( Conn And left' right',
+            leftTriggers `S.union` rightTriggers,
+            leftChanged || rightChanged
+          )
+    go formula =
+      case guardCorrespondence formula of
+        Just (guarded, triggers) -> (guarded, triggers, True)
+        Nothing -> (formula, S.empty, False)
+
+    guardCorrespondence formula =
+      let (prefix, body) = collectAllPrefix formula
+          ctx = reverse prefix
+       in case (prefix, body) of
+            (_ : _, Conn Imp premise conclusion) ->
+              let premiseOccurrences = collectOccurrences ctx premise
+                  conclusionOccurrences = collectOccurrences ctx conclusion
+                  demandingConclusionOrigins =
+                    S.fromList
+                      [ origin
+                      | occurrence@(origin, _, _, _) <- conclusionOccurrences,
+                        occurrence `notElem` premiseOccurrences
+                      ]
+                  sharedPremiseOccurrences =
+                    [ occurrence
+                    | occurrence@(origin, _, _, _) <- premiseOccurrences,
+                      origin `S.member` demandingConclusionOrigins
+                    ]
+                  firstPerOrigin =
+                    M.elems $
+                      M.fromListWith
+                        (\first _ -> first)
+                        [ (origin, occurrence)
+                        | occurrence@(origin, _, _, _) <- sharedPremiseOccurrences
+                        ]
+                  completionActions =
+                    [ Ato (Action timepoint completionFact)
+                    | (_, timepoint, _, _) <- firstPerOrigin
+                    ]
+                  triggers =
+                    S.fromList
+                      [ tag
+                      | (_, _, tag, _) <- sharedPremiseOccurrences
+                      ]
+               in if null completionActions
+                    then Nothing
+                    else
+                      Just
+                        ( rewrapBoundPrefix All prefix $
+                            Conn Imp
+                              (buildConjunction (premise : completionActions))
+                              conclusion,
+                          triggers
+                        )
+            _ -> Nothing
+
+    collectAllPrefix (Qua All v body) =
+      let (rest, inner) = collectAllPrefix body
+       in (v : rest, inner)
+    collectAllPrefix body = ([], body)
+
+    collectOccurrences ctx (Ato (Action timepoint fact@(Fact tag _ _)))
+      | tag == KUFact
+          || isKLogFact fact
+          || factTagName tag == ruleCompletedEvent =
+          []
+      | Just origin <- timeOriginIn ctx timepoint =
+          [(origin, timepoint, factTagName tag, fact)]
+    collectOccurrences ctx (Not body) = collectOccurrences ctx body
+    collectOccurrences ctx (Conn _ left right) =
+      collectOccurrences ctx left ++ collectOccurrences ctx right
+    collectOccurrences ctx (Qua _ v body) =
+      collectOccurrences (v : ctx) body
+    collectOccurrences _ _ = []
+
+    timeOriginIn ctx term =
+      case viewTerm term of
+        Lit (Var (Bound i)) ->
+          case drop (fromIntegral i) ctx of
+            (name, LSortNode) : _ -> Just (Right name)
+            _ -> Nothing
+        Lit (Var (Free v))
+          | lvarSort v == LSortNode -> Just (Left v)
+        _ -> Nothing
+
+    completionFact =
+      Fact
+        (ProtoFact Linear ruleCompletedEvent 0)
+        S.empty
+        []
+
+-- | Property-only demand analysis used before rule rendering.
+completionTriggersForFormula :: LNFormula -> S.Set String
+completionTriggersForFormula = snd . guardSameActionConclusions
+
 -- | Collect pairs of time-variable names linked by a temporal equality:
 -- an equality atom #i = #j (possibly negated), or a negated strict
 -- comparison not(#i < #j), which is expanded later into a disjunction
@@ -1868,16 +2677,18 @@ collectEventTimeVars = go []
 collectTemporalEqPairs :: LNFormula -> [(String, String)]
 collectTemporalEqPairs = go []
   where
-    go ctx (Ato (EqE l r)) = pairOf ctx l r
-    go ctx (Not (Ato (Less l r))) = pairOf ctx l r
-    go ctx (Not p) = go ctx p
-    go ctx (Conn _ p q) = go ctx p ++ go ctx q
-    go ctx (Qua _ v p) = go (v : ctx) p
+    go ctx (Ato (EqE left right)) = pairOf ctx left right
+    go ctx (Not (Ato (Less left right))) = pairOf ctx left right
+    go ctx (Not body) = go ctx body
+    go ctx (Conn _ left right) = go ctx left ++ go ctx right
+    go ctx (Qua _ binder body) = go (binder : ctx) body
     go _ _ = []
 
-    pairOf ctx l r = case (timeVarNameIn ctx l, timeVarNameIn ctx r) of
-      (Just a, Just b) | a /= b -> [(a, b)]
-      _ -> []
+    pairOf ctx left right =
+      case (timeVarNameIn ctx left, timeVarNameIn ctx right) of
+        (Just leftName, Just rightName)
+          | leftName /= rightName -> [(leftName, rightName)]
+        _ -> []
 
 -- | Per-occurrence rule-id variable names for rule-id instrumented events in
 -- formulas without split timepoints. The shared "rid" variable is only
@@ -1909,6 +2720,43 @@ ridOccurrenceNames ruleIdEvents fm = M.fromSet ("rid_" ++) mapped
             _ -> False
         ]
 
+-- | Per-occurrence rule-id names after shared timepoints have been split.
+-- Independent original Tamarin timepoints keep distinct rule ids, while all
+-- event occurrences copied from one original timepoint use the same rule id.
+ridOccurrenceNamesWithOrigins ::
+  S.Set String ->
+  M.Map String String ->
+  LNFormula ->
+  M.Map String String
+ridOccurrenceNamesWithOrigins ruleIdEvents splitOrigins afterSplit =
+  M.fromList
+    [ (name, "rid_" ++ M.findWithDefault name name splitOrigins)
+    | name <- S.toList eventTimeNames,
+      let tags = tagsOf name,
+      not (null tags),
+      all (`S.member` ruleIdEvents) tags
+    ]
+  where
+    eventTVs = collectEventTimeVars afterSplit
+    eventTimeNames = S.fromList (map fst eventTVs)
+    tagsOf name = [tag | (name', tag) <- eventTVs, name' == name]
+
+-- | Use origin-aware rule ids only when a rendered formula contains more
+-- than one original instrumented timepoint group. With one group, the
+-- established shared @rid@ rendering is semantically identical and is kept
+-- byte-for-byte.
+ridOccurrenceNamesWithOriginsPreservingSingle ::
+  S.Set String ->
+  M.Map String String ->
+  LNFormula ->
+  M.Map String String
+ridOccurrenceNamesWithOriginsPreservingSingle ruleIdEvents splitOrigins fm =
+  if S.size (S.fromList (M.elems names)) <= 1
+    then M.empty
+    else names
+  where
+    names = ridOccurrenceNamesWithOrigins ruleIdEvents splitOrigins fm
+
 -- | Event tags linked by temporal equalities that survive rewriting; these
 -- need rule-id instrumentation so the equality can be translated as a
 -- rule-id equality (see 'ridEqualityNames').
@@ -1916,24 +2764,97 @@ temporalEqualityLinkedEvents :: LNFormula -> S.Set String
 temporalEqualityLinkedEvents fm =
   S.fromList $
     concat
-      [ tagsOf a ++ tagsOf b
-      | (a, b) <- collectTemporalEqPairs fm,
-        not (null (tagsOf a)),
-        not (null (tagsOf b))
+      [ tagsOf leftName ++ tagsOf rightName
+      | (leftName, rightName) <- collectTemporalEqPairs fm,
+        not (null (tagsOf leftName)),
+        not (null (tagsOf rightName))
       ]
   where
     eventTVs = collectEventTimeVars fm
-    tagsOf n = [tag | (n', tag) <- eventTVs, n' == n]
+    tagsOf name = [tag | (name', tag) <- eventTVs, name' == name]
+
+-- | Binder-identity-based variant used for temporal equalities introduced by
+-- the current query rewrite. It avoids adding new instrumentation because two
+-- independent scopes happen to reuse the same binder hint.
+temporalEqualityLinkedEventsByBinder :: LNFormula -> S.Set String
+temporalEqualityLinkedEventsByBinder fm =
+  S.fromList $
+    concat
+      [ M.findWithDefault [] a actionMap
+          ++ M.findWithDefault [] b actionMap
+      | (a, b) <- collectTemporalEqKeyPairs fm,
+        M.member a actionMap,
+        M.member b actionMap
+      ]
+  where
+    actionMap = collectActionsWithTimepoints fm
 
 -- | Make time variables distinct for each action occurrence in a formula.
 -- This ensures that events with shared timepoints in Tamarin get distinct time variables in ProVerif.
 -- Transforms: ∃ x #i. A(x)@i & B(x)@i  into  ∃ x #i1 #i2. A(x)@i1 & B(x)@i2
 makeTimeVarsDistinct :: LNFormula -> LNFormula
-makeTimeVarsDistinct fm =
+makeTimeVarsDistinct = fst . makeTimeVarsDistinctWithOrigins
+
+-- | Split shared timepoint variables and record the original Tamarin
+-- timepoint of every generated binder hint. The provenance map is consumed
+-- by rule-ID rendering: generated copies from one timepoint share a rule ID,
+-- while independent original timepoints never do.
+makeTimeVarsDistinctWithOrigins ::
+  LNFormula ->
+  (LNFormula, M.Map String String)
+makeTimeVarsDistinctWithOrigins fm =
   let sharedTimeVars = findSharedTimeVars fm
-  in if M.null sharedTimeVars
-     then fm
-     else splitTimeVars sharedTimeVars fm
+      reservedNames = collectBinderHintNames fm
+      splitNames = allocateSplitNames reservedNames (M.toList sharedTimeVars)
+      splitOrigins =
+        M.fromList
+          [ (generated, origin)
+          | (origin, generatedNames) <- M.elems splitNames,
+            generated <- generatedNames
+          ]
+   in if M.null sharedTimeVars
+        then (fm, M.empty)
+        else (splitTimeVars splitNames fm, splitOrigins)
+  where
+    collectBinderHintNames (Qua _ (name, _) body) =
+      S.insert name (collectBinderHintNames body)
+    collectBinderHintNames (Not body) = collectBinderHintNames body
+    collectBinderHintNames (Conn _ left right) =
+      collectBinderHintNames left `S.union` collectBinderHintNames right
+    collectBinderHintNames _ = S.empty
+
+    allocateSplitNames used0 shared =
+      let (_, _, allocated) =
+            foldl allocateOne (used0, S.empty, M.empty) shared
+       in allocated
+
+    allocateOne (used, usedOrigins, allocated) (key@(name, _), count) =
+      let origin = freshOrigin name usedOrigins
+          (used', generatedNames) =
+            List.mapAccumL allocateGenerated used [name ++ show i | i <- [1 .. count]]
+       in
+        ( used',
+          S.insert origin usedOrigins,
+          M.insert key (origin, generatedNames) allocated
+        )
+
+    allocateGenerated used candidate =
+      let generated
+            | candidate `S.notMember` used = candidate
+            | otherwise = freshSuffixedName candidate used
+       in (S.insert generated used, generated)
+
+    freshOrigin name usedOrigins
+      | name `S.notMember` usedOrigins = name
+      | otherwise = freshSuffixedName name usedOrigins
+
+    freshSuffixedName name used =
+      head
+        [ candidate
+        | i <- [(1 :: Integer) ..],
+          let candidate = name ++ "_" ++ show i,
+          candidate `S.notMember` used
+        ]
 
 -- | Find time variables (LSortNode quantifiers) that are used more than once
 -- Returns: Map from (variable name, quantifier depth) to occurrence count
@@ -1964,11 +2885,14 @@ findSharedTimeVars fm =
       countTimeVarOccurrences ((name, varSort) : ctx) (depth + 1) p acc
     countTimeVarOccurrences _ _ _ acc = acc
 
--- | Split time variables that occur multiple times
--- For each quantifier matching a shared time var, replace with N copies
--- and adjust Bound indices in action atoms
-splitTimeVars :: M.Map (String, Integer) Int -> LNFormula -> LNFormula
-splitTimeVars sharedVars fm =
+-- | Split time variables that occur multiple times. The caller supplies
+-- collision-free generated binder names together with the rule-ID origin
+-- represented by each group.
+splitTimeVars ::
+  M.Map (String, Integer) (String, [String]) ->
+  LNFormula ->
+  LNFormula
+splitTimeVars splitNames fm =
   fst $ splitAndReindexTimeVars [] 0 0 M.empty fm
   where
     -- ctx: list of (name, sort, original_depth) for tracking quantifiers
@@ -1980,16 +2904,16 @@ splitTimeVars sharedVars fm =
 
     splitAndReindexTimeVars ctx depth originalDepth seenCounts (Qua q (name, srt) p) =
       -- Check if this quantifier is a shared time variable
-      -- Use originalDepth for lookup since sharedVars was computed from original formula
+      -- Use originalDepth for lookup since splitNames was computed from the
+      -- original formula.
       let lookupKey = (name, originalDepth)
-      in case M.lookup lookupKey sharedVars of
-        Just count | srt == LSortNode ->
+      in case M.lookup lookupKey splitNames of
+        Just (_, generatedNames) | srt == LSortNode ->
           -- This is a shared time variable - split it into multiple quantifiers
-          let makeQuantifiers i body
-                | i > count = body
-                | otherwise =
-                    let newName = name ++ show i
-                    in Qua q (newName, srt) (makeQuantifiers (i + 1) body)
+          let count = length generatedNames
+              makeQuantifiers [] body = body
+              makeQuantifiers (newName : rest) body =
+                Qua q (newName, srt) (makeQuantifiers rest body)
               -- Shift indices in p by (count - 1) because we're adding (count - 1) extra quantifiers
               p_shifted = shiftFreeIndices (fromIntegral (count - 1)) p
               -- Process the shifted body with updated context
@@ -1997,7 +2921,7 @@ splitTimeVars sharedVars fm =
               -- IMPORTANT: Store the original name (before splitting), not the split name
               newCtxEntries = [(name, srt, originalDepth) | _ <- [1..count]]
               (p', seenCounts') = splitAndReindexTimeVars (newCtxEntries ++ ctx) (depth + fromIntegral count) (originalDepth + 1) seenCounts p_shifted
-          in (makeQuantifiers 1 p', seenCounts')
+          in (makeQuantifiers generatedNames p', seenCounts')
         _ ->
           -- Normal quantifier - just process recursively
           let (p', seenCounts') = splitAndReindexTimeVars ((name, srt, originalDepth) : ctx) (depth + 1) (originalDepth + 1) seenCounts p
@@ -2011,8 +2935,8 @@ splitTimeVars sharedVars fm =
             (origName, LSortNode, origDepth) : _ ->
               let lookupKey = (origName, origDepth)
               in -- Check if the original quantifier was split
-              case M.lookup lookupKey sharedVars of
-                Just count | count > 1 ->
+              case M.lookup lookupKey splitNames of
+                Just (_, generatedNames) | length generatedNames > 1 ->
                   -- This action uses a split time variable
                   -- Determine which occurrence this is
                   let key = (origName, origDepth)
@@ -2531,15 +3455,28 @@ data BinderInfo = BinderInfo
     _binderSort :: LSort
   }
 
+timeVarKey ::
+  [BinderInfo] ->
+  VTerm Name (BVar LVar) ->
+  Maybe TimeVarKey
+timeVarKey ctx timeVar =
+  case viewTerm timeVar of
+    Lit (Var (Free v))
+      | lvarSort v == LSortNode -> Just (FreeTimeVar v)
+    Lit (Var (Bound i)) ->
+      case drop (fromIntegral i) ctx of
+        BinderInfo bid LSortNode : _ -> Just (BoundTimeVar bid)
+        _ -> Nothing
+    _ -> Nothing
+
 collectActionsWithTimepoints :: LNFormula -> M.Map TimeVarKey [String]
 collectActionsWithTimepoints fm = snd (collectActions [] 0 fm M.empty)
   where
     collectActions ctx nextId (Ato (Action timeVar (Fact tag _ _))) acc =
-      let (nextId', maybeKey) = extractKey ctx nextId timeVar
-          updatedAcc = case maybeKey of
+      let updatedAcc = case timeVarKey ctx timeVar of
             Just key -> M.insertWith (++) key [factTagName tag] acc
             Nothing -> acc
-       in (nextId', updatedAcc)
+       in (nextId, updatedAcc)
     collectActions _ctx nextId (Ato _) acc = (nextId, acc)
     collectActions _ctx nextId (TF _) acc = (nextId, acc)
     collectActions ctx nextId (Not p) acc = collectActions ctx nextId p acc
@@ -2550,20 +3487,33 @@ collectActionsWithTimepoints fm = snd (collectActions [] 0 fm M.empty)
       let binder = BinderInfo nextId varSort
        in collectActions (binder : ctx) (nextId + 1) body acc
 
-    extractKey ctx nextId timeVar =
-      case viewTerm timeVar of
-        Lit (Var (Free v)) ->
-          if lvarSort v == LSortNode
-            then (nextId, Just (FreeTimeVar v))
-            else (nextId, Nothing)
-        Lit (Var (Bound i)) ->
-          case drop (fromIntegral i) ctx of
-            BinderInfo bid bSort : _ ->
-              if bSort == LSortNode
-                then (nextId, Just (BoundTimeVar bid))
-                else (nextId, Nothing)
-            [] -> (nextId, Nothing)
-        _ -> (nextId, Nothing)
+-- | Resolve the endpoints of temporal equalities by binder identity, not by
+-- binder hint. Independently quantified variables are allowed to reuse the
+-- same human-readable hint, and must never be treated as one timepoint.
+collectTemporalEqKeyPairs :: LNFormula -> [(TimeVarKey, TimeVarKey)]
+collectTemporalEqKeyPairs fm = snd (collect [] 0 fm)
+  where
+    collect ctx nextId (Ato (EqE left right)) =
+      (nextId, pairOf ctx left right)
+    collect ctx nextId (Not (Ato (Less left right))) =
+      (nextId, pairOf ctx left right)
+    collect _ nextId (Ato _) = (nextId, [])
+    collect _ nextId (TF _) = (nextId, [])
+    collect ctx nextId (Not body) = collect ctx nextId body
+    collect ctx nextId (Conn _ left right) =
+      let (nextAfterLeft, leftPairs) = collect ctx nextId left
+          (nextAfterRight, rightPairs) =
+            collect ctx nextAfterLeft right
+       in (nextAfterRight, leftPairs ++ rightPairs)
+    collect ctx nextId (Qua _ (_, varSort) body) =
+      let binder = BinderInfo nextId varSort
+       in collect (binder : ctx) (nextId + 1) body
+
+    pairOf ctx left right =
+      case (timeVarKey ctx left, timeVarKey ctx right) of
+        (Just leftKey, Just rightKey)
+          | leftKey /= rightKey -> [(leftKey, rightKey)]
+        _ -> []
 
 -- | Find events that share timepoints in a formula
 eventsSharingTimepoints :: LNFormula -> S.Set String
@@ -2588,19 +3538,14 @@ formulaUsesRuleIdEvents ruleIdEvents =
     (\_ p q -> p || q)
     (\_ _ p -> p)
 
--- | Detect which event fact tags appear with shared timepoints in lemmas.
--- Returns a set of fact tag names that need rule IDs.
-detectSharedTimepointEvents :: [ProtoLemma LNFormula ProofSkeleton] -> S.Set String
-detectSharedTimepointEvents lemmas =
-  S.unions $ map (analyze . L.get lFormula) lemmas
-  where
-    -- Definite temporal equalities are eliminated by unifying the equated
-    -- timepoints, turning them into shared timepoints; equalities that
-    -- survive (e.g. in disjunctions) are translated as rule-id equalities,
-    -- so their events need rule-id instrumentation as well.
-    analyze fm =
-      let fm' = eliminateTemporalEqualities fm
-       in eventsSharingTimepoints fm' `S.union` temporalEqualityLinkedEvents fm'
+-- | Events in one formula that require rule-instance instrumentation.
+-- Definite temporal equalities are eliminated by unifying the equated
+-- timepoints, turning them into shared timepoints; equalities that survive
+-- (e.g. in disjunctions) are translated as rule-id equalities.
+eventsRequiringRuleIds :: LNFormula -> S.Set String
+eventsRequiringRuleIds fm =
+  let fm' = eliminateTemporalEqualities fm
+   in eventsSharingTimepoints fm' `S.union` temporalEqualityLinkedEvents fm'
 
 loadLemmas ::
   S.Set String ->  -- sharedEventTags: events that need rule IDs
@@ -2630,7 +3575,9 @@ loadLemmas sharedEventTags hasSpecificLemmas lemSel tc te thy = (axiomDocs, quer
     -- Translate queries using existing ppLemma
     queryDocs = map (ppLemma sharedEventTags te) queryLemmas
 
-    allFacts = concatMap (formulaFacts . L.get lFormula) allIncludedLemmas
+    allFacts =
+      filter (not . isKnowledgeFact) $
+        concatMap (formulaFacts . L.get lFormula) allIncludedLemmas
     headers = makeEventHeaders sharedEventTags allFacts
 
 -- | Classify how a lemma should be translated based on selector and attributes
@@ -2982,6 +3929,487 @@ isAllImpliesExists f@(Conn Imp p q) = isQuantifierFree f || (isQuantifierFree p 
     isConstr _ = False
 isAllImpliesExists _ = False
 
+-- | All x1..xn. not(F) is equivalent to not(Ex x1..xn. F). Return the inner
+-- existential so it can be rendered as a reachability query on F with the
+-- leading-negation interpretation; ProVerif has no negation in queries, so
+-- rendering 'not(F)' literally would be rejected ("not unexpected in events").
+universalNegationAsExists :: LNFormula -> Maybe LNFormula
+universalNegationAsExists (Qua All v p) = Qua Ex v <$> go p
+  where
+    go (Qua All v' p') = Qua Ex v' <$> go p'
+    go (Not f) = Just f
+    go _ = Nothing
+universalNegationAsExists _ = Nothing
+
+-- | Query-only dualization for an event-free exists-trace property:
+--
+--   exists trace. forall xs. not Event(xs)
+--
+-- holds exactly when the all-traces correspondence
+--
+--   attacker(()) ==> exists xs. Event(xs)
+--
+-- is false. The unit attacker fact is an always-true premise. This recognizer
+-- deliberately accepts only a nonempty universal prefix followed by the
+-- negation of one ordinary event; attacker facts and every other formula
+-- shape remain on the existing rejection path.
+rewriteEventFreeExistsTrace :: LNFormula -> Maybe LNFormula
+rewriteEventFreeExistsTrace fm =
+  case collect fm of
+    Just (v : vs, event) ->
+      Just $
+        rewrapBoundPrefix Ex (v : vs) $
+          Conn Imp (TF True) event
+    _ -> Nothing
+  where
+    collect (Qua All v p) = do
+      (vs, event) <- collect p
+      pure (v : vs, event)
+    collect (Not event@(Ato (Action _ f@(Fact tag _ _))))
+      | tag /= KUFact && not (isKLogFact f) = Just ([], event)
+    collect _ = Nothing
+
+-- | Query-only dualization for a positive-witness exists-trace property:
+--
+--   exists trace. P and U
+--
+-- where P is a nonempty positive witness and U is a conjunction of safety
+-- conditions. The trace property holds exactly when the single all-traces
+-- correspondence
+--
+--   P ==> violation(U)
+--
+-- is false. Normalizing the negation of the complete source formula keeps
+-- conjunctions within each violation branch intact; in particular, it never
+-- turns alternative violations into separate correspondences whose
+-- counterexamples could come from different traces.
+--
+-- The recognizer is deliberately conservative. After NNF/PNF normalization:
+--
+-- * every negative top-level disjunct must be a supported atom using only
+--   universal binders (the binders obtained by negating the existential
+--   witness);
+-- * every remaining disjunct must be a positive formula over events,
+--   attacker facts, equalities, disequalities, and temporal comparisons;
+-- * the premise and conclusion must each contain an action atom; and
+-- * no quantifier may remain below the normalized prefix.
+--
+-- Rewrapping the prefix with 'All' matches ProVerif correspondence semantics:
+-- variables occurring in the premise are universal, while variables that
+-- occur only in the conclusion are existential.
+rewritePositiveWitnessExistsTrace :: LNFormula -> Maybe LNFormula
+rewritePositiveWitnessExistsTrace fm = do
+  let normalized = pnf (Not (makeBinderHintsGloballyUnique fm))
+      (prefix, body) = collectPrefix normalized
+      disjuncts = flattenDisjunction body
+  (premiseAtoms, violationBranches) <- classifyDisjuncts prefix disjuncts
+  let premise = buildConjunction premiseAtoms
+      conclusion = buildDisjunction violationBranches
+  if null prefix
+      || null premiseAtoms
+      || null violationBranches
+      || not (containsAction premise)
+      || not (containsAction conclusion)
+    then Nothing
+    else
+      Just $
+        rewrapBoundPrefix All (map snd prefix) $
+          Conn Imp premise conclusion
+  where
+    collectPrefix (Qua q v body) =
+      let (rest, inner) = collectPrefix body
+       in ((q, v) : rest, inner)
+    collectPrefix body = ([], body)
+
+    flattenDisjunction (Conn Or p q) =
+      flattenDisjunction p ++ flattenDisjunction q
+    flattenDisjunction formula = [formula]
+
+    classifyDisjuncts _ [] = Just ([], [])
+    classifyDisjuncts prefix (formula : rest) = do
+      (premises, violations) <- classifyDisjuncts prefix rest
+      case formula of
+        Not atom
+          | isSupportedPremiseAtom atom,
+            usesOnlyUniversalBinders prefix atom ->
+              Just (atom : premises, violations)
+        _
+          | isSupportedViolation formula ->
+              Just (premises, formula : violations)
+        _ -> Nothing
+
+    isSupportedPremiseAtom (Ato (Action _ _)) = True
+    isSupportedPremiseAtom (Ato (EqE _ _)) = True
+    isSupportedPremiseAtom (Ato (Less _ _)) = True
+    isSupportedPremiseAtom _ = False
+
+    isSupportedViolation (Ato (Action _ _)) = True
+    isSupportedViolation (Ato (EqE _ _)) = True
+    isSupportedViolation (Ato (Less _ _)) = True
+    isSupportedViolation (Not (Ato (EqE _ _))) = True
+    isSupportedViolation (Not (Ato (Less _ _))) = True
+    isSupportedViolation (Conn And p q) =
+      isSupportedViolation p && isSupportedViolation q
+    isSupportedViolation (Conn Or p q) =
+      isSupportedViolation p && isSupportedViolation q
+    isSupportedViolation _ = False
+
+    containsAction =
+      foldFormula
+        (\atom -> case atom of Action _ _ -> True; _ -> False)
+        (const False)
+        id
+        (\_ p q -> p || q)
+        (\_ _ p -> p)
+
+    usesOnlyUniversalBinders prefix formula =
+      all isUniversal (S.toList (boundIndices formula))
+      where
+        bindersByIndex = reverse (map fst prefix)
+        isUniversal i =
+          case drop (fromIntegral i) bindersByIndex of
+            All : _ -> True
+            _ -> False
+
+    boundIndices =
+      foldFormula
+        (foldMap indicesInTerm)
+        (const S.empty)
+        id
+        (\_ -> S.union)
+        (\_ _ -> id)
+
+    indicesInTerm term =
+      case viewTerm term of
+        Lit (Var (Bound i)) -> S.singleton i
+        Lit _ -> S.empty
+        FApp _ terms -> S.unions (map indicesInTerm terms)
+
+-- | Normalize compound all-trace properties into equivalent correspondences
+-- in ProVerif's supported fragment. The three recognized families are:
+--
+-- * @All xs. P ==> (C1 & ... & Cn)@, distributed into a conjunction of
+--   independent all-trace correspondences;
+-- * a universal safety guard @G@ in front of, or conjoined with the premise
+--   of, a correspondence, moved to its conclusion as the positive
+--   existential violation @not G@; and
+-- * @not (Ex xs. A & (K1 or K2) & U)@, distributed into the conjunction of
+--   the two ordinary secrecy properties.
+--
+-- Every rewrite is an equivalence over traces. Safety movement is accepted
+-- only if negating the guard leaves an existential positive formula over
+-- supported atoms; in particular, a positive universal or a negated event
+-- makes the recognizer fail. This function is shared with source/reuse axiom
+-- translation, while query callers additionally gate it on rejection by the
+-- established pipeline.
+rewriteCompoundAllTraceFormula :: LNFormula -> Maybe LNFormula
+rewriteCompoundAllTraceFormula fm =
+  makeBinderHintsGloballyUnique
+    <$> firstRewrite
+      [ distributeCorrespondenceConclusion fm,
+        moveOuterSafetyGuard fm,
+        moveInnerSafetyGuard fm,
+        distributeAttackerDisjunction fm
+      ]
+  where
+    firstRewrite [] = Nothing
+    firstRewrite (candidate : rest) =
+      case candidate of
+        Just rewritten -> Just rewritten
+        Nothing -> firstRewrite rest
+
+    -- P ==> (C1 & ... & Cn) is equivalent to
+    -- (P ==> C1) & ... & (P ==> Cn).
+    distributeCorrespondenceConclusion formula =
+      let (prefix, body) = collectPrefix All formula
+       in case (prefix, body) of
+            (_ : _, Conn Imp premise conclusion@(Conn And _ _)) ->
+              Just $
+                buildConjunction
+                  [ rewrapBoundPrefix All prefix (Conn Imp premise conjunct)
+                  | conjunct <- flattenConjunction conclusion
+                  ]
+            _ -> Nothing
+
+    -- G ==> (All xs. P ==> C) is equivalent to
+    -- All xs. P ==> (C or not G).
+    moveOuterSafetyGuard (Conn Imp safety correspondence) = do
+      violation <- negateSafetyGuard safety
+      addViolationToCorrespondence violation correspondence
+    moveOuterSafetyGuard _ = Nothing
+
+    -- All xs. (G & P) ==> C is equivalent to
+    -- All xs. P ==> (C or not G).
+    moveInnerSafetyGuard formula =
+      let (prefix, body) = collectPrefix All formula
+       in case (prefix, body) of
+            (_ : _, Conn Imp premise conclusion) -> do
+              (safety, remaining) <- extractOneSafetyGuard premise
+              violation <- negateSafetyGuard safety
+              pure $
+                rewrapBoundPrefix All prefix $
+                  Conn Imp (buildConjunction remaining) (Conn Or conclusion violation)
+            _ -> Nothing
+
+    -- not(Ex xs. A & (K1 or K2) & U) is equivalent to the conjunction
+    -- not(Ex xs. A & K1 & U) and not(Ex xs. A & K2 & U).
+    distributeAttackerDisjunction (Not existential) = do
+      (prefix, body) <- collectNonemptyExPrefix existential
+      (leftBody, rightBody) <- splitOneAttackerDisjunction body
+      let left = Not (rewrapBoundPrefix Ex prefix leftBody)
+          right = Not (rewrapBoundPrefix Ex prefix rightBody)
+      if isNegatedExistsWithConjunction left
+          && isNegatedExistsWithConjunction right
+        then Just (Conn And left right)
+        else Nothing
+    distributeAttackerDisjunction _ = Nothing
+
+    collectPrefix q (Qua q' v body)
+      | q == q' =
+          let (rest, inner) = collectPrefix q body
+           in (v : rest, inner)
+    collectPrefix _ body = ([], body)
+
+    collectNonemptyExPrefix formula =
+      case collectPrefix Ex formula of
+        ([], _) -> Nothing
+        result -> Just result
+
+    flattenConjunction (Conn And left right) =
+      flattenConjunction left ++ flattenConjunction right
+    flattenConjunction formula = [formula]
+
+    addViolationToCorrespondence violation formula =
+      let (prefix, body) = collectPrefix All formula
+       in case (prefix, body) of
+            (_ : _, Conn Imp premise conclusion) ->
+              Just $
+                rewrapBoundPrefix All prefix $
+                  Conn Imp premise (Conn Or conclusion violation)
+            _ -> Nothing
+
+    extractOneSafetyGuard premise =
+      case
+        [ (candidate, take i conjuncts ++ drop (i + 1) conjuncts)
+        | (i, candidate) <- zip [0 ..] conjuncts,
+          isJust (negateSafetyGuard candidate)
+        ] of
+        [(safety, remaining@(_ : _))] -> Just (safety, remaining)
+        _ -> Nothing
+      where
+        conjuncts = flattenConjunction premise
+
+    negateSafetyGuard safety
+      | isUniversalSafetyGuard safety,
+        let violation = simplifyFormula (nnf (Not safety)),
+        isSupportedPositiveViolation violation,
+        containsAction violation =
+          Just violation
+      | otherwise = Nothing
+
+    isUniversalSafetyGuard (Conn And left right) =
+      isUniversalSafetyGuard left && isUniversalSafetyGuard right
+    isUniversalSafetyGuard formula =
+      case collectPrefix All formula of
+        (_ : _, Conn Imp premise conclusion) ->
+          isQuantifierFree premise && isQuantifierFree conclusion
+        _ -> False
+
+    isSupportedPositiveViolation (Qua Ex _ body) =
+      isSupportedPositiveViolation body
+    isSupportedPositiveViolation (Conn And left right) =
+      isSupportedPositiveViolation left && isSupportedPositiveViolation right
+    isSupportedPositiveViolation (Conn Or left right) =
+      isSupportedPositiveViolation left && isSupportedPositiveViolation right
+    isSupportedPositiveViolation (Ato (Action _ _)) = True
+    isSupportedPositiveViolation (Ato (EqE _ _)) = True
+    isSupportedPositiveViolation (Ato (Less _ _)) = True
+    isSupportedPositiveViolation (Not (Ato (EqE _ _))) = True
+    isSupportedPositiveViolation (Not (Ato (Less _ _))) = True
+    isSupportedPositiveViolation _ = False
+
+    containsAction =
+      foldFormula
+        (\atom -> case atom of Action _ _ -> True; _ -> False)
+        (const False)
+        id
+        (\_ left right -> left || right)
+        (\_ _ body -> body)
+
+    splitOneAttackerDisjunction body =
+      case
+        [ ( buildConjunction (take i conjuncts ++ [left] ++ drop (i + 1) conjuncts),
+            buildConjunction (take i conjuncts ++ [right] ++ drop (i + 1) conjuncts)
+          )
+        | (i, Conn Or left right) <- zip [0 ..] conjuncts,
+          isExistentialKAction left,
+          isExistentialKAction right
+        ] of
+        [splitBodies] -> Just splitBodies
+        _ -> Nothing
+      where
+        conjuncts = flattenConjunction body
+
+    isExistentialKAction formula =
+      case collectPrefix Ex formula of
+        (_ : _, Ato (Action _ fact)) -> isKLogFact fact
+        _ -> False
+
+-- | Normalize a tree of guarded all-trace correspondences without reference
+-- to protocol or fact names.  The transformation composes three general
+-- equivalences:
+--
+--   * @(not E & P) ==> C@ becomes @P ==> C | E@;
+--   * @(G & P) ==> C@ becomes @P ==> C | not G@ when @G@ is a universal
+--     safety property whose violation is in the positive fragment; and
+--   * @P ==> C1 & C2@ becomes the conjunction of the two obligations.
+--
+-- A guard outside a conjunction of correspondences is copied into every
+-- conclusion.  Negated attacker disjunctions are distributed into separate
+-- obligations.  Every moved formula is checked structurally against the
+-- supported positive correspondence fragment.
+rewriteGuardedAllTraceFormula :: LNFormula -> Maybe LNFormula
+rewriteGuardedAllTraceFormula fm = do
+  normalized <- normalizeTree [] fm
+  let normalized' = makeBinderHintsGloballyUnique normalized
+  if normalized' == makeBinderHintsGloballyUnique fm
+    then Nothing
+    else Just normalized'
+  where
+    normalizeTree inherited formula
+      | Just (outerEscapes, propertyTree) <- extractOuterEscapes formula =
+          normalizeTree (inherited ++ outerEscapes) propertyTree
+    normalizeTree inherited (Conn And left right) = do
+      left' <- normalizeTree inherited left
+      right' <- normalizeTree inherited right
+      pure (Conn And left' right')
+    normalizeTree inherited formula =
+      normalizeCorrespondence inherited formula
+
+    extractOuterEscapes (Conn Imp outerGuard propertyTree)
+      | looksLikePropertyTree propertyTree,
+        let guardParts = flattenConjunction outerGuard,
+        not (null guardParts),
+        Just escapes <- traverse positiveNegatedExistential guardParts =
+          Just (escapes, propertyTree)
+    extractOuterEscapes _ = Nothing
+
+    looksLikePropertyTree (Conn And left right) =
+      looksLikePropertyTree left && looksLikePropertyTree right
+    looksLikePropertyTree (Qua All _ body) = looksLikePropertyTree body
+    looksLikePropertyTree (Conn Imp _ _) = True
+    looksLikePropertyTree _ = False
+
+    normalizeCorrespondence outerEscapes formula =
+      let (prefix, body) = collectPrefix All formula
+       in case (prefix, body) of
+            (_ : _, Conn Imp premise conclusion) -> do
+              let premiseParts = flattenConjunction premise
+                  localEscapes =
+                    mapMaybe positiveNegatedExistential premiseParts
+                  safetyViolations =
+                    mapMaybe negateUniversalSafetyGuard premiseParts
+                  movedParts =
+                    [ part
+                    | part <- premiseParts,
+                      isNothing (positiveNegatedExistential part),
+                      isNothing (negateUniversalSafetyGuard part)
+                    ]
+                  obligations = splitConclusion conclusion
+                  violations =
+                    outerEscapes ++ localEscapes ++ safetyViolations
+                  changed =
+                    not (null violations)
+                      || length obligations > 1
+              if not changed
+                  || null movedParts
+                  || not (all isSupportedPositivePremise movedParts)
+                  || not (formulaContainsAction (buildConjunction movedParts))
+                  || null obligations
+                  || any (not . isSupportedObligation) obligations
+                then Nothing
+                else
+                  Just $
+                    buildConjunction
+                      [ rewrapBoundPrefix All prefix $
+                          Conn Imp
+                            (buildConjunction movedParts)
+                            (buildDisjunction (obligation : violations))
+                      | obligation <- obligations
+                      ]
+            _ -> Nothing
+
+    positiveNegatedExistential (Not positive@(Qua Ex _ _))
+      | isSupportedPositiveConclusion positive,
+        formulaContainsAction positive =
+          Just positive
+    positiveNegatedExistential _ = Nothing
+
+    negateUniversalSafetyGuard safety =
+      case collectPrefix All safety of
+        (_ : _, Conn Imp premise _) ->
+          let violation = simplifyFormula (nnf (Not safety))
+           in if isSupportedPositivePremise premise
+                && formulaContainsAction premise
+                && isSupportedPositiveConclusion violation
+                && formulaContainsAction violation
+                then Just violation
+                else Nothing
+        _ -> Nothing
+
+    collectPrefix q (Qua q' v body)
+      | q == q' =
+          let (rest, inner) = collectPrefix q body
+           in (v : rest, inner)
+    collectPrefix _ body = ([], body)
+
+    flattenConjunction (Conn And left right) =
+      flattenConjunction left ++ flattenConjunction right
+    flattenConjunction formula = [formula]
+
+    splitConclusion (Conn And left right) =
+      splitConclusion left ++ splitConclusion right
+    splitConclusion (Not (Conn Or left right))
+      | isExistentialKAction left,
+        isExistentialKAction right =
+          [Not left, Not right]
+    splitConclusion conclusion = [conclusion]
+
+    isSupportedObligation obligation =
+      isSupportedPositiveConclusion obligation
+        || isNegatedSupportedExistential obligation
+
+    -- A negative existential whose counterexample is itself in the positive
+    -- fragment is handled by the established final rewrite pipeline.  This
+    -- includes both secrecy (@not exists K@) and uniqueness
+    -- (@not exists Event & timepoint-disequality@) conclusions.
+    isNegatedSupportedExistential (Not positive@(Qua Ex _ _)) =
+      isSupportedPositiveConclusion positive && formulaContainsAction positive
+    isNegatedSupportedExistential _ = False
+
+    isExistentialKAction formula =
+      case collectPrefix Ex formula of
+        (_ : _, Ato (Action _ fact)) -> isKLogFact fact
+        _ -> False
+
+-- | Shared all-trace normalization entry point.  Existing compound
+-- correspondence rewrites retain priority for output stability; the
+-- conditional existence split and guarded-correspondence pass are generic
+-- fallbacks.
+normalizeAllTraceFormula :: LNFormula -> Maybe LNFormula
+normalizeAllTraceFormula fm =
+  firstJust
+    [ rewriteCompoundAllTraceFormula fm,
+      rewriteConditionalExistenceCase fm,
+      rewriteGuardedAllTraceFormula fm
+    ]
+  where
+    firstJust [] = Nothing
+    firstJust (candidate : rest) =
+      case candidate of
+        Just normalized -> Just normalized
+        Nothing -> firstJust rest
+
 -- | Check if a formula is of the form not(Ex x1 ... xn. F) where F is a conjunction
 -- that may contain:
 --   - Atoms (action facts)
@@ -3051,35 +4479,6 @@ isExistsWithNegatedExistentials (Conn And p0 q0) = hasNegatedEx && checkNotExist
     checkExistsInNotExists (Conn {}) = False
     checkExistsInNotExists _ = True
 isExistsWithNegatedExistentials _ = False
-
--- | Check if a formula has existentially quantified K (attacker knowledge) facts.
--- K facts can only be supported when universally quantified (in the premise).
--- This function returns True if there are K facts that are existentially quantified.
---
--- The quantification context is determined by:
--- - Under Ex x. P: everything is existentially quantified
--- - Under All x. P: everything is universally quantified
--- - In implication (A ==> B):
---     * Premise A stays in same context (universal if under All)
---     * Conclusion B: always existential (we're asserting B must hold)
--- - Under Not: the quantification context flips
-hasExistentiallyQuantifiedKFact :: LNFormula -> Bool
-hasExistentiallyQuantifiedKFact = go True  -- Start in existential context (top-level)
-  where
-    -- isExistential: True if we're in an existential context, False if universal
-    go _isExistential (Qua Ex _ body) = go True body  -- Ex always makes context existential
-    go _isExistential (Qua All _ body) = go False body  -- All makes context universal
-    go _isExistential (Conn Imp premise conclusion) =
-      -- Premise is always universal context (we're assuming premise holds)
-      -- Conclusion is always existential context (we're asserting it)
-      go False premise || go True conclusion
-    go isExistential (Conn _ p q) = go isExistential p || go isExistential q
-    go isExistential (Not p) = go (not isExistential) p  -- Negation flips context
-    go isExistential (Ato (Action _ fact)) = isExistential && isKFactLocal fact
-    go _ _ = False
-
-    -- Check if a fact is a K fact (K() or KU())
-    isKFactLocal f@(Fact tag _ _) = (tag == KUFact) || isKLogFact f
 
 -- | Eliminate double negations: not(not(P)) ==> P
 -- This should be done before any other transformations
@@ -3311,8 +4710,8 @@ ppNAtomR ruleIdEvents te b = ppAtomR ruleIdEvents te b (fst . ppLNTerm emptyTC)
 ppProtoAtomR :: (Ord a1, Show a1, Show c, Typeable a1, HighlightDocument a2) => S.Set String -> TypingEnvironment -> Bool -> (s (Term (Lit c a1)) -> a2) -> (Term (Lit c a1) -> a2) -> ProtoAtom s (Term (Lit c a1)) -> (a2, M.Map a1 SapicType)
 ppProtoAtomR ruleIdEvents te _ _ ppT (Action _ f@(Fact tag _ ts))
   | factTagArity tag /= length ts = translationFail $ "MALFORMED function" ++ show tag
-  | (tag == KUFact) || isKLogFact f -- treat KU() and K() facts the same
-    =
+  | tag == KUFact = translationFail "KU facts are outside the supported formula translation"
+  | isKLogFact f =
       (ppFactL "attacker" ts, M.empty)
   | otherwise =
       ( text "event(" <> eventArgs ('e' : factTagName tag) ts <> text ")",
@@ -3419,7 +4818,7 @@ ppRestrictFormulaR ::
   String ->
   Precise.FreshT Data.Functor.Identity.Identity Doc
 ppRestrictFormulaR pe ridNames ruleIdEvents te frm attrs =
-  if any (\(Fact tag _ _) -> factTagName tag == "KU") (formulaFacts frm) -- don't allow KU facts, nothing corresponding in PV
+  if formulaContainsKUFact frm -- don't allow KU facts, nothing corresponding in PV
     || (hasLessOrTmpEqInPremise frm && not (hasDistinctFact frm)) -- by this point we have stripped the less if that was possible in the 1st place
     then pure $ ppFail frm
     else let transformedFrm = allImplExLessWoTmps frm
@@ -3427,17 +4826,13 @@ ppRestrictFormulaR pe ridNames ruleIdEvents te frm attrs =
              flattenedFrm = flattenNestedImplications transformedFrm
          in if hasTopLevelNegatedAction flattenedFrm
             then pure $ ppFailNegatedAction flattenedFrm
-            -- Check for nested implications in conclusion (axioms don't support this)
-            else if rejectNestedImplicationInConclusion && hasNestedImplicationInConclusion flattenedFrm
+            -- ProVerif rejects nested implications ("nested queries") in the
+            -- conclusion of lemmas, axioms, and restrictions alike; emitting
+            -- them makes the whole file unparseable.
+            else if hasNestedImplicationInConclusion flattenedFrm
             then pure $ ppFailNestedImpl flattenedFrm
             else pp flattenedFrm
   where
-    -- Check if the formula has nested implications in the conclusion
-    -- This is not supported for axioms in ProVerif
-    rejectNestedImplicationInConclusion = case pe of
-      R -> False
-      RSL -> True
-
     hasNestedImplicationInConclusion = checkNested False
       where
         checkNested inConc (Qua _ _ q) = checkNested inConc q
@@ -3448,7 +4843,7 @@ ppRestrictFormulaR pe ridNames ruleIdEvents te frm attrs =
         checkNested _ _ = False
 
     ppFailNestedImpl fm = text "(*" <> prettyLNFormula fm <> text "*)" $$
-                text ("(* " ++ failMsg ++ " has nested implication in conclusion which is not supported for axioms in ProVerif. *)") $$
+                text ("(* " ++ failMsg ++ " translation failed. Nested implication in the conclusion is not supported in ProVerif. *)") $$
                 text ""
       where
         failMsg = case pe of
@@ -3475,7 +4870,10 @@ ppRestrictFormulaR pe ridNames ruleIdEvents te frm attrs =
       where
         keepTimeVars = case pe of
           R -> True
-          RSL -> hasDistinctFact frm || hasTimepointEqInConclusion frm
+          RSL ->
+            hasDistinctFact frm
+              || hasTimepointEqInConclusion frm
+              || M.size ridNames > 1
     ppFail fm = text "(*" <> prettyLNFormula fm <> text "*)" $$
                 text ("(* " ++ failMsg ++ " translation failed. Results may be incomplete. *)") $$
                 text ""
@@ -3583,32 +4981,44 @@ ppRestrictFormulaR pe ridNames ruleIdEvents te frm attrs =
 
 -- | Translate a restriction to ProVerif format
 ppRestr :: S.Set String -> TypingEnvironment -> Restriction -> Doc
+ppRestr _ruleIdEvents _te rstr
+  | Just reason <- assumptionKnowledgeFragmentFailure rstr._rstrFormula =
+      text "(*" <> text rstr._rstrName <> text "*)"
+        $$ text ("(* Restriction translation failed: " ++ reason ++ ". *)")
+        $$ text "(*" <> prettyLNFormula rstr._rstrFormula <> text "*)"
+        $$ text ""
 ppRestr ruleIdEvents te rstr =
   timepointComment
     $$ text "(*" <> text rstr._rstrName <> text "*)"
-    $$ case tryRewriteNegatedRestriction fm of
+    $$ case tryRewriteForbiddenAlternatives fm of
          Just rewritten ->
-           -- Successfully rewrote the negated restriction
            text "(* Original: " <> prettyLNFormula rstr._rstrFormula <> text " *)"
-           $$ Precise.evalFresh (ppRestrictFormulaR R (ridNamesFor rewritten) ruleIdEvents te rewritten "") (avoidPrecise rewritten)
+           $$ vcat
+                (intersperse (text "") (map renderStandaloneRestriction rewritten))
          Nothing ->
-           -- Check for unsupported patterns
-           if hasNestedImplicationInConjunction fm
-           then text "(* " <> prettyLNFormula rstr._rstrFormula <> text " *)"
-                $$ text "(* Formula has nested implications inside conjunctions (e.g., A => ((B => C) & D))."
-                $$ text "   This pattern cannot be soundly transformed to ProVerif's supported fragment."
-                $$ text "   The formula is outside the supported ProVerif fragment. *)"
-                $$ text ""
-           else if hasVariableCaptureInNestedImplication fm
-           then text "(* " <> prettyLNFormula rstr._rstrFormula <> text " *)"
-                $$ text "(* Formula has variable capture in nested quantified implications (e.g., A(x) => (All x. B => C))."
-                $$ text "   Flattening would change the semantics. *)"
-                $$ text ""
-           else if hasProblematicNegation fm
-           then text "(* " <> prettyLNFormula fm <> text " *)"
-                $$ text "(* Restriction has negated event which is not supported in ProVerif. *)"
-                $$ text ""
-           else Precise.evalFresh (ppRestrictFormulaR R (ridNamesFor fm) ruleIdEvents te fm "") (avoidPrecise fm)
+           case tryRewriteNegatedRestriction fm of
+             Just rewritten ->
+               -- Successfully rewrote the negated restriction
+               text "(* Original: " <> prettyLNFormula rstr._rstrFormula <> text " *)"
+               $$ Precise.evalFresh (ppRestrictFormulaR R (ridNamesFor rewritten) ruleIdEvents te rewritten "") (avoidPrecise rewritten)
+             Nothing ->
+               -- Check for unsupported patterns
+               if hasNestedImplicationInConjunction fm
+               then text "(* " <> prettyLNFormula rstr._rstrFormula <> text " *)"
+                    $$ text "(* Formula has nested implications inside conjunctions (e.g., A => ((B => C) & D))."
+                    $$ text "   This pattern cannot be soundly transformed to ProVerif's supported fragment."
+                    $$ text "   The formula is outside the supported ProVerif fragment. *)"
+                    $$ text ""
+               else if hasVariableCaptureInNestedImplication fm
+               then text "(* " <> prettyLNFormula rstr._rstrFormula <> text " *)"
+                    $$ text "(* Formula has variable capture in nested quantified implications (e.g., A(x) => (All x. B => C))."
+                    $$ text "   Flattening would change the semantics. *)"
+                    $$ text ""
+               else if hasProblematicNegation fm
+               then text "(* " <> prettyLNFormula fm <> text " *)"
+                    $$ text "(* Restriction has negated event which is not supported in ProVerif. *)"
+                    $$ text ""
+               else Precise.evalFresh (ppRestrictFormulaR R (ridNamesFor fm) ruleIdEvents te fm "") (avoidPrecise fm)
   where
     -- Apply transformations for restrictions:
     -- 1. First simplify (converts A => F to Not A)
@@ -3635,13 +5045,105 @@ ppRestr ruleIdEvents te rstr =
     timepointComment = if needsRuleId
                        then text "(* Timepoints in restriction have been split *)"
                        else text ""
-    fm = if needsRuleId
-         then makeTimeVarsDistinct simplifiedFormula
-         else simplifiedFormula
+    (fm, splitTimeOrigins) =
+      if needsRuleId
+        then makeTimeVarsDistinctWithOrigins simplifiedFormula
+        else (simplifiedFormula, M.empty)
     -- Per-occurrence rule-id variables (and rule-id equalities for surviving
     -- temporal equalities, e.g. uniqueness restrictions on instrumented
-    -- events); split-timepoint restrictions keep the shared "rid" scheme.
-    ridNamesFor f = if needsRuleId then M.empty else ridOccurrenceNames ruleIdEvents f
+    -- events). Split-timepoint restrictions preserve each independent
+    -- original timepoint group while retaining the established shared "rid"
+    -- rendering when only one group remains in a subformula.
+    ridNamesFor f =
+      if needsRuleId
+        then
+          ridOccurrenceNamesWithOriginsPreservingSingle
+            ruleIdEvents
+            splitTimeOrigins
+            f
+        else ridOccurrenceNames ruleIdEvents f
+
+    renderStandaloneRestriction formula =
+      let formulaNeedsRuleId = formulaHasSharedTimepoints formula
+          (formula', origins) =
+            if formulaNeedsRuleId
+              then makeTimeVarsDistinctWithOrigins formula
+              else (formula, M.empty)
+          formulaRidNames =
+            if formulaNeedsRuleId
+              then
+                ridOccurrenceNamesWithOriginsPreservingSingle
+                  ruleIdEvents
+                  origins
+                  formula'
+              else ridOccurrenceNames ruleIdEvents formula'
+       in Precise.evalFresh
+            (ppRestrictFormulaR R formulaRidNames ruleIdEvents te formula' "")
+            (avoidPrecise formula')
+
+    -- A forbidden positive witness whose body is a disjunction can be
+    -- represented by one prohibition per DNF branch:
+    --
+    --   not (Ex xs. C1 or ... or Cn)
+    --     iff
+    --   (All xs. C1 ==> false) and ... and (All xs. Cn ==> false).
+    --
+    -- This is purely structural. Every resulting branch must be a
+    -- quantifier-free positive correspondence premise containing an event.
+    -- The small cap prevents an accidental exponential exporter blow-up.
+    tryRewriteForbiddenAlternatives :: LNFormula -> Maybe [LNFormula]
+    tryRewriteForbiddenAlternatives (Not positive) = do
+      let normalized = pnf positive
+          (prefix, body) = collectExistentialPrefix normalized
+      if null prefix
+        then Nothing
+        else do
+          branches <- positiveDnf 16 body
+          let distinctBranches = List.nub branches
+          if length distinctBranches < 2
+              || any (not . isSupportedPositivePremise) distinctBranches
+              || any (not . formulaContainsAction) distinctBranches
+            then Nothing
+            else
+              Just
+                [ rewrapBoundPrefix All prefix (Conn Imp branch (TF False))
+                | branch <- distinctBranches
+                ]
+    tryRewriteForbiddenAlternatives _ = Nothing
+
+    collectExistentialPrefix (Qua Ex v body) =
+      let (rest, inner) = collectExistentialPrefix body
+       in (v : rest, inner)
+    collectExistentialPrefix body = ([], body)
+
+    positiveDnf limit formula =
+      case formula of
+        Conn Or left right -> do
+          leftBranches <- positiveDnf limit left
+          rightBranches <- positiveDnf (limit - length leftBranches) right
+          let branches = leftBranches ++ rightBranches
+          if length branches <= limit then Just branches else Nothing
+        Conn And left right -> do
+          leftBranches <- positiveDnf limit left
+          rightBranches <- positiveDnf limit right
+          let branchCount = length leftBranches * length rightBranches
+          if branchCount <= limit
+            then
+              Just
+                [ buildConjunction
+                    (flattenConjunction leftBranch ++ flattenConjunction rightBranch)
+                | leftBranch <- leftBranches,
+                  rightBranch <- rightBranches
+                ]
+            else Nothing
+        _
+          | limit >= 1,
+            isQuantifierFree formula -> Just [formula]
+          | otherwise -> Nothing
+
+    flattenConjunction (Conn And left right) =
+      flattenConjunction left ++ flattenConjunction right
+    flattenConjunction formula = [formula]
 
     -- Check if a formula has a problematic negation (negated event at top level)
     hasProblematicNegation (Not f) = hasEventAnywhere f
@@ -3670,62 +5172,92 @@ ppRestr ruleIdEvents te rstr =
     -- Note: inequality (i ≠ j) is represented as Not (EqE i j)
     tryRewriteNegatedBody (Conn And premise (Not (Ato (EqE t1 t2)))) =
       Just $ Conn Imp premise (Ato (EqE t1 t2))
+    -- Pattern: not((P) & (#t1 < #t2)) -> P => ((#t2 < #t1) | (#t1 = #t2))
+    -- The negated temporal order becomes its complement in the conclusion.
+    tryRewriteNegatedBody (Conn And premise (Ato (Less t1 t2))) =
+      Just $ Conn Imp premise (Conn Or (Ato (Less t2 t1)) (Ato (EqE t1 t2)))
     tryRewriteNegatedBody _ = Nothing
 
 -- | Printer for reuse/src lemmas as ProVerif axioms.
 -- | Different than ppLemma in that it ignores timepoints and does transformations custom to these lemmas.
 ppAxiomLemma :: S.Set String -> TypingEnvironment -> Lemma ProofSkeleton -> Doc
+ppAxiomLemma _ruleIdEvents _te l
+  | Just reason <- assumptionKnowledgeFragmentFailure l._lFormula =
+      text "(*"
+        <> text l._lName
+        <> text " [reuse/source lemma not translated as axiom]"
+        <> text "*)"
+        $$ text ("(* Axiom translation failed: " ++ reason ++ ". *)")
+        $$ text "(*" <> prettyLNFormula l._lFormula <> text "*)"
+        $$ text ""
 ppAxiomLemma ruleIdEvents te l =
   timepointComment
     $$ text "(*"
     <> text l._lName
     <> text " [reuse/source lemma translated as axiom]"
     <> text "*)"
-    $$ if hasNestedImplicationInConjunction fm
-       then text "(* " <> prettyLNFormula l._lFormula <> text " *)"
-            $$ text "(* Formula has nested implications inside conjunctions (e.g., A => ((B => C) & D))."
-            $$ text "   This pattern cannot be soundly transformed to ProVerif's supported fragment."
-            $$ text "   The formula is outside the supported ProVerif fragment. *)"
-            $$ text ""
-       else if hasVariableCaptureInNestedImplication fm
-       then text "(* " <> prettyLNFormula l._lFormula <> text " *)"
-            $$ text "(* Formula has variable capture in nested quantified implications (e.g., A(x) => (All x. B => C))."
-            $$ text "   Flattening would change the semantics. *)"
-            $$ text ""
-       else if hasNegatedEventInFormula fm
-       then text "(* " <> prettyLNFormula l._lFormula <> text " *)"
-            $$ text "(* Axiom has negated event (not(...event...)) which is not supported in ProVerif. *)"
-            $$ text ""
-       else Precise.evalFresh (ppRestrictFormulaR RSL ridNames ruleIdEvents te fm "") (avoidPrecise fm)
+    $$ vcat (intersperse (text "") (map renderAxiom axiomFormulas))
   where
-    -- Per-occurrence rule-id variables, as for restrictions.
-    ridNames = if needsRuleId then M.empty else ridOccurrenceNames ruleIdEvents fm
-    -- Apply same transformations as for restrictions
-    -- Order matters:
-    -- 1. First eliminate temporal equalities by unifying the equated timepoints
-    --    (must happen before constraints are moved to the conclusion)
-    -- 2. Then move negated actions from premise to conclusion BEFORE pullNots
-    --    (pullNots combines negations via De Morgan, making individual movement impossible)
-    -- 3. Then move constraints to conclusion
-    -- 4. Then apply pullNots to normalize negations
-    -- 5. Then flatten nested implications: A => (B => C) -> (A & B) => C
-    -- 6. Then expand negated timepoint comparisons: not(i < j) -> (j < i) | (i = j)
-    -- 7. Finally simplify
-    simplifiedFormula =
-      simplifyFormula
-        $ flattenNestedImplications
-        $ expandNegatedTimepointComparisons
-        $ transformWithPullNots
-        $ moveConstraintsToConclusion
-        $ moveNegatedActionsToConclusion
-        $ eliminateTemporalEqualities l._lFormula
-    needsRuleId = formulaHasSharedTimepoints simplifiedFormula
-    timepointComment = if needsRuleId
+    renderAxiom simplifiedFm =
+      let needsRuleId = formulaHasSharedTimepoints simplifiedFm
+          (fm, splitTimeOrigins) =
+            if needsRuleId
+              then makeTimeVarsDistinctWithOrigins simplifiedFm
+              else (simplifiedFm, M.empty)
+          ridNames =
+            if needsRuleId
+              then
+                ridOccurrenceNamesWithOriginsPreservingSingle
+                  ruleIdEvents
+                  splitTimeOrigins
+                  fm
+              else ridOccurrenceNames ruleIdEvents fm
+       in if hasNestedImplicationInConjunction fm
+            then
+              text "(* " <> prettyLNFormula l._lFormula <> text " *)"
+                $$ text "(* Formula has nested implications inside conjunctions (e.g., A => ((B => C) & D))."
+                $$ text "   This pattern cannot be soundly transformed to ProVerif's supported fragment."
+                $$ text "   The formula is outside the supported ProVerif fragment. *)"
+                $$ text ""
+            else
+              if hasVariableCaptureInNestedImplication fm
+                then
+                  text "(* " <> prettyLNFormula l._lFormula <> text " *)"
+                    $$ text "(* Formula has variable capture in nested quantified implications (e.g., A(x) => (All x. B => C))."
+                    $$ text "   Flattening would change the semantics. *)"
+                    $$ text ""
+                else
+                  if hasNegatedEventInFormula fm
+                    then
+                      text "(* " <> prettyLNFormula l._lFormula <> text " *)"
+                        $$ text "(* Axiom has negated event (not(...event...)) which is not supported in ProVerif. *)"
+                        $$ text ""
+                    else
+                      Precise.evalFresh
+                        (ppRestrictFormulaR RSL ridNames ruleIdEvents te fm "")
+                        (avoidPrecise fm)
+
+    sharedNormalization =
+      normalizeAllTraceFormula (simplifyFormula l._lFormula)
+    normalizedFormula =
+      fromMaybe l._lFormula sharedNormalization
+    simplifiedFormulaBeforeCompletion
+      | isJust sharedNormalization =
+          mapTopLevelConjunctsFormula rewriteFormulaForAxiom normalizedFormula
+      | otherwise = rewriteFormulaForAxiom normalizedFormula
+    simplifiedFormula
+      | isJust sharedNormalization =
+          fst (guardSameActionConclusions simplifiedFormulaBeforeCompletion)
+      | otherwise = simplifiedFormulaBeforeCompletion
+    axiomFormulas
+      | isJust sharedNormalization =
+          let (formulas, _, _) =
+                splitTopLvlConns AllTraces 1 simplifiedFormula
+           in formulas
+      | otherwise = [simplifiedFormula]
+    timepointComment = if any formulaHasSharedTimepoints axiomFormulas
                        then text "(* Timepoints in lemma have been split *)\n"
                        else text ""
-    fm = if needsRuleId
-         then makeTimeVarsDistinct simplifiedFormula
-         else simplifiedFormula
 
 -- Check if a formula is of the form "All x1 .. xn tA. A(x1 ... xn)@tA ==> not (Ex y1 ... yn tB. B(y1 ... yn)@tB)"
 isAllActionsImpliesNotExists :: LNFormula -> Bool
@@ -3808,7 +5340,10 @@ loadRestrictions sharedEventTags _ te thy =
       docs = map (ppRestr sharedEventTags te) rs
       allFacts = concatMap (formulaFacts . L.get rstrFormula) rs
       validFacts =
-        [ f | f@(Fact tag _ _) <- allFacts, factTagName tag `notElem` ["OnlyOnce", "DistinctFact"]
+        [ f
+        | f@(Fact tag _ _) <- allFacts,
+          not (isKnowledgeFact f),
+          factTagName tag `notElem` ["OnlyOnce", "DistinctFact"]
         ]
       headers = makeEventHeaders sharedEventTags validFacts
    in (docs, headers)

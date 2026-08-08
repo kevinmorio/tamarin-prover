@@ -1,0 +1,28 @@
+theory export_property_instrumentation
+begin
+
+rule EmitTogether:
+  [ Fr(~x) ]
+  --[ Trigger(~x), Consequence(~x) ]->
+  []
+
+rule EmitFirst:
+  [ Fr(~x) ]
+  --[ First(~x) ]->
+  []
+
+rule EmitSecond:
+  [ Fr(~x) ]
+  --[ Second(~x) ]->
+  []
+
+lemma completion_required:
+  "All x #i. Trigger(x) @ i ==> Consequence(x) @ i"
+
+lemma completion_not_required_for_same_fact:
+  "All x #i. Trigger(x) @ i ==> Trigger(x) @ i"
+
+lemma temporal_equality_uses_rule_ids:
+  "not (Ex x #i #j. First(x) @ i & Second(x) @ j & #i < #j)"
+
+end
