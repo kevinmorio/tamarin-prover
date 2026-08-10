@@ -15,9 +15,15 @@ module Export
   ( prettyProVerifTheory,
     prettyProVerifEquivTheory,
     prettyDeepSecTheory,
+    ExportDiagnostic (..),
+    ExportError (..),
+    ExportResult (..),
+    diagnosticsToWfReport,
+    renderExportDiagnostics,
   )
 where
 
+import Control.Exception qualified as Exception
 import Control.Monad.Fresh
 import Control.Monad.Trans.PreciseFresh qualified as Precise
 import Data.ByteString.Char8 qualified as BC
@@ -27,16 +33,17 @@ import Data.Functor.Identity qualified
 import Data.List as List
 import Data.Map qualified as M
 import Data.Maybe
+import Data.Sequence qualified as Seq
 import Data.Set qualified as S
 import Extension.Data.Label qualified as L
+import Export.Diagnostic
+import Export.Types
 import ProVerifHeader
 import RuleTranslation
 import Sapic.Annotation
 import Sapic.Report
 import Sapic.States
 import Sapic.Typing
-import System.IO
-import System.IO.Unsafe
 import Term.Builtin.Rules
 import Term.SubtermRule
 import Text.PrettyPrint.Class
@@ -409,17 +416,32 @@ isNestedImplicationOk (Conn Imp q r) | isQuantifierFree q = do
         else isNestedImplicationOk r
 isNestedImplicationOk _ = pure False
 
--- | Failure function performing an unsafe IO failure
-translationFail :: String -> a
-translationFail s = unsafePerformIO (fail s)
+newtype ExportException = ExportException String
+  deriving (Show)
 
--- | Warning function performing an unsafe IO failure
-translationWarning :: String -> a -> a
-translationWarning s cont = unsafePerformIO printWarning
+instance Exception.Exception ExportException
+
+-- | Abort pure rendering. The public entry points force and catch this
+-- exception before returning an 'ExportResult', so callers never receive a
+-- partial target model.
+translationFail :: String -> a
+translationFail = Exception.throw . ExportException
+
+captureExport :: Seq.Seq ExportDiagnostic -> IO Doc -> IO (Either ExportError ExportResult)
+captureExport diagnostics renderDocument = do
+  rendered <- Exception.try renderDocument :: IO (Either Exception.SomeException Doc)
+  case rendered of
+    Left exception -> pure (Left (exceptionToExportError exception))
+    Right document -> do
+      forced <- Exception.try (Exception.evaluate (length (render document))) :: IO (Either Exception.SomeException Int)
+      case forced of
+        Left exception -> pure (Left (exceptionToExportError exception))
+        Right _ -> pure (Right (ExportResult document diagnostics))
   where
-    printWarning = do
-      hPutStr stderr $ "WARNING: " ++ s
-      pure cont
+    exceptionToExportError exception =
+      case Exception.fromException exception of
+        Just (ExportException message) -> ExportError "EXP-FATAL-INPUT" message
+        Nothing -> ExportError "EXP-FATAL-RENDER" (Exception.displayException exception)
 
 ------------------------------------------------------------------------------
 -- Core ProVerif Export
@@ -450,20 +472,21 @@ prettyProVerifTheory ::
   Bool -> -- hasSpecificLemmas
   (ProtoLemma LNFormula ProofSkeleton -> Bool) ->
   (OpenTheory, TypingEnvironment) ->
-  IO Doc
-prettyProVerifTheory m noReuseLemmas noSourceLemmas noRestrictions noMultiset noPrecise hasSpecificLemmas lemSel (thy', typEnv) = do
-  headersTheory <- loadHeaders propertyEventTags tc thy typEnv -- load headers from theory
-  let headersTranslation =
-        [ baseHeaders, -- base headers for translation
-          prochd, -- headers from the process
-          macroprochd, -- headers from the macroprocess
-          ruleHeaders, -- headers from the rules
-          lemmaHeaders, -- headers from the lemmas
-          restrictionHeaders -- headers from the restrictions
-        ]
-  headers <- checkDuplicates' $ filterHeaders $ S.unions $ headersTheory : headersTranslation
-  let hd = attribHeaders tc headers
-  pure $ proverifTemplate (skipPrecise tc) hd queries proc' macroproc ruleproc restrictions axioms lemmas comments
+  IO (Either ExportError ExportResult)
+prettyProVerifTheory m noReuseLemmas noSourceLemmas noRestrictions noMultiset noPrecise hasSpecificLemmas lemSel (thy', typEnv) =
+  captureExport diagnostics $ do
+    headersTheory <- loadHeaders propertyEventTags tc thy typEnv -- load headers from theory
+    let headersTranslation =
+          [ baseHeaders, -- base headers for translation
+            prochd, -- headers from the process
+            macroprochd, -- headers from the macroprocess
+            ruleHeaders, -- headers from the rules
+            lemmaHeaders, -- headers from the lemmas
+            restrictionHeaders -- headers from the restrictions
+          ]
+    headers <- checkDuplicates' $ filterHeaders $ S.unions $ headersTheory : headersTranslation
+    let hd = attribHeaders tc headers
+    pure $ proverifTemplate (skipPrecise tc) hd queries proc' macroproc ruleproc restrictions axioms lemmas comments
   where
     thy = if noMultiset then thy' else multisetTheory thy'
 
@@ -565,6 +588,9 @@ prettyProVerifTheory m noReuseLemmas noSourceLemmas noRestrictions noMultiset no
       -- if stateM is not empty, we have inlined the process calls, so we don't reoutput them
       if hasBoundState then ([text ""], S.empty) else loadMacroProc tc thy
     comments = [text "(*" $$ text bd $$ text "*)" | (_, bd) <- theoryFormalComments thy]
+    diagnostics =
+      collectProVerifDiagnostics hasSpecificLemmas lemSel tc thy
+        <> collectTypingDiagnostics typEnv
 
 stateHeaders :: S.Set ProVerifHeader
 stateHeaders =
@@ -577,6 +603,89 @@ data BuiltinTranslation
   = NotSupportedBuiltin String
   | AccurateBuiltin [ProVerifHeader]
   | BestEffortBuiltin [ProVerifHeader]
+
+collectProVerifDiagnostics ::
+  Bool ->
+  (ProtoLemma LNFormula ProofSkeleton -> Bool) ->
+  TranslationContext ->
+  OpenTheory ->
+  Seq.Seq ExportDiagnostic
+collectProVerifDiagnostics hasSpecificLemmas lemSel tc thy =
+  collectBuiltinDiagnostics thy
+    <> Seq.fromList (lemmaDiagnostics ++ restrictionDiagnostics)
+  where
+    classified =
+      [ (lemma, classifyLemma hasSpecificLemmas tc lemSel lemma)
+      | lemma <- theoryLemmas thy
+      ]
+    lemmaDiagnostics = concatMap diagnosticForLemma classified
+    diagnosticForLemma (lemma, AsQuery) =
+      case queryKnowledgeFragmentFailure lemma._lTraceQuantifier lemma._lFormula of
+        Nothing -> []
+        Just reason ->
+          [ ExportDiagnostic
+              "PV-GOAL-OMITTED"
+              DiagnosticWarning
+              UntranslatedGoal
+              (LemmaSubject lemma._lName)
+              ("produced no ProVerif query: " ++ reason)
+          ]
+    diagnosticForLemma (lemma, AsAxiom) =
+      case assumptionKnowledgeFragmentFailure lemma._lFormula of
+        Nothing -> []
+        Just reason ->
+          [ ExportDiagnostic
+              "PV-AXIOM-OMITTED"
+              DiagnosticWarning
+              ChangedAssumptions
+              (AxiomSubject lemma._lName)
+              ("was not emitted: " ++ reason)
+          ]
+    diagnosticForLemma (_, ExcludeLemma) = []
+    restrictionDiagnostics
+      | skipRestrictions tc = []
+      | otherwise = mapMaybe diagnosticForRestriction (theoryRestrictions thy)
+    diagnosticForRestriction restriction =
+      ExportDiagnostic
+        "PV-RESTRICTION-OMITTED"
+        DiagnosticWarning
+        ChangedAssumptions
+        (RestrictionSubject restriction._rstrName)
+        . ("was not emitted: " ++)
+        <$> assumptionKnowledgeFragmentFailure restriction._rstrFormula
+
+collectBuiltinDiagnostics :: OpenTheory -> Seq.Seq ExportDiagnostic
+collectBuiltinDiagnostics thy =
+  Seq.fromList
+    [ ExportDiagnostic
+        "PV-BUILTIN-APPROXIMATED"
+        DiagnosticWarning
+        ChangedProcessSemantics
+        (BuiltinSubject name)
+        "uses a best-effort target encoding"
+    | name <- theoryBuiltins thy,
+      BestEffortBuiltin _ <- [builtins name]
+    ]
+
+collectTypingDiagnostics :: TypingEnvironment -> Seq.Seq ExportDiagnostic
+collectTypingDiagnostics typeEnvironment =
+  Seq.fromList
+    [ ExportDiagnostic
+        "PV-SORT-COERCED"
+        DiagnosticWarning
+        ChangedProcessSemantics
+        ProcessSubject
+        ( "variable `"
+            ++ name
+            ++ "` of sort "
+            ++ show variableSort
+            ++ " is encoded as ProVerif bitstring"
+        )
+    | LVar name variableSort _ <- S.toList distinctVariables,
+      variableSort `elem` [LSortPub, LSortFresh, LSortNat]
+    ]
+  where
+    distinctVariables = S.fromList (M.keys typeEnvironment.vars)
 
 builtins :: String -> BuiltinTranslation
 builtins "diffie-hellman" =
@@ -704,19 +813,20 @@ proverifEquivTemplate headers queries equivlemmas macroproc comments =
     $$ vcat equivlemmas
     $--$ vcat (intersperse (text "") comments)
 
-prettyProVerifEquivTheory :: (OpenTheory, TypingEnvironment) -> IO Doc
-prettyProVerifEquivTheory (thy, typEnv) = do
-  headersTheory <- loadHeaders S.empty tc thy typEnv
-  let headersTranslation =
-        [ baseHeaders,
-          equivhd,
-          diffEquivhd,
-          macroprochd
-        ]
-  headers <- checkDuplicates' $ filterHeaders $ S.unions $ headersTheory : headersTranslation
-  let hd = attribHeaders tc headers
-  fproc <- finalproc
-  pure $ proverifEquivTemplate hd queries fproc macroproc comments
+prettyProVerifEquivTheory :: (OpenTheory, TypingEnvironment) -> IO (Either ExportError ExportResult)
+prettyProVerifEquivTheory (thy, typEnv) =
+  captureExport diagnostics $ do
+    headersTheory <- loadHeaders S.empty tc thy typEnv
+    let headersTranslation =
+          [ baseHeaders,
+            equivhd,
+            diffEquivhd,
+            macroprochd
+          ]
+    headers <- checkDuplicates' $ filterHeaders $ S.unions $ headersTheory : headersTranslation
+    let hd = attribHeaders tc headers
+    fproc <- finalproc
+    pure $ proverifEquivTemplate hd queries fproc macroproc comments
   where
     tc = emptyTC {predicates = theoryPredicates thy}
     (equivlemmas, equivhd, hasBoundState, hasUnboundState) = loadEquivProc tc thy
@@ -731,6 +841,7 @@ prettyProVerifEquivTheory (thy, typEnv) = do
       -- if stateM is not empty, we have inlined the process calls, so we don't reoutput them
       if hasBoundState then ([text ""], S.empty) else loadMacroProc tc thy
     comments = [text "(*" $$ text bd $$ text "*)" | (_, bd) <- theoryFormalComments thy]
+    diagnostics = collectBuiltinDiagnostics thy <> collectTypingDiagnostics typEnv
 
 ------------------------------------------------------------------------------
 -- Core DeepSec Export
@@ -747,17 +858,19 @@ deepsecTemplate headers macroproc requests equivlemmas comments =
 emptyTypeEnv :: TypingEnvironment
 emptyTypeEnv = TypingEnvironment {vars = M.empty, events = M.empty, funs = M.empty}
 
-prettyDeepSecTheory :: Int -> OpenTheory -> IO Doc
-prettyDeepSecTheory repBound thy = do
-  headers <- loadHeaders S.empty tc thy emptyTypeEnv
-  let hd = attribHeaders tc $ S.toList (S.unions [headers, macroprochd, equivhd])
-  pure $ deepsecTemplate hd macroproc requests equivlemmas comments
+prettyDeepSecTheory :: Int -> OpenTheory -> IO (Either ExportError ExportResult)
+prettyDeepSecTheory repBound thy =
+  captureExport diagnostics $ do
+    headers <- loadHeaders S.empty tc thy emptyTypeEnv
+    let hd = attribHeaders tc $ S.toList (S.unions [headers, macroprochd, equivhd])
+    pure $ deepsecTemplate hd macroproc requests equivlemmas comments
   where
     tc = emptyTC {trans = DeepSec, replicationBound = repBound}
     requests = loadRequests thy
     (macroproc, macroprochd) = loadMacroProc tc thy
     (equivlemmas, equivhd, _, _) = loadEquivProc tc thy
     comments = [text "(*" $$ text bd $$ text "*)" | (_, bd) <- theoryFormalComments thy]
+    diagnostics = collectBuiltinDiagnostics thy
 
 -- Loader of the export functions
 ------------------------------------------------------------------------------
@@ -856,18 +969,11 @@ renderSapicTermWithPattern tc mVars isPattern = renderTermWithHeaders ppLit
       Con (Name FreshName n) -> text . sanitizeSymbol 'a' $ show n
       Con (Name PubName n) | isPattern -> text "=" <> text ("s" ++ show n)
       Con (Name PubName n) -> ppPubName n
-      Var (SapicLVar lvar@(LVar n lsort _) _)
+      Var (SapicLVar lvar@(LVar _ lsort _) _)
         | lsort `elem` [LSortPub, LSortFresh, LSortNat] ->
-            translationWarning
-              ( "Encountered a variable "
-                  ++ n
-                  ++ " of non-message sort "
-                  ++ show lsort
-                  ++ ". Used in pattern matching, this may produces different behaviour in Tamarin and ProVerif.  Used elsewhere, we simply ignore the sort and translate to to ProVerif's default: bitstring"
-              )
-              $ if isPattern || S.member lvar mVars
-                  then text "=" <> ppLVar lvar
-                  else ppLVar lvar
+            if isPattern || S.member lvar mVars
+              then text "=" <> ppLVar lvar
+              else ppLVar lvar
       Var (SapicLVar lvar _)
         | S.member lvar mVars -> text "=" <> ppLVar lvar
       l | isPattern -> ppTypeLit tc l
@@ -2203,7 +2309,7 @@ applyRewriteForShape shape fm = case shape of
 -- | Apply pullNegationsToTop transformation with warning on partial rewrite
 transformWithPullNots :: LNFormula -> LNFormula
 transformWithPullNots f = case pullNegationsToTop f of
-  Left f' -> translationWarning ("Formula " ++ render (prettyLNFormula f) ++ " cannot be rewritten s.t. it either has only 1 ¬ or none, the result is:\n" ++ render (prettyLNFormula f') ++ "!\n\n") f'
+  Left f' -> f'
   Right f' -> f'
 
 -- ===========================================================================
@@ -3665,7 +3771,7 @@ loadHeaders ruleIdEvents tc thy typeEnv = do
     sig = thy._thySignature._sigMaudeInfo
     builtins' x = case builtins x of
       AccurateBuiltin y -> y
-      BestEffortBuiltin y -> translationWarning ("Using best-effort translation for " ++ x) y
+      BestEffortBuiltin y -> y
       NotSupportedBuiltin s -> translationFail s
     -- all builtins are contained in Sapic Element
     headerBuiltins = S.fromList $ foldMap builtins' (theoryBuiltins thy)

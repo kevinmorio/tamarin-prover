@@ -51,6 +51,8 @@ library
     Export
 
   other-modules:
+    Export.Types
+    Export.Diagnostic
     RuleTranslation
     ProVerifHeader
 

@@ -92,6 +92,27 @@ require_pattern 'Lemma translation failed: exists-trace formula contains K fact'
 knowledge_negative="$tmp_dir/knowledge-negative.pv"
 export_model_lemma "$knowledge_model" rejected_negative_k "$knowledge_negative"
 require_pattern 'Lemma translation failed: formula is outside T-UKF: NNF\(not\(phi\)\) contains a negative K atom' "$knowledge_negative"
+require_pattern '^WARNING: export omitted or approximated proof-relevant input\.$' "$knowledge_negative"
+require_pattern '^Changed assumptions$' "$knowledge_negative"
+require_pattern 'Restriction `rejected_negative_k_restriction`: was not emitted' "$knowledge_negative"
+require_pattern 'Axiom `rejected_negative_k_axiom`: was not emitted' "$knowledge_negative"
+require_pattern '^Untranslated goals$' "$knowledge_negative"
+require_pattern 'Lemma `rejected_negative_k`: produced no ProVerif query' "$knowledge_negative"
+
+knowledge_skipped="$tmp_dir/knowledge-skipped.pv"
+"$tamarin" -d=0 -m=proverif --lemma=supported_k \
+  --proverif-no-reuse-lemmas --proverif-no-source-lemmas --proverif-no-restrictions \
+  "-o=$knowledge_skipped" "$knowledge_model" >/dev/null
+if grep -q '^WARNING: export omitted or approximated proof-relevant input\.$' "$knowledge_skipped"; then
+  echo "explicitly skipped assumptions unexpectedly produced export diagnostics" >&2
+  exit 1
+fi
+
+if "$tamarin" -d=0 -m=proverif --quit-on-warning --lemma=rejected_ku \
+  "-o=$tmp_dir/quit-on-warning.pv" "$knowledge_model" >/dev/null 2>&1; then
+  echo "--quit-on-warning ignored an untranslated selected goal" >&2
+  exit 1
+fi
 
 # Characterize the four refactoring defects before fixing them.  These
 # temporary assertions deliberately describe the current broken output; the
@@ -112,11 +133,6 @@ if [ "$(grep -c '^event eRuleCompleted(bitstring)\.$' "$refactoring_completion")
 fi
 require_pattern 'event eRuleCompleted\(x\);' "$refactoring_completion"
 require_pattern 'event eRuleCompleted\(rid_rUserCompletion\)\.' "$refactoring_completion"
-
-if grep -q '^Export warnings$' "$knowledge_supported"; then
-  echo "export diagnostics unexpectedly appeared before diagnostics integration" >&2
-  exit 1
-fi
 
 if command -v proverif >/dev/null 2>&1; then
   proverif -parse-only "$completion" >/dev/null
