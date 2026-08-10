@@ -54,8 +54,12 @@ library
     Export.Types
     Export.Diagnostic
     Export.Name
+    Export.ProVerif
+    Export.ProVerifEquivalence
+    Export.DeepSec
     Export.ProVerif.Rule
     Export.ProVerif.Header
+    Export.ProVerif.Property
 
   default-extensions:
     DuplicateRecordFields
