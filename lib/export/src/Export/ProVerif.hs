@@ -1,4 +1,3 @@
-{-# OPTIONS_GHC -Wno-incomplete-patterns #-}
 {-# OPTIONS_GHC -Wno-unrecognised-pragmas #-}
 
 {-# HLINT ignore "Use lambda-case" #-}
@@ -13,13 +12,18 @@
 -- Translation from Sapic processes to ProVerif
 module Export.ProVerif
   ( prettyProVerifTheory,
-    prettyProVerifEquivTheory,
-    prettyDeepSecTheory,
-    ExportDiagnostic (..),
-    ExportError (..),
-    ExportResult (..),
-    diagnosticsToWfReport,
-    renderExportDiagnostics,
+    captureExport,
+    collectBuiltinDiagnostics,
+    collectTypingDiagnostics,
+    loadHeaders,
+    filterHeaders,
+    checkDuplicates',
+    attribHeaders,
+    stateHeaders,
+    loadQueries,
+    loadMacroProc,
+    loadEquivProc,
+    loadDiffProc,
   )
 where
 
@@ -36,11 +40,14 @@ import Data.Maybe
 import Data.Sequence qualified as Seq
 import Data.Set qualified as S
 import Extension.Data.Label qualified as L
-import Export.Diagnostic
 import Export.Name
+import Export.ProVerif.Formula
 import Export.ProVerif.Header
+import Export.ProVerif.Instrumentation
 import Export.ProVerif.Property
+import Export.ProVerif.Render
 import Export.ProVerif.Rule
+import Export.Sapic
 import Export.Types
 import Sapic.Annotation
 import Sapic.Report
@@ -59,17 +66,6 @@ import Theory.Tools.Wellformedness (formulaFacts)
 -- SECTION 1: Module Header & Types
 -- ===========================================================================
 
--- | Types of translation the export module covers (others are covered by sapic module).
-data Translation
-  = ProVerif
-  | DeepSec
-  deriving (Ord, Eq, Typeable, Data)
-
--- | Types of translations covered here map to other modules, but not vice versa (for instance, Sapic to MSR).
-exportModule :: Translation -> ModuleType
-exportModule ProVerif = ModuleProVerif
-exportModule DeepSec = ModuleDeepSec
-
 -- | Classification for how a lemma should be translated
 data LemmaTranslationMode
   = AsQuery       -- ^ Regular lemma, translate as query
@@ -85,54 +81,9 @@ data QueryPolarity
   | InvertResult
   deriving (Eq, Ord, Show)
 
--- | Information needed during translation.
-data TranslationContext = TranslationContext
-  { trans :: Translation,
-    attackerChannel :: Maybe LVar,
-    hasBoundStates :: Bool,
-    hasUnboundStates :: Bool,
-    predicates :: [Predicate],
-    replicationBound :: Int,
-    skipReuseLemmas :: Bool,
-    skipSourceLemmas :: Bool,
-    skipRestrictions :: Bool,
-    skipPrecise :: Bool
-  }
-  deriving (Eq, Ord)
-
--- | Default translation context.
-emptyTC :: TranslationContext
-emptyTC =
-  TranslationContext
-    { trans = ProVerif,
-      attackerChannel = Nothing,
-      hasBoundStates = False,
-      hasUnboundStates = False,
-      predicates = [],
-      replicationBound = 3, -- TODO: allow modifying this parameter
-      skipReuseLemmas = False,
-      skipSourceLemmas = False,
-      skipRestrictions = False,
-      skipPrecise = False
-    }
-
 -- ===========================================================================
 -- Helper Functions for Formula Construction
 -- ===========================================================================
-
--- | Build a conjunction from a list of formulas.
--- Returns True for empty list, single formula unchanged, otherwise folds with .&&.
-buildConjunction :: [LNFormula] -> LNFormula
-buildConjunction [] = TF True
-buildConjunction [f] = f
-buildConjunction fs = foldr1 (.&&.) fs
-
--- | Build a disjunction from a list of formulas.
--- Returns False for empty list, single formula unchanged, otherwise folds with .||.
-buildDisjunction :: [LNFormula] -> LNFormula
-buildDisjunction [] = TF False
-buildDisjunction [f] = f
-buildDisjunction fs = foldr1 (.||.) fs
 
 -- | Positive formulas accepted in a correspondence premise.  The predicate
 -- is deliberately structural: action names and protocol vocabulary play no
@@ -168,15 +119,6 @@ isSupportedPositiveConclusion (Conn Or left right) =
 isSupportedPositiveConclusion (TF True) = True
 isSupportedPositiveConclusion (TF False) = True
 isSupportedPositiveConclusion _ = False
-
-formulaContainsAction :: LNFormula -> Bool
-formulaContainsAction =
-  foldFormula
-    (\atom -> case atom of Action _ _ -> True; _ -> False)
-    (const False)
-    id
-    (\_ left right -> left || right)
-    (\_ _ body -> body)
 
 -- | Knowledge atoms need separate fragment checks before any query rewriting.
 -- KU is an internal message-deduction annotation and is outside the formal
@@ -280,18 +222,27 @@ rewriteFormulaForQuery traceQuantifier fm =
       hasNestedEx left || hasNestedEx right
     hasNestedEx _ = False
 
--- | Axiom-side equivalent of 'rewriteFormulaForQuery'.  Completion analysis
--- uses this exact transformation before deciding which rule actions need the
--- internal completion event.
-rewriteFormulaForAxiom :: LNFormula -> LNFormula
-rewriteFormulaForAxiom =
-  simplifyFormula
-    . flattenNestedImplications
-    . expandNegatedTimepointComparisons
-    . transformWithPullNots
-    . moveConstraintsToConclusion
-    . moveNegatedActionsToConclusion
-    . eliminateTemporalEqualities
+rewriteFormulaForAxiomWithDiagnostic :: LNFormula -> (LNFormula, Maybe String)
+rewriteFormulaForAxiomWithDiagnostic formula =
+  ( simplifyFormula
+      . flattenNestedImplications
+      . expandNegatedTimepointComparisons
+      $ pulled,
+    approximation
+  )
+  where
+    beforePull =
+      moveConstraintsToConclusion
+        . moveNegatedActionsToConclusion
+        . eliminateTemporalEqualities
+        $ formula
+    (pulled, approximation) =
+      case pullNegationsToTop beforePull of
+        Left partiallyRewritten ->
+          ( partiallyRewritten,
+            Just "negations could only be partially normalized; the emitted axiom is an approximation"
+          )
+        Right rewritten -> (rewritten, Nothing)
 
 mapTopLevelConjunctsFormula :: (LNFormula -> LNFormula) -> LNFormula -> LNFormula
 mapTopLevelConjunctsFormula f (Conn And left right) =
@@ -579,9 +530,13 @@ prettyProVerifTheory m noReuseLemmas noSourceLemmas noRestrictions noMultiset no
         )
     restrictionSharedEvents = detectSharedTimepointEventsRestrictions (theoryRestrictions thy)
     sharedEventTags = lemmaSharedEvents `S.union` restrictionSharedEvents
-    propertyEventTags
-      | S.null completionTriggerEvents = sharedEventTags
-      | otherwise = S.insert completionEvent sharedEventTags
+    instrumentationPlan =
+      InstrumentationPlan
+        { instrumentationCompletionEvent = completionEvent,
+          instrumentationRuleIdEvents = sharedEventTags,
+          instrumentationCompletionTriggers = completionTriggerEvents
+        }
+    propertyEventTags = instrumentationPropertyEvents instrumentationPlan
     (restrictions, restrictionHeaders) =
       if skipRestrictions tc
         then ([], S.empty)
@@ -590,13 +545,18 @@ prettyProVerifTheory m noReuseLemmas noSourceLemmas noRestrictions noMultiset no
     (axioms, lemmas, lemmaHeaders) =
       loadLemmas completionEvent preparedAxiomPlans propertyEventTags hasSpecificLemmas lemSel tc typEnv thy
     (ruleproc, ruleComb, ruleHeaders) =
-      loadRules completionEvent sharedEventTags completionTriggerEvents thy m
+      loadRules
+        instrumentationPlan.instrumentationCompletionEvent
+        instrumentationPlan.instrumentationRuleIdEvents
+        instrumentationPlan.instrumentationCompletionTriggers
+        thy
+        m
     (macroproc, macroprochd) =
       -- if stateM is not empty, we have inlined the process calls, so we don't reoutput them
       if hasBoundState then ([text ""], S.empty) else loadMacroProc tc thy
     comments = [text "(*" $$ text bd $$ text "*)" | (_, bd) <- theoryFormalComments thy]
     diagnostics =
-      collectProVerifDiagnostics hasSpecificLemmas lemSel tc thy
+      collectProVerifDiagnostics hasSpecificLemmas lemSel tc preparedAxiomPlans thy
         <> collectTypingDiagnostics typEnv
 
 stateHeaders :: S.Set ProVerifHeader
@@ -615,9 +575,10 @@ collectProVerifDiagnostics ::
   Bool ->
   (ProtoLemma LNFormula ProofSkeleton -> Bool) ->
   TranslationContext ->
+  [(String, PropertyOutcome PreparedAxiomProperty)] ->
   OpenTheory ->
   Seq.Seq ExportDiagnostic
-collectProVerifDiagnostics hasSpecificLemmas lemSel tc thy =
+collectProVerifDiagnostics hasSpecificLemmas lemSel tc preparedAxiomPlans thy =
   collectBuiltinDiagnostics thy
     <> Seq.fromList (lemmaDiagnostics ++ restrictionDiagnostics)
   where
@@ -638,9 +599,8 @@ collectProVerifDiagnostics hasSpecificLemmas lemSel tc thy =
               ("produced no ProVerif query: " ++ reason)
           ]
     diagnosticForLemma (lemma, AsAxiom) =
-      case assumptionKnowledgeFragmentFailure lemma._lFormula of
-        Nothing -> []
-        Just reason ->
+      case lookup lemma._lName preparedAxiomPlans of
+        Just (PropertyOmitted reason) ->
           [ ExportDiagnostic
               "PV-AXIOM-OMITTED"
               DiagnosticWarning
@@ -648,18 +608,54 @@ collectProVerifDiagnostics hasSpecificLemmas lemSel tc thy =
               (AxiomSubject lemma._lName)
               ("was not emitted: " ++ reason)
           ]
+        Just (PropertyEmitted prepared) ->
+          case prepared.preparedAxiomApproximation of
+            Nothing -> []
+            Just reason ->
+              [ ExportDiagnostic
+                  "PV-AXIOM-APPROXIMATED"
+                  DiagnosticWarning
+                  ChangedAssumptions
+                  (AxiomSubject lemma._lName)
+                  reason
+              ]
+        _ -> []
     diagnosticForLemma (_, ExcludeLemma) = []
     restrictionDiagnostics
       | skipRestrictions tc = []
       | otherwise = mapMaybe diagnosticForRestriction (theoryRestrictions thy)
     diagnosticForRestriction restriction =
-      ExportDiagnostic
-        "PV-RESTRICTION-OMITTED"
-        DiagnosticWarning
-        ChangedAssumptions
-        (RestrictionSubject restriction._rstrName)
-        . ("was not emitted: " ++)
-        <$> assumptionKnowledgeFragmentFailure restriction._rstrFormula
+      case assumptionKnowledgeFragmentFailure restriction._rstrFormula of
+        Just reason ->
+          Just
+            ( ExportDiagnostic
+                "PV-RESTRICTION-OMITTED"
+                DiagnosticWarning
+                ChangedAssumptions
+                (RestrictionSubject restriction._rstrName)
+                ("was not emitted: " ++ reason)
+            )
+        Nothing ->
+          ExportDiagnostic
+            "PV-RESTRICTION-APPROXIMATED"
+            DiagnosticWarning
+            ChangedAssumptions
+            (RestrictionSubject restriction._rstrName)
+            <$> restrictionApproximation restriction._rstrFormula
+    restrictionApproximation formula =
+      case pullNegationsToTop beforePull of
+        Left _ -> Just "negations could only be partially normalized; the emitted restriction is an approximation"
+        Right _ -> Nothing
+      where
+        beforePull =
+          simplifyFormula
+            . flattenNestedImplications
+            . expandNegatedTimepointComparisons
+            . moveNegatedActionsToConclusion
+            . moveConstraintsToConclusion
+            . eliminateTemporalEqualities
+            . simplifyFormula
+            $ formula
 
 collectBuiltinDiagnostics :: OpenTheory -> Seq.Seq ExportDiagnostic
 collectBuiltinDiagnostics thy =
@@ -747,6 +743,18 @@ builtins "multiset" =
 builtins "bilinear-pairing" =
   NotSupportedBuiltin
     "Bilinear pairings are not supported in ProVerif."
+builtins name
+  | name
+      `elem` [ "dest-pairing",
+               "dest-asymmetric-encryption",
+               "dest-signing",
+               "dest-symmetric-encryption",
+               "natural-numbers",
+               "reliable-channel"
+             ] = AccurateBuiltin []
+builtins name =
+  NotSupportedBuiltin
+    ("Builtin `" ++ name ++ "` is not supported by this export backend.")
 
 -- We filter out some predefined headers that we don't want to redefine.
 filterHeaders :: S.Set ProVerifHeader -> S.Set ProVerifHeader
@@ -846,83 +854,6 @@ ppPubName (NameId n) = text $ case n of
 loadQueries :: Theory sig c b p TranslationElement -> [Doc]
 loadQueries thy =
   map (text . (._eText)) (lookupExportInfo "queries" thy)
-
-------------------------------------------------------------------------------
--- Core ProVerif Equivalence Export
-------------------------------------------------------------------------------
-
-proverifEquivTemplate :: (Document d) => [d] -> [d] -> [d] -> [d] -> [d] -> d
-proverifEquivTemplate headers queries equivlemmas macroproc comments =
-  vcat headers
-    $$ vcat queries
-    $$ vcat macroproc
-    $$ vcat equivlemmas
-    $--$ vcat (intersperse (text "") comments)
-
-prettyProVerifEquivTheory :: (OpenTheory, TypingEnvironment) -> IO (Either ExportError ExportResult)
-prettyProVerifEquivTheory (thy, typEnv) =
-  captureExport diagnostics $ do
-    headersTheory <- loadHeaders S.empty tc thy typEnv
-    let headersTranslation =
-          [ baseHeaders,
-            equivhd,
-            diffEquivhd,
-            macroprochd
-          ]
-    headers <- checkDuplicates' $ filterHeaders $ S.unions $ headersTheory : headersTranslation
-    let hd = attribHeaders tc headers
-    fproc <- finalproc
-    pure $ proverifEquivTemplate hd queries fproc macroproc comments
-  where
-    tc = emptyTC {predicates = theoryPredicates thy}
-    (equivlemmas, equivhd, hasBoundState, hasUnboundState) = loadEquivProc tc thy
-    (diffEquivlemmas, diffEquivhd, _, diffHasUnboundState) = loadDiffProc tc thy
-    baseHeaders = if hasUnboundState || diffHasUnboundState then stateHeaders else S.empty
-    finalproc =
-      if length equivlemmas + length diffEquivlemmas > 1
-        then fail "Error: ProVerif can only support at most one equivalence or diff equivalence query."
-        else pure $ equivlemmas ++ diffEquivlemmas
-    queries = loadQueries thy
-    (macroproc, macroprochd) =
-      -- if stateM is not empty, we have inlined the process calls, so we don't reoutput them
-      if hasBoundState then ([text ""], S.empty) else loadMacroProc tc thy
-    comments = [text "(*" $$ text bd $$ text "*)" | (_, bd) <- theoryFormalComments thy]
-    diagnostics = collectBuiltinDiagnostics thy <> collectTypingDiagnostics typEnv
-
-------------------------------------------------------------------------------
--- Core DeepSec Export
-------------------------------------------------------------------------------
-
-deepsecTemplate :: (Document d) => [d] -> [d] -> [d] -> [d] -> [d] -> d
-deepsecTemplate headers macroproc requests equivlemmas comments =
-  vcat headers
-    $$ vcat macroproc
-    $$ vcat requests
-    $$ vcat equivlemmas
-    $--$ vcat (intersperse (text "") comments)
-
-emptyTypeEnv :: TypingEnvironment
-emptyTypeEnv = TypingEnvironment {vars = M.empty, events = M.empty, funs = M.empty}
-
-prettyDeepSecTheory :: Int -> OpenTheory -> IO (Either ExportError ExportResult)
-prettyDeepSecTheory repBound thy =
-  captureExport diagnostics $ do
-    headers <- loadHeaders S.empty tc thy emptyTypeEnv
-    let hd = attribHeaders tc $ S.toList (S.unions [headers, macroprochd, equivhd])
-    pure $ deepsecTemplate hd macroproc requests equivlemmas comments
-  where
-    tc = emptyTC {trans = DeepSec, replicationBound = repBound}
-    requests = loadRequests thy
-    (macroproc, macroprochd) = loadMacroProc tc thy
-    (equivlemmas, equivhd, _, _) = loadEquivProc tc thy
-    comments = [text "(*" $$ text bd $$ text "*)" | (_, bd) <- theoryFormalComments thy]
-    diagnostics = collectBuiltinDiagnostics thy
-
--- Loader of the export functions
-------------------------------------------------------------------------------
-loadRequests :: Theory sig c b p TranslationElement -> [Doc]
-loadRequests thy =
-  map (text . (._eText)) (lookupExportInfo "requests" thy)
 
 ------------------------------------------------------------------------------
 -- Term Printers
@@ -1615,6 +1546,8 @@ typeVarsEvent TypingEnvironment {events = ev} tag ts =
 
 ppProtoAtom ::
   (HighlightDocument d, Ord k, Show k, Show c) =>
+  EventTimeMode ->
+  d -> -- shared rule-ID variable
   (Term (Lit c k) -> Maybe d) -> -- per-occurrence rule-id variable of a timepoint variable, if any
   S.Set String -> -- events requiring rule identifiers
   TypingEnvironment ->
@@ -1623,17 +1556,17 @@ ppProtoAtom ::
   (Term (Lit c k) -> d) ->
   ProtoAtom s (Term (Lit c k)) ->
   (d, M.Map k SapicType)
-ppProtoAtom ridOf ruleIdEvents te _ _ ppT (Action v f@(Fact tag _ ts))
+ppProtoAtom eventTimeMode sharedRuleId ridOf ruleIdEvents te _ _ ppT (Action v f@(Fact tag _ ts))
   | factTagArity tag /= length ts = translationFail $ "MALFORMED function" ++ show tag
   | tag == KUFact = translationFail "KU facts are outside the supported formula translation"
   | isKLogFact f =
-      (ppFactL "attacker" ts <> opAction <> ppT v, M.empty)
+      (withEventTime (ppFactL "attacker" ts), M.empty)
   | otherwise =
-      ( text "event("
-          <> eventArgs ('e' : factTagName tag) ts
-          <> text ")"
-          <> opAction
-          <> ppT v,
+      ( withEventTime
+          ( text "event("
+              <> eventArgs ('e' : factTagName tag) ts
+              <> text ")"
+          ),
         typeVarsEvent te tag ts
       )
   where
@@ -1643,26 +1576,31 @@ ppProtoAtom ridOf ruleIdEvents te _ _ ppT (Action v f@(Fact tag _ ts))
     eventArgs n t
       | useRuleId = nestShort' (n ++ "(") ")" . fsep . punctuate comma $ (ridDoc : map ppT t)
       | otherwise = ppFactL n t
-    ridDoc = fromMaybe (text "rid") (ridOf v)
-ppProtoAtom _ _ _ _ ppS _ (Syntactic s) = (ppS s, M.empty)
+    ridDoc = fromMaybe sharedRuleId (ridOf v)
+    withEventTime document =
+      case eventTimeMode of
+        RenderEventTime -> document <> opAction <> ppT v
+        OmitEventTime -> document
+ppProtoAtom _ _ _ _ _ _ ppS _ (Syntactic s) = (ppS s, M.empty)
 -- A temporal equality between rule-id instrumented events is translated as an
 -- equality of their rule-id variables: distinct ProVerif events never share a
 -- timepoint, while in Tamarin equal timepoints mean "same rule instance".
-ppProtoAtom ridOf _ _ False _ ppT (EqE l r) =
+ppProtoAtom _ _ ridOf _ _ False _ ppT (EqE l r) =
   case (ridOf l, ridOf r) of
     (Just dl, Just dr) -> (sep [dl <-> opEqual, dr], M.empty)
     _ -> (sep [ppT l <-> opEqual, ppT r], M.empty)
-ppProtoAtom ridOf _ _ True _ ppT (EqE l r) =
+ppProtoAtom _ _ ridOf _ _ True _ ppT (EqE l r) =
   case (ridOf l, ridOf r) of
     (Just dl, Just dr) -> (sep [dl <-> text "<>", dr], M.empty)
     _ -> (sep [ppT l <-> text "<>", ppT r], M.empty)
 -- sep [ppNTerm l <-> text "≈", ppNTerm r]
-ppProtoAtom _ _ _ _ _ ppT (Less u v) = (ppT u <-> opLess <-> ppT v, M.empty)
-ppProtoAtom _ _ _ _ _ ppT (Subterm u v) = (text "subterm(" <> ppT u <> comma <> ppT v <> text ")", M.empty)
-ppProtoAtom _ _ _ _ _ _ (Last i) = (operator_ "last" <> parens (text (show i)), M.empty)
+ppProtoAtom _ _ _ _ _ _ _ ppT (Less u v) = (ppT u <-> opLess <-> ppT v, M.empty)
+ppProtoAtom _ _ _ _ _ _ _ ppT (Subterm u v) = (text "subterm(" <> ppT u <> comma <> ppT v <> text ")", M.empty)
+ppProtoAtom _ _ _ _ _ _ _ _ (Last i) = (operator_ "last" <> parens (text (show i)), M.empty)
 
 ppAtom :: M.Map String String -> S.Set String -> TypingEnvironment -> Bool -> (LNTerm -> Doc) -> ProtoAtom s LNTerm -> (Doc, M.Map LVar SapicType)
-ppAtom ridNames ruleIdEvents te b = ppProtoAtom ridOf ruleIdEvents te b (const emptyDoc)
+ppAtom ridNames ruleIdEvents te b =
+  ppProtoAtom RenderEventTime (text "rid") ridOf ruleIdEvents te b (const emptyDoc)
   where
     ridOf t = case viewTerm t of
       Lit (Var (LVar n LSortNode _)) -> text <$> M.lookup n ridNames
@@ -1691,7 +1629,16 @@ ppLFormula ::
   (TypingEnvironment -> Bool -> ProtoAtom syn (Term (Lit c LVar)) -> (b, M.Map LVar SapicType)) ->
   ProtoFormula syn (String, LSort) c LVar ->
   m ([LVar], (b, M.Map LVar SapicType))
-ppLFormula te ppAt =
+ppLFormula = ppLFormulaWithTimeVars True
+
+ppLFormulaWithTimeVars ::
+  (MonadFresh m, Ord c, HighlightDocument b, Functor syn) =>
+  Bool ->
+  TypingEnvironment ->
+  (TypingEnvironment -> Bool -> ProtoAtom syn (Term (Lit c LVar)) -> (b, M.Map LVar SapicType)) ->
+  ProtoFormula syn (String, LSort) c LVar ->
+  m ([LVar], (b, M.Map LVar SapicType))
+ppLFormulaWithTimeVars keepTimeVars te ppAt =
   printFormula
   where
     printFormula (Ato a) = pure ([], ppAt te False (toLAt a))
@@ -1715,7 +1662,7 @@ ppLFormula te ppAt =
       scopeFreshness $ do
         (vs, _, fm') <- openFormulaPrefix fm
         (vsp, d') <- printFormula fm'
-        pure (vs ++ vsp, d')
+        pure (filter (\v -> keepTimeVars || lvarSort v /= LSortNode) (vs ++ vsp), d')
 
 -- | Check if a formula is quantifier-free.
 isQuantifierFree :: LNFormula -> Bool
@@ -2859,7 +2806,10 @@ collectTemporalEqPairs = go []
 -- Only time variables used by exactly one instrumented event are mapped;
 -- anything else falls back to the shared "rid" scheme.
 ridOccurrenceNames :: S.Set String -> LNFormula -> M.Map String String
-ridOccurrenceNames ruleIdEvents fm = M.fromSet ("rid_" ++) mapped
+ridOccurrenceNames ruleIdEvents fm =
+  addFreshSharedFallback fm sharedTimeNames
+    $ freshenRuleIdNames fm
+    $ M.fromSet ("rid_" ++) mapped
   where
     eventTVs = collectEventTimeVars fm
     tagsOf n = [tag | (n', tag) <- eventTVs, n' == n]
@@ -2871,6 +2821,13 @@ ridOccurrenceNames ruleIdEvents fm = M.fromSet ("rid_" ++) mapped
             [tag] -> tag `S.member` ruleIdEvents
             _ -> False
         ]
+    sharedTimeNames =
+      S.fromList
+        [ name
+        | (name, tag) <- eventTVs,
+          tag `S.member` ruleIdEvents,
+          name `S.notMember` mapped
+        ]
 
 -- | Per-occurrence rule-id names after shared timepoints have been split.
 -- Independent original Tamarin timepoints keep distinct rule ids, while all
@@ -2881,13 +2838,14 @@ ridOccurrenceNamesWithOrigins ::
   LNFormula ->
   M.Map String String
 ridOccurrenceNamesWithOrigins ruleIdEvents splitOrigins afterSplit =
-  M.fromList
-    [ (name, "rid_" ++ M.findWithDefault name name splitOrigins)
-    | name <- S.toList eventTimeNames,
-      let tags = tagsOf name,
-      not (null tags),
-      all (`S.member` ruleIdEvents) tags
-    ]
+  freshenRuleIdNames afterSplit
+    $ M.fromList
+      [ (name, "rid_" ++ M.findWithDefault name name splitOrigins)
+      | name <- S.toList eventTimeNames,
+        let tags = tagsOf name,
+        not (null tags),
+        all (`S.member` ruleIdEvents) tags
+      ]
   where
     eventTVs = collectEventTimeVars afterSplit
     eventTimeNames = S.fromList (map fst eventTVs)
@@ -2904,10 +2862,54 @@ ridOccurrenceNamesWithOriginsPreservingSingle ::
   M.Map String String
 ridOccurrenceNamesWithOriginsPreservingSingle ruleIdEvents splitOrigins fm =
   if S.size (S.fromList (M.elems names)) <= 1
-    then M.empty
+    then addFreshSharedFallback fm (M.keysSet names) M.empty
     else names
   where
     names = ridOccurrenceNamesWithOrigins ruleIdEvents splitOrigins fm
+
+freshenRuleIdNames :: LNFormula -> M.Map String String -> M.Map String String
+freshenRuleIdNames formula names =
+  fmap (replacements M.!) names
+  where
+    (_, replacements) =
+      foldl'
+        allocatePreferred
+        (formulaVariableAllocator formula, M.empty)
+        (S.toAscList (S.fromList (M.elems names)))
+    allocatePreferred (allocator, allocated) preferred =
+      let (TargetVariable chosen, allocator') = allocateVariable preferred allocator
+       in (allocator', M.insert preferred chosen allocated)
+
+addFreshSharedFallback :: LNFormula -> S.Set String -> M.Map String String -> M.Map String String
+addFreshSharedFallback formula timeNames names
+  | S.null timeNames = names
+  | chosen == "rid" = names
+  | otherwise = foldr (`M.insert` chosen) names timeNames
+  where
+    allocator =
+      reserveNames
+        VariableNamespace
+        (S.fromList (M.elems names))
+        (formulaVariableAllocator formula)
+    (TargetVariable chosen, _) = allocateVariable "rid" allocator
+
+formulaVariableAllocator :: LNFormula -> NameAllocator
+formulaVariableAllocator formula =
+  reserveNames VariableNamespace variableNames emptyNameAllocator
+  where
+    variableNames =
+      S.fromList
+        ( collectBinderNames formula
+            ++ [ sanitizeSymbol 'a' name
+               | LVar name _ _ <- frees formula
+               ]
+        )
+    collectBinderNames (Qua _ (name, _) body) =
+      sanitizeSymbol 'a' name : collectBinderNames body
+    collectBinderNames (Not body) = collectBinderNames body
+    collectBinderNames (Conn _ left right) =
+      collectBinderNames left ++ collectBinderNames right
+    collectBinderNames _ = []
 
 -- | Event tags linked by temporal equalities that survive rewriting; these
 -- need rule-id instrumentation so the equality can be translated as a
@@ -4859,8 +4861,6 @@ splitTopLvlConns _ step fm = ([fm], mempty, step)
 -- Printers for Restrictions and ProVerif Lemmas
 ------------------------------------------------------------------------------
 
-data PVElement = R | RSL
-
 ppAtomR :: S.Set String -> TypingEnvironment -> Bool -> (LNTerm -> Doc) -> ProtoAtom s LNTerm -> (Doc, M.Map LVar SapicType)
 ppAtomR ruleIdEvents te b = ppProtoAtomR ruleIdEvents te b (const emptyDoc)
 
@@ -4870,31 +4870,16 @@ ppNAtomR :: S.Set String -> TypingEnvironment -> Bool -> ProtoAtom s LNTerm -> (
 ppNAtomR ruleIdEvents te b = ppAtomR ruleIdEvents te b (fst . ppLNTerm emptyTC)
 
 ppProtoAtomR :: (Ord a1, Show a1, Show c, Typeable a1, HighlightDocument a2) => S.Set String -> TypingEnvironment -> Bool -> (s (Term (Lit c a1)) -> a2) -> (Term (Lit c a1) -> a2) -> ProtoAtom s (Term (Lit c a1)) -> (a2, M.Map a1 SapicType)
-ppProtoAtomR ruleIdEvents te _ _ ppT (Action _ f@(Fact tag _ ts))
-  | factTagArity tag /= length ts = translationFail $ "MALFORMED function" ++ show tag
-  | tag == KUFact = translationFail "KU facts are outside the supported formula translation"
-  | isKLogFact f =
-      (ppFactL "attacker" ts, M.empty)
-  | otherwise =
-      ( text "event(" <> eventArgs ('e' : factTagName tag) ts <> text ")",
-        typeVarsEvent te tag ts
-      )
-  where
-    factName = factTagName tag
-    useRuleId = factName `S.member` ruleIdEvents
-    ppFactL n t = nestShort' (n ++ "(") ")" . fsep . punctuate comma $ map ppT t
-    eventArgs n t
-      | useRuleId = nestShort' (n ++ "(") ")" . fsep . punctuate comma $ (text "rid" : map ppT t)
-      | otherwise = ppFactL n t
-ppProtoAtomR _ _ _ ppS _ (Syntactic s) = (ppS s, M.empty)
-ppProtoAtomR _ _ False _ ppT (EqE l r) =
-  (sep [ppT l <-> opEqual, ppT r], M.empty)
-ppProtoAtomR _ _ True _ ppT (EqE l r) =
-  (sep [ppT l <-> text "<>", ppT r], M.empty)
--- sep [ppNTerm l <-> text "≈", ppNTerm r]
-ppProtoAtomR _ _ _ _ ppT (Less u v) = (ppT u <-> opLess <-> ppT v, M.empty)
-ppProtoAtomR _ _ _ _ ppT (Subterm u v) = (text "subterm(" <> ppT u <> comma <> ppT v <> text ")", M.empty)
-ppProtoAtomR _ _ _ _ _ (Last i) = (operator_ "last" <> parens (text (show i)), M.empty)
+ppProtoAtomR ruleIdEvents te negated ppS ppT =
+  ppProtoAtom
+    OmitEventTime
+    (text "rid")
+    (const Nothing)
+    ruleIdEvents
+    te
+    negated
+    ppS
+    ppT
 
 ppLFormulaR ::
   (MonadFresh m, Ord c, HighlightDocument b, Functor syn) =>
@@ -4905,30 +4890,7 @@ ppLFormulaR ::
   ProtoFormula syn (String, LSort) c LVar ->
   m ([LVar], (b, M.Map LVar SapicType))
 ppLFormulaR keepTimeVars _ruleIdEvents te ppAt =
-  pp
-  where
-    pp (Ato a) = pure ([], ppAt te False (toLAt a))
-    pp (TF True) = pure ([], (operator_ "true", M.empty)) -- "T"
-    pp (TF False) = pure ([], (operator_ "false", M.empty)) -- "F"
-    pp (Not (Ato a@(EqE _ _))) = pure ([], ppAt te True (toLAt a))
-    pp (Not p) = do
-      (vs, (p', envp)) <- pp p
-      pure (vs, (operator_ "not" <> opParens p', envp)) -- text "¬" <> parens (pp a)
-      -- pure $ operator_ "not" <> opParens p' -- text "¬" <> parens (pp a)
-    pp (Conn op p q) = do
-      (vsp, (p', envp)) <- pp p
-      (vsq, (q', envq)) <- pp q
-      pure (vsp ++ vsq, (sep [opParens p' <-> ppOp op, opParens q'], mergeEnv envp envq))
-      where
-        ppOp And = text "&&"
-        ppOp Or = text "||"
-        ppOp Imp = text "==>"
-        ppOp Iff = opIff
-    pp fm@(Qua {}) =
-      scopeFreshness $ do
-        (vs, _, fm') <- openFormulaPrefix fm
-        (vsp, d') <- pp fm'
-        pure (filter (\v -> keepTimeVars || lvarSort v /= LSortNode) (vs ++ vsp), d')
+  ppLFormulaWithTimeVars keepTimeVars te ppAt
 
 ppQueryFormulaR ::
   (MonadFresh m) =>
@@ -5346,16 +5308,16 @@ prepareAxiomProperty completionEvent lemma
         PreparedAxiomProperty
           { preparedAxiomBeforeCompletion = [rewrittenBeforeCompletion],
             preparedAxiomFormulas = map prepareRenderedFormula axiomFormulas,
-            preparedAxiomCompletionTriggers = completionTriggers
+            preparedAxiomCompletionTriggers = completionTriggers,
+            preparedAxiomApproximation = approximation
           }
   where
     simplified = simplifyFormula lemma._lFormula
     sharedNormalization = normalizeAllTraceFormula simplified
     normalized = fromMaybe simplified sharedNormalization
-    rewrittenBeforeCompletion
-      | isJust sharedNormalization =
-          mapTopLevelConjunctsFormula rewriteFormulaForAxiom normalized
-      | otherwise = rewriteFormulaForAxiom normalized
+    (rewrittenBeforeCompletion, approximation)
+      | isJust sharedNormalization = rewriteTopLevelConjuncts normalized
+      | otherwise = rewriteFormulaForAxiomWithDiagnostic normalized
     (guarded, completionTriggers) =
       guardSameActionConclusions completionEvent rewrittenBeforeCompletion
     axiomFormulas
@@ -5363,6 +5325,15 @@ prepareAxiomProperty completionEvent lemma
           let (formulas, _, _) = splitTopLvlConns AllTraces 1 guarded
            in formulas
       | otherwise = [guarded]
+    rewriteTopLevelConjuncts (Conn And left right) =
+      let (left', leftApproximation) = rewriteTopLevelConjuncts left
+          (right', rightApproximation) = rewriteTopLevelConjuncts right
+       in ( Conn And left' right',
+            case leftApproximation of
+              Just message -> Just message
+              Nothing -> rightApproximation
+          )
+    rewriteTopLevelConjuncts formula = rewriteFormulaForAxiomWithDiagnostic formula
 
 prepareRenderedFormula :: LNFormula -> PreparedFormula
 prepareRenderedFormula formula =

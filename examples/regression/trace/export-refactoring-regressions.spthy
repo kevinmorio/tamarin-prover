@@ -34,6 +34,11 @@ lemma identity_axiom_instruments_shared_timepoint [reuse]:
 lemma generated_rule_id_avoids_source_variable:
   "All x #i. CollisionA(x) @ i ==> CollisionB(x) @ i"
 
+lemma generated_query_id_avoids_source_variable:
+  "All rid #i.
+      AxiomA(rid) @ i & AxiomB(rid) @ i
+      ==> AxiomC(rid) @ i"
+
 lemma internal_completion_avoids_user_event:
   "All x #i. UserTrigger(x) @ i ==> UserConsequence(x) @ i"
 

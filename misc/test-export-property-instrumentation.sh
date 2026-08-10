@@ -7,6 +7,8 @@ model="$repo_dir/examples/regression/trace/export-property-instrumentation.spthy
 restriction_model="$repo_dir/examples/regression/trace/export-restriction-disjunction.spthy"
 knowledge_model="$repo_dir/examples/regression/trace/export-knowledge-fragment.spthy"
 refactoring_model="$repo_dir/examples/regression/trace/export-refactoring-regressions.spthy"
+equivalence_model="$repo_dir/examples/regression/trace/export-backend-characterization.spthy"
+deepsec_model="$repo_dir/examples/sapic/export/toy-example.spthy"
 tamarin=${TAMARIN:-tamarin-prover}
 tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/tamarin-export-properties.XXXXXX")
 trap 'rm -rf "$tmp_dir"' EXIT HUP INT TERM
@@ -128,6 +130,12 @@ require_pattern 'new rid_rCollision_1: bitstring;' "$refactoring_collision"
 require_pattern 'in\(publicChannel, rid_rCollision: bitstring\);' "$refactoring_collision"
 require_pattern 'event eCollisionA\(rid_rCollision_1, rid_rCollision\);' "$refactoring_collision"
 
+refactoring_query_collision="$tmp_dir/refactoring-query-collision.pv"
+export_model_lemma "$refactoring_model" generated_query_id_avoids_source_variable "$refactoring_query_collision"
+require_pattern 'query rid_1:bitstring, rid:bitstring' "$refactoring_query_collision"
+require_pattern 'event\(eAxiomA\( rid_1, rid \)\)' "$refactoring_query_collision"
+require_pattern 'event\(eAxiomB\( rid_1, rid \)\)' "$refactoring_query_collision"
+
 refactoring_completion="$tmp_dir/refactoring-completion.pv"
 export_model_lemma "$refactoring_model" internal_completion_avoids_user_event "$refactoring_completion"
 if [ "$(grep -c '^event eRuleCompleted(bitstring)\.$' "$refactoring_completion")" -ne 1 ]; then
@@ -138,6 +146,16 @@ require_pattern '^event eRuleCompleted_1\(bitstring\)\.$' "$refactoring_completi
 require_pattern 'event eRuleCompleted\(x\);' "$refactoring_completion"
 require_pattern 'event eRuleCompleted_1\(rid_rUserCompletion\)\.' "$refactoring_completion"
 
+equivalence="$tmp_dir/equivalence.pv"
+"$tamarin" -d=0 -m=proverifequiv "-o=$equivalence" "$equivalence_model" >/dev/null
+require_pattern '^equivalence$' "$equivalence"
+require_pattern 'new x_[[:digit:]]+:bitstring' "$equivalence"
+
+deepsec="$tmp_dir/equivalence.dps"
+"$tamarin" -d=0 -m=deepsec "-o=$deepsec" "$deepsec_model" >/dev/null
+require_pattern '^query session_equiv\($' "$deepsec"
+require_pattern '!\^3\(' "$deepsec"
+
 if command -v proverif >/dev/null 2>&1; then
   proverif -parse-only "$completion" >/dev/null
   proverif -parse-only "$tautology" >/dev/null
@@ -145,7 +163,9 @@ if command -v proverif >/dev/null 2>&1; then
   proverif -parse-only "$restriction" >/dev/null
   proverif -parse-only "$knowledge_supported" >/dev/null
   proverif -parse-only "$refactoring_collision" >/dev/null
+  proverif -parse-only "$refactoring_query_collision" >/dev/null
   proverif -parse-only "$refactoring_completion" >/dev/null
+  proverif -parse-only "$equivalence" >/dev/null
 fi
 
 echo "export property instrumentation regression passed"

@@ -20,11 +20,11 @@ data PreparedFormula = PreparedFormula
 data PreparedAxiomProperty = PreparedAxiomProperty
   { preparedAxiomBeforeCompletion :: [LNFormula],
     preparedAxiomFormulas :: [PreparedFormula],
-    preparedAxiomCompletionTriggers :: Set.Set String
+    preparedAxiomCompletionTriggers :: Set.Set String,
+    preparedAxiomApproximation :: Maybe String
   }
 
 data PropertyOutcome a
   = PropertyEmitted a
   | PropertyOmitted String
   | PropertyExcluded
-
