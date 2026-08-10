@@ -4,8 +4,10 @@ module Export.ProVerifEquivalence (prettyProVerifEquivTheory) where
 
 import Data.List (intersperse)
 import Data.Set qualified as Set
-import Export.ProVerif
+import Export.Diagnostic
+import Export.ProVerif (loadQueries)
 import Export.ProVerif.Header (checkDuplicates', filterHeaders)
+import Export.ProVerif.Render (renderSapicFormula)
 import Export.Sapic
 import Export.Types
 import Sapic.Typing (TypingEnvironment)
@@ -36,9 +38,9 @@ prettyProVerifEquivTheory (thy, typeEnvironment) =
   where
     context = emptyTC {predicates = theoryPredicates thy}
     (equivalenceLemmas, equivalenceHeaders, hasBoundState, hasUnboundState) =
-      loadEquivProc context thy
+      loadEquivProc renderSapicFormula context thy
     (diffEquivalenceLemmas, diffEquivalenceHeaders, _, diffHasUnboundState) =
-      loadDiffProc context thy
+      loadDiffProc renderSapicFormula context thy
     baseHeaders
       | hasUnboundState || diffHasUnboundState = stateHeaders
       | otherwise = Set.empty
@@ -49,7 +51,7 @@ prettyProVerifEquivTheory (thy, typeEnvironment) =
     queries = loadQueries thy
     (macroProcesses, macroHeaders)
       | hasBoundState = ([text ""], Set.empty)
-      | otherwise = loadMacroProc context thy
+      | otherwise = loadMacroProc renderSapicFormula context thy
     comments = [text "(*" $$ text body $$ text "*)" | (_, body) <- theoryFormalComments thy]
     diagnostics = collectBuiltinDiagnostics thy <> collectTypingDiagnostics typeEnvironment
 

@@ -4,13 +4,21 @@ module Export.Diagnostic
   ( diagnosticIsProofRelevant,
     diagnosticsToWfReport,
     renderExportDiagnostics,
+    collectBuiltinDiagnostics,
+    collectTypingDiagnostics,
   )
 where
 
 import Data.Foldable (toList)
+import Data.Map qualified as M
 import Data.Sequence (Seq)
+import Data.Sequence qualified as Seq
+import Data.Set qualified as S
+import Export.Sapic (BuiltinTranslation (..), builtins)
 import Export.Types
+import Sapic.Typing
 import Text.PrettyPrint.Class
+import Theory
 import Theory.Tools.Wellformedness (WfErrorReport, underlineTopic)
 
 diagnosticIsProofRelevant :: ExportDiagnostic -> Bool
@@ -64,3 +72,36 @@ subjectLabel (LemmaSubject name) = "Lemma `" ++ name ++ "`"
 subjectLabel (AxiomSubject name) = "Axiom `" ++ name ++ "`"
 subjectLabel (RestrictionSubject name) = "Restriction `" ++ name ++ "`"
 subjectLabel (BuiltinSubject name) = "Builtin `" ++ name ++ "`"
+
+collectBuiltinDiagnostics :: OpenTheory -> Seq.Seq ExportDiagnostic
+collectBuiltinDiagnostics thy =
+  Seq.fromList
+    [ ExportDiagnostic
+        "PV-BUILTIN-APPROXIMATED"
+        DiagnosticWarning
+        ChangedProcessSemantics
+        (BuiltinSubject name)
+        "uses a best-effort target encoding"
+    | name <- theoryBuiltins thy,
+      BestEffortBuiltin _ <- [builtins name]
+    ]
+
+collectTypingDiagnostics :: TypingEnvironment -> Seq.Seq ExportDiagnostic
+collectTypingDiagnostics typeEnvironment =
+  Seq.fromList
+    [ ExportDiagnostic
+        "PV-SORT-COERCED"
+        DiagnosticWarning
+        ChangedProcessSemantics
+        ProcessSubject
+        ( "variable `"
+            ++ name
+            ++ "` of sort "
+            ++ show variableSort
+            ++ " is encoded as ProVerif bitstring"
+        )
+    | LVar name variableSort _ <- S.toList distinctVariables,
+      variableSort `elem` [LSortPub, LSortFresh, LSortNat]
+    ]
+  where
+    distinctVariables = S.fromList (M.keys typeEnvironment.vars)

@@ -4,7 +4,8 @@ module Export.DeepSec (prettyDeepSecTheory) where
 
 import Data.List (intersperse)
 import Data.Set qualified as Set
-import Export.ProVerif
+import Export.Diagnostic
+import Export.ProVerif.Render (renderSapicFormula)
 import Export.Sapic
 import Export.Types
 import Text.PrettyPrint.Class
@@ -21,8 +22,8 @@ prettyDeepSecTheory replicationLimit thy =
     context = emptyTC {trans = DeepSec, replicationBound = replicationLimit}
     requests =
       map (text . (._eText)) (lookupExportInfo "requests" thy)
-    (macroProcesses, macroHeaders) = loadMacroProc context thy
-    (equivalenceLemmas, equivalenceHeaders, _, _) = loadEquivProc context thy
+    (macroProcesses, macroHeaders) = loadMacroProc renderSapicFormula context thy
+    (equivalenceLemmas, equivalenceHeaders, _, _) = loadEquivProc renderSapicFormula context thy
     comments = [text "(*" $$ text body $$ text "*)" | (_, body) <- theoryFormalComments thy]
     diagnostics = collectBuiltinDiagnostics thy
 

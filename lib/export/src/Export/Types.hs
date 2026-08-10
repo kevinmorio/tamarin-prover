@@ -8,13 +8,25 @@ module Export.Types
     ExportError (..),
     ExportResult (..),
     ExportException (..),
+    Translation (..),
+    TranslationContext (..),
+    emptyTC,
+    emptyTypeEnv,
+    exportModule,
+    captureExport,
     translationFail,
   )
 where
 
 import Control.Exception qualified as Exception
+import Data.Data (Data, Typeable)
+import Data.Map.Strict qualified as Map
 import Data.Sequence (Seq)
-import Text.PrettyPrint.Class (Doc)
+import Data.Sequence qualified as Seq
+import Sapic.Typing
+import Text.PrettyPrint.Class (Doc, render)
+import Theory (LVar, Predicate)
+import Theory.Module (ModuleType (..))
 
 data DiagnosticSeverity
   = DiagnosticNotice
@@ -64,3 +76,64 @@ instance Exception.Exception ExportException
 
 translationFail :: String -> a
 translationFail = Exception.throw . ExportException
+
+data Translation
+  = ProVerif
+  | DeepSec
+  deriving (Ord, Eq, Typeable, Data)
+
+exportModule :: Translation -> ModuleType
+exportModule ProVerif = ModuleProVerif
+exportModule DeepSec = ModuleDeepSec
+
+data TranslationContext = TranslationContext
+  { trans :: Translation,
+    attackerChannel :: Maybe LVar,
+    hasBoundStates :: Bool,
+    hasUnboundStates :: Bool,
+    predicates :: [Predicate],
+    replicationBound :: Int,
+    skipReuseLemmas :: Bool,
+    skipSourceLemmas :: Bool,
+    skipRestrictions :: Bool,
+    skipPrecise :: Bool
+  }
+  deriving (Eq, Ord)
+
+emptyTC :: TranslationContext
+emptyTC =
+  TranslationContext
+    { trans = ProVerif,
+      attackerChannel = Nothing,
+      hasBoundStates = False,
+      hasUnboundStates = False,
+      predicates = [],
+      replicationBound = 3,
+      skipReuseLemmas = False,
+      skipSourceLemmas = False,
+      skipRestrictions = False,
+      skipPrecise = False
+    }
+
+emptyTypeEnv :: TypingEnvironment
+emptyTypeEnv = TypingEnvironment {vars = Map.empty, events = Map.empty, funs = Map.empty}
+
+captureExport :: Seq.Seq ExportDiagnostic -> IO Doc -> IO (Either ExportError ExportResult)
+captureExport diagnostics renderDocument = do
+  rendered <- Exception.try renderDocument :: IO (Either Exception.SomeException Doc)
+  case rendered of
+    Left exception -> pure (Left (exceptionToExportError exception))
+    Right document -> do
+      forced <- Exception.try (Exception.evaluate (length (render document))) :: IO (Either Exception.SomeException Int)
+      case forced of
+        Left exception -> pure (Left (exceptionToExportError exception))
+        Right _ -> pure (Right (ExportResult document diagnostics))
+  where
+    exceptionToExportError exception =
+      case Exception.fromException exception of
+        Just (ExportException message) -> ExportError "EXP-FATAL-INPUT" message
+        Nothing -> ExportError "EXP-FATAL-RENDER" (Exception.displayException exception)
+
+------------------------------------------------------------------------------
+-- Core ProVerif Export
+------------------------------------------------------------------------------

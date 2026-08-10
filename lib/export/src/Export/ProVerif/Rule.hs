@@ -96,7 +96,7 @@ translateEmbeddedRuleAction matchedVars rprems racts rconcls =
   (ruleDoc, headers, hasTailDocs)
   where
     (headDocs, tailDocs, destructors) =
-      translateRuleDocs "RuleCompleted" S.empty S.empty Nothing matchedVars rprems racts rconcls M.empty
+      translateRuleDocs "" S.empty S.empty Nothing matchedVars rprems racts rconcls M.empty
     hasTailDocs = not (null tailDocs)
     ruleDoc =
       if hasTailDocs
@@ -377,7 +377,7 @@ translateProtoRule completionEvent ruleIdNames ruleIdEvents completionTriggerEve
         completionEvent
         ruleIdEvents
         completionTriggerEvents
-        (M.findWithDefault ("rid_" ++ rname) rname ruleIdNames)
+        (fromMaybe (translationFail ("missing allocated rule-ID name for " ++ rname)) (M.lookup rname ruleIdNames))
         ru._rPrems
         (notDiffRuleActs ru)
         ru._rConcs
