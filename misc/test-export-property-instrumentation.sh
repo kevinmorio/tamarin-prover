@@ -6,6 +6,7 @@ repo_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
 model="$repo_dir/examples/regression/trace/export-property-instrumentation.spthy"
 restriction_model="$repo_dir/examples/regression/trace/export-restriction-disjunction.spthy"
 knowledge_model="$repo_dir/examples/regression/trace/export-knowledge-fragment.spthy"
+refactoring_model="$repo_dir/examples/regression/trace/export-refactoring-regressions.spthy"
 tamarin=${TAMARIN:-tamarin-prover}
 tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/tamarin-export-properties.XXXXXX")
 trap 'rm -rf "$tmp_dir"' EXIT HUP INT TERM
@@ -92,12 +93,38 @@ knowledge_negative="$tmp_dir/knowledge-negative.pv"
 export_model_lemma "$knowledge_model" rejected_negative_k "$knowledge_negative"
 require_pattern 'Lemma translation failed: formula is outside T-UKF: NNF\(not\(phi\)\) contains a negative K atom' "$knowledge_negative"
 
+# Characterize the four refactoring defects before fixing them.  These
+# temporary assertions deliberately describe the current broken output; the
+# semantic refactoring commits replace them with the desired invariants.
+refactoring_collision="$tmp_dir/refactoring-collision.pv"
+export_model_lemma "$refactoring_model" generated_rule_id_avoids_source_variable "$refactoring_collision"
+require_pattern 'event\(eBranchB\( rid_j1, x \)\)' "$refactoring_collision"
+require_pattern 'event\(eBranchC\( rid_j2, x \)\)' "$refactoring_collision"
+require_pattern '^event eAxiomA\(bitstring\)\.$' "$refactoring_collision"
+require_pattern 'new rid_rCollision: bitstring;' "$refactoring_collision"
+require_pattern 'in\(publicChannel, rid_rCollision: bitstring\);' "$refactoring_collision"
+
+refactoring_completion="$tmp_dir/refactoring-completion.pv"
+export_model_lemma "$refactoring_model" internal_completion_avoids_user_event "$refactoring_completion"
+if [ "$(grep -c '^event eRuleCompleted(bitstring)\.$' "$refactoring_completion")" -ne 1 ]; then
+  echo "completion-event collision baseline changed unexpectedly" >&2
+  exit 1
+fi
+require_pattern 'event eRuleCompleted\(x\);' "$refactoring_completion"
+require_pattern 'event eRuleCompleted\(rid_rUserCompletion\)\.' "$refactoring_completion"
+
+if grep -q '^Export warnings$' "$knowledge_supported"; then
+  echo "export diagnostics unexpectedly appeared before diagnostics integration" >&2
+  exit 1
+fi
+
 if command -v proverif >/dev/null 2>&1; then
   proverif -parse-only "$completion" >/dev/null
   proverif -parse-only "$tautology" >/dev/null
   proverif -parse-only "$temporal" >/dev/null
   proverif -parse-only "$restriction" >/dev/null
   proverif -parse-only "$knowledge_supported" >/dev/null
+  proverif -parse-only "$refactoring_completion" >/dev/null
 fi
 
 echo "export property instrumentation regression passed"
