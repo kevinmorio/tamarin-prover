@@ -10,7 +10,6 @@
 -- Translation from multiset rewrite rules to ProVerif
 module RuleTranslation
   ( loadRules,
-    ruleCompletedEvent,
     translateEmbeddedRuleAction,
     ppFunSym,
     sanitizeSymbol,
@@ -27,9 +26,10 @@ import Data.ByteString.Char8 qualified as BC
 import Data.Char
 import Data.List as List
 import Data.Map qualified as M
-import Data.Maybe (catMaybes, mapMaybe)
+import Data.Maybe (catMaybes, fromMaybe, mapMaybe)
 import Data.Set qualified as S
 import Extension.Data.Label qualified as L
+import Export.Name
 import ProVerifHeader
 import Sapic.Exceptions
 import Sapic.Facts
@@ -39,14 +39,8 @@ import Theory.Text.Parser
 import Theory.Text.Pretty
 import TheoryObject (theoryMacros)
 
--- | Internal event emitted after all action facts of a rule instance.  It is
--- enabled only when property analysis finds a correspondence that observes
--- another fact from the same Tamarin action in its conclusion.
-ruleCompletedEvent :: String
-ruleCompletedEvent = "RuleCompleted"
-
-loadRules :: S.Set String -> S.Set String -> OpenTheory -> ModuleType -> ([Doc], Doc, S.Set ProVerifHeader)
-loadRules ruleIdEvents completionTriggerEvents thy m = case theoryRules thy of
+loadRules :: String -> S.Set String -> S.Set String -> OpenTheory -> ModuleType -> ([Doc], Doc, S.Set ProVerifHeader)
+loadRules completionEvent ruleIdEvents completionTriggerEvents thy m = case theoryRules thy of
   [] -> ([text ""], text "", S.empty)
   rules -> (ruleDocs, ruleComb, headers)
     where
@@ -54,7 +48,7 @@ loadRules ruleIdEvents completionTriggerEvents thy m = case theoryRules thy of
         foldl'
           (\acc@(_, destrs) r ->
              acc `accumulateResult`
-               translateOpenProtoRule ruleIdEvents completionTriggerEvents r thy destrs)
+               translateOpenProtoRule completionEvent ruleIdNames ruleIdEvents completionTriggerEvents r thy destrs)
           ([], M.empty)
           rulesMod
       headers =
@@ -68,8 +62,22 @@ loadRules ruleIdEvents completionTriggerEvents thy m = case theoryRules thy of
         | S.null completionTriggerEvents = S.empty
         | otherwise =
             S.singleton
-              (HEvent ('e' : ruleCompletedEvent) "(bitstring)")
+              (HEvent ('e' : completionEvent) "(bitstring)")
       ruleNames = map (\(OpenProtoRule ruE _) -> showRuleName ruE._rInfo._preName) rulesMod
+      ruleIdNames = snd $ foldl' allocateRuleId (initialAllocator, M.empty) ruleNames
+      allocateRuleId (allocator, names) targetRuleName =
+        let (TargetVariable allocated, allocator') =
+              allocateVariable ("rid_" ++ targetRuleName) allocator
+         in (allocator', M.insert targetRuleName allocated names)
+      initialAllocator =
+        reserveNames VariableNamespace sourceVariableNames emptyNameAllocator
+      sourceVariableNames =
+        S.fromList
+          [ sanitizeSymbol 'a' name
+          | OpenProtoRule rule _ <- rulesMod,
+            fact <- rule._rPrems ++ notDiffRuleActs rule ++ rule._rConcs,
+            LVar name _ _ <- frees fact
+          ]
       ruleComb = text ("( " ++ intercalate " | " (map ((++ ")") . ("!(" ++)) ruleNames) ++ " )")
       -- want to export restrictions and reuse/src lemmas => need to introduce fresh stamps (as there no timepoints in such formulas)
       rulesMod = map (\(OpenProtoRule ruE rusAC) -> OpenProtoRule (applyMacroInRule (theoryMacros thy) ruE) rusAC) $ case m of
@@ -87,7 +95,7 @@ translateEmbeddedRuleAction matchedVars rprems racts rconcls =
   (ruleDoc, headers, hasTailDocs)
   where
     (headDocs, tailDocs, destructors) =
-      translateRuleDocs S.empty S.empty Nothing matchedVars rprems racts rconcls M.empty
+      translateRuleDocs "RuleCompleted" S.empty S.empty Nothing matchedVars rprems racts rconcls M.empty
     hasTailDocs = not (null tailDocs)
     ruleDoc =
       if hasTailDocs
@@ -305,14 +313,16 @@ showEventNameFromName tag = 'e' : tag
 
 translateOpenProtoRule ::
   (HighlightDocument d) =>
+  String ->
+  M.Map String String ->
   S.Set String ->
   S.Set String ->
   OpenProtoRule ->
   OpenTheory ->
   M.Map (String, String) String ->
   (d, M.Map (String, String) String)
-translateOpenProtoRule ruleIdEvents completionTriggerEvents (OpenProtoRule ruE _) thy =
-  translateProtoRule ruleIdEvents completionTriggerEvents (checkTypes ruE thy)
+translateOpenProtoRule completionEvent ruleIdNames ruleIdEvents completionTriggerEvents (OpenProtoRule ruE _) thy =
+  translateProtoRule completionEvent ruleIdNames ruleIdEvents completionTriggerEvents (checkTypes ruE thy)
 
 -- Functions with user-defined types cannot be used in rewrite rules, they
 -- are currently written such that everything is treated as a bitstring
@@ -345,20 +355,23 @@ incorrectTermTypes thy t = case viewTerm t of
 
 translateProtoRule ::
   (HighlightDocument d) =>
+  String ->
+  M.Map String String ->
   S.Set String ->
   S.Set String ->
   Rule ProtoRuleEInfo ->
   M.Map (String, String) String ->
   (d, M.Map (String,String) String)
-translateProtoRule ruleIdEvents completionTriggerEvents ru de =
+translateProtoRule completionEvent ruleIdNames ruleIdEvents completionTriggerEvents ru de =
   (ruleDoc, destructors)
   where
     rname = showRuleName ru._rInfo._preName
     (factsDoc, destructors) =
       translateRule
+        completionEvent
         ruleIdEvents
         completionTriggerEvents
-        rname
+        (M.findWithDefault ("rid_" ++ rname) rname ruleIdNames)
         ru._rPrems
         (notDiffRuleActs ru)
         ru._rConcs
@@ -371,6 +384,7 @@ showRuleName (StandRule s) = 'r' : s
 
 translateRule ::
   (HighlightDocument d) =>
+  String ->
   S.Set String ->
   S.Set String ->
   String ->
@@ -379,12 +393,13 @@ translateRule ::
   [LNFact] ->
   M.Map (String, String) String ->
   (d, M.Map (String, String) String)
-translateRule ruleIdEvents completionTriggerEvents rname rprems racts rconcls destrs =
+translateRule completionEvent ruleIdEvents completionTriggerEvents ruleIdName rprems racts rconcls destrs =
   let (headDocs, tailDocs, newDestrs) =
         translateRuleDocs
+          completionEvent
           ruleIdEvents
           completionTriggerEvents
-          (Just rname)
+          (Just ruleIdName)
           S.empty
           rprems
           racts
@@ -394,6 +409,7 @@ translateRule ruleIdEvents completionTriggerEvents rname rprems racts rconcls de
 
 translateRuleDocs ::
   (HighlightDocument d) =>
+  String ->
   S.Set String ->
   S.Set String ->
   Maybe String ->
@@ -403,14 +419,14 @@ translateRuleDocs ::
   [LNFact] ->
   M.Map (String, String) String ->
   ([d], [d], M.Map (String, String) String)
-translateRuleDocs ruleIdEvents completionTriggerEvents maybeRname initialVars rprems racts rconcls destrs =
+translateRuleDocs completionEvent ruleIdEvents completionTriggerEvents maybeRuleIdName initialVars rprems racts rconcls destrs =
   -- docsX contains the expression resulting from the given translation (as an instance of Doc)
   -- varsX is a set of all variables that have appeared in the rule translation until that point
   -- varsX' is a map where the keys are the patterns, which have appeared in the rule translation until that point,
   -- and the values are their helper variables
   -- destrX is a map where the keys are terms a and t, where a given destructor extracts a from t
   -- and the values are the given destructors (which have appeared in the rule translation until that point)
-  let ruleIdName = maybe "" ("rid_" ++) maybeRname
+  let ruleIdName = fromMaybe "" maybeRuleIdName
       ruleNeedsCompletion =
         any
           (\fact -> factTagName (factTag fact) `S.member` completionTriggerEvents)
@@ -423,7 +439,7 @@ translateRuleDocs ruleIdEvents completionTriggerEvents maybeRname initialVars rp
       ruleIdDoc = text "new" <-> text ruleIdName <> text ": bitstring"
       completionDoc =
         text "event"
-          <-> text ('e' : ruleCompletedEvent)
+          <-> text ('e' : completionEvent)
           <> parens (text ruleIdName)
       (docs1, vars1, vars1', destr1) = translatePatterns rprems GET patternGetsFilter initialVars M.empty destrs
       (docs2, vars2) = translateNonPatterns rprems GET nonPatternGetsFilter vars1

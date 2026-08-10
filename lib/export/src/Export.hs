@@ -37,6 +37,7 @@ import Data.Sequence qualified as Seq
 import Data.Set qualified as S
 import Extension.Data.Label qualified as L
 import Export.Diagnostic
+import Export.Name
 import Export.Types
 import ProVerifHeader
 import RuleTranslation
@@ -498,6 +499,7 @@ prettyProVerifTheory m noReuseLemmas noSourceLemmas noRestrictions noMultiset no
           skipRestrictions = noRestrictions,
           skipPrecise = noPrecise
         }
+    completionEvent = allocateCompletionEvent typEnv thy
     (proc, prochd, hasBoundState, hasUnboundState) = loadProc tc thy
     proc'
       | null (theoryProcesses thy) = ruleComb
@@ -565,25 +567,25 @@ prettyProVerifTheory m noReuseLemmas noSourceLemmas noRestrictions noMultiset no
             else S.empty
     completionTriggerEvents =
       S.unions
-        ( [ completionTriggersForFormula (propertyAnalysisFormula lemma)
+        ( [ completionTriggersForFormula completionEvent (propertyAnalysisFormula lemma)
           | lemma <- selectedQueryLemmas
           ]
-            ++ map completionTriggersForFormula rewrittenAxiomFormulas
+            ++ map (completionTriggersForFormula completionEvent) rewrittenAxiomFormulas
         )
     restrictionSharedEvents = detectSharedTimepointEventsRestrictions (theoryRestrictions thy)
     sharedEventTags = lemmaSharedEvents `S.union` restrictionSharedEvents
     propertyEventTags
       | S.null completionTriggerEvents = sharedEventTags
-      | otherwise = S.insert ruleCompletedEvent sharedEventTags
+      | otherwise = S.insert completionEvent sharedEventTags
     (restrictions, restrictionHeaders) =
       if skipRestrictions tc
         then ([], S.empty)
         else loadRestrictions sharedEventTags tc typEnv thy
     queries = loadQueries thy
     (axioms, lemmas, lemmaHeaders) =
-      loadLemmas propertyEventTags hasSpecificLemmas lemSel tc typEnv thy
+      loadLemmas completionEvent propertyEventTags hasSpecificLemmas lemSel tc typEnv thy
     (ruleproc, ruleComb, ruleHeaders) =
-      loadRules sharedEventTags completionTriggerEvents thy m
+      loadRules completionEvent sharedEventTags completionTriggerEvents thy m
     (macroproc, macroprochd) =
       -- if stateM is not empty, we have inlined the process calls, so we don't reoutput them
       if hasBoundState then ([text ""], S.empty) else loadMacroProc tc thy
@@ -758,6 +760,45 @@ getProVerifHeaderIdentifier (Sym _ n _ _) = Just n
 getProVerifHeaderIdentifier (HEvent n _) = Just n
 getProVerifHeaderIdentifier (Table n _) = Just n
 getProVerifHeaderIdentifier _ = Nothing
+
+allocateCompletionEvent :: TypingEnvironment -> OpenTheory -> String
+allocateCompletionEvent typeEnvironment thy =
+  case targetEventText allocatedTarget of
+    'e' : factName -> factName
+    targetName -> targetName
+  where
+    (allocatedTarget, _) = allocateEvent "eRuleCompleted" allocator
+    allocator =
+      reserveNames GlobalNamespace reservedTargetNames emptyNameAllocator
+    reservedTargetNames =
+      S.fromList
+        ( mapMaybe getProVerifHeaderIdentifier declarationHeaders
+            ++ map (('e' :) . factTagName) sourceEventTags
+        )
+    declarationHeaders =
+      S.toList
+        ( foldMap headerOfFunSym (theoryFunctionTypingInfos thy)
+            `S.union` foldMap builtinHeaders (theoryBuiltins thy)
+        )
+    builtinHeaders name =
+      case builtins name of
+        AccurateBuiltin headers -> S.fromList headers
+        BestEffortBuiltin headers -> S.fromList headers
+        NotSupportedBuiltin _ -> S.empty
+    sourceEventTags =
+      M.keys typeEnvironment.events
+        ++ [ factTag fact
+           | OpenProtoRule rule _ <- theoryRules thy,
+             fact <- rule._rActs
+           ]
+        ++ [ factTag fact
+           | lemma <- theoryLemmas thy,
+             fact <- formulaFacts lemma._lFormula
+           ]
+        ++ [ factTag fact
+           | restriction <- theoryRestrictions thy,
+             fact <- formulaFacts restriction._rstrFormula
+           ]
 
 -- | Fail if any identifier occurs more than once; otherwise return all headers
 checkDuplicates :: (MonadFail m) => [ProVerifHeader] -> m [ProVerifHeader]
@@ -1984,14 +2025,14 @@ ppRestrictFormula ridNames ruleIdEvents te frm attrs =
 -- 2. Split shared timepoints if needed
 -- 3. Split top-level connectives (AND for all-traces, OR for exists-trace)
 -- 4. Apply final transformations and print each subformula
-ppLemma :: S.Set String -> TypingEnvironment -> Lemma ProofSkeleton -> Doc
-ppLemma _ruleIdEvents _te p
+ppLemma :: String -> S.Set String -> TypingEnvironment -> Lemma ProofSkeleton -> Doc
+ppLemma _completionEvent _ruleIdEvents _te p
   | Just reason <- queryKnowledgeFragmentFailure p._lTraceQuantifier p._lFormula =
       text "(*" <> text p._lName <> text "*)"
         $$ text ("(* Lemma translation failed: " ++ reason ++ ". *)")
         $$ text "(*" <> prettyLNFormula p._lFormula <> text "*)"
         $$ text ""
-ppLemma ruleIdEvents te p =
+ppLemma completionEvent ruleIdEvents te p =
   let subformulas = vcat (intersperse (text "") (zipWith (curry renderSubformula) fms queryPolarities))
   in if isEmpty comments
      then subformulas $$ text ""
@@ -2053,7 +2094,7 @@ ppLemma ruleIdEvents te p =
     -- in its conclusion, delay the trigger until the generic completion event
     -- for that rule instance has occurred.
     (rewrittenFormula, _) =
-      guardSameActionConclusions rewrittenFormulaBeforeCompletion
+      guardSameActionConclusions completionEvent rewrittenFormulaBeforeCompletion
     needsRuleId = formulaHasSharedTimepoints rewrittenFormula
     hadTimepointSplit = needsRuleId
     (formulaForProcessing, splitTimeOrigins) =
@@ -2673,8 +2714,8 @@ collectEventTimeVars = go []
 --
 -- The returned fact tags are the rule actions whose presence demands
 -- completion emission.  No rule or protocol name is inspected.
-guardSameActionConclusions :: LNFormula -> (LNFormula, S.Set String)
-guardSameActionConclusions fm =
+guardSameActionConclusions :: String -> LNFormula -> (LNFormula, S.Set String)
+guardSameActionConclusions completionEvent fm =
   let unique = makeBinderHintsGloballyUnique fm
       (guarded, triggers, changed) = go unique
    in if changed then (guarded, triggers) else (fm, S.empty)
@@ -2745,7 +2786,7 @@ guardSameActionConclusions fm =
     collectOccurrences ctx (Ato (Action timepoint fact@(Fact tag _ _)))
       | tag == KUFact
           || isKLogFact fact
-          || factTagName tag == ruleCompletedEvent =
+          || factTagName tag == completionEvent =
           []
       | Just origin <- timeOriginIn ctx timepoint =
           [(origin, timepoint, factTagName tag, fact)]
@@ -2768,13 +2809,13 @@ guardSameActionConclusions fm =
 
     completionFact =
       Fact
-        (ProtoFact Linear ruleCompletedEvent 0)
+        (ProtoFact Linear completionEvent 0)
         S.empty
         []
 
 -- | Property-only demand analysis used before rule rendering.
-completionTriggersForFormula :: LNFormula -> S.Set String
-completionTriggersForFormula = snd . guardSameActionConclusions
+completionTriggersForFormula :: String -> LNFormula -> S.Set String
+completionTriggersForFormula completionEvent = snd . guardSameActionConclusions completionEvent
 
 -- | Collect pairs of time-variable names linked by a temporal equality:
 -- an equality atom #i = #j (possibly negated), or a negated strict
@@ -3654,6 +3695,7 @@ eventsRequiringRuleIds fm =
    in eventsSharingTimepoints fm' `S.union` temporalEqualityLinkedEvents fm'
 
 loadLemmas ::
+  String ->  -- completionEvent: allocated internal completion event
   S.Set String ->  -- sharedEventTags: events that need rule IDs
   Bool ->  -- hasSpecificLemmas: whether --lemma flag was used
   (ProtoLemma LNFormula ProofSkeleton -> Bool) ->
@@ -3661,7 +3703,7 @@ loadLemmas ::
   TypingEnvironment ->
   OpenTheory ->
   ([Doc], [Doc], S.Set ProVerifHeader)  -- (axioms, queries, headers)
-loadLemmas sharedEventTags hasSpecificLemmas lemSel tc te thy = (axiomDocs, queryDocs, headers)
+loadLemmas completionEvent sharedEventTags hasSpecificLemmas lemSel tc te thy = (axiomDocs, queryDocs, headers)
   where
     thyLemmas = theoryLemmas thy
 
@@ -3676,10 +3718,10 @@ loadLemmas sharedEventTags hasSpecificLemmas lemSel tc te thy = (axiomDocs, quer
     allIncludedLemmas = axiomsLemmas ++ queryLemmas
 
     -- Translate axioms using ppAxiomLemma
-    axiomDocs = map (ppAxiomLemma sharedEventTags te) axiomsLemmas
+    axiomDocs = map (ppAxiomLemma completionEvent sharedEventTags te) axiomsLemmas
 
     -- Translate queries using existing ppLemma
-    queryDocs = map (ppLemma sharedEventTags te) queryLemmas
+    queryDocs = map (ppLemma completionEvent sharedEventTags te) queryLemmas
 
     allFacts =
       filter (not . isKnowledgeFact) $
@@ -5286,8 +5328,8 @@ ppRestr ruleIdEvents te rstr =
 
 -- | Printer for reuse/src lemmas as ProVerif axioms.
 -- | Different than ppLemma in that it ignores timepoints and does transformations custom to these lemmas.
-ppAxiomLemma :: S.Set String -> TypingEnvironment -> Lemma ProofSkeleton -> Doc
-ppAxiomLemma _ruleIdEvents _te l
+ppAxiomLemma :: String -> S.Set String -> TypingEnvironment -> Lemma ProofSkeleton -> Doc
+ppAxiomLemma _completionEvent _ruleIdEvents _te l
   | Just reason <- assumptionKnowledgeFragmentFailure l._lFormula =
       text "(*"
         <> text l._lName
@@ -5296,7 +5338,7 @@ ppAxiomLemma _ruleIdEvents _te l
         $$ text ("(* Axiom translation failed: " ++ reason ++ ". *)")
         $$ text "(*" <> prettyLNFormula l._lFormula <> text "*)"
         $$ text ""
-ppAxiomLemma ruleIdEvents te l =
+ppAxiomLemma completionEvent ruleIdEvents te l =
   timepointComment
     $$ text "(*"
     <> text l._lName
@@ -5353,7 +5395,7 @@ ppAxiomLemma ruleIdEvents te l =
       | otherwise = rewriteFormulaForAxiom normalizedFormula
     simplifiedFormula
       | isJust sharedNormalization =
-          fst (guardSameActionConclusions simplifiedFormulaBeforeCompletion)
+          fst (guardSameActionConclusions completionEvent simplifiedFormulaBeforeCompletion)
       | otherwise = simplifiedFormulaBeforeCompletion
     axiomFormulas
       | isJust sharedNormalization =

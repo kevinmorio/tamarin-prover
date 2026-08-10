@@ -53,6 +53,7 @@ library
   other-modules:
     Export.Types
     Export.Diagnostic
+    Export.Name
     RuleTranslation
     ProVerifHeader
 
