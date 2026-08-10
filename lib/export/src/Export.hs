@@ -84,6 +84,23 @@ data QueryPolarity
   | InvertResult
   deriving (Eq, Ord, Show)
 
+data PreparedFormula = PreparedFormula
+  { preparedFormula :: LNFormula,
+    preparedTimeOrigins :: M.Map String String,
+    preparedHadTimepointSplit :: Bool
+  }
+
+data PreparedAxiomProperty = PreparedAxiomProperty
+  { preparedAxiomBeforeCompletion :: [LNFormula],
+    preparedAxiomFormulas :: [PreparedFormula],
+    preparedAxiomCompletionTriggers :: S.Set String
+  }
+
+data PropertyOutcome a
+  = PropertyEmitted a
+  | PropertyOmitted String
+  | PropertyExcluded
+
 -- | Information needed during translation.
 data TranslationContext = TranslationContext
   { trans :: Translation,
@@ -540,17 +557,19 @@ prettyProVerifTheory m noReuseLemmas noSourceLemmas noRestrictions noMultiset no
        in if lemma._lTraceQuantifier == AllTraces
             then fromMaybe simplified (normalizeAllTraceFormula simplified)
             else simplified
-    normalizedAxiomFormulas =
-      [ normalized
+    selectedAxiomLemmas =
+      [ lemma
       | lemma <- theoryLemmas thy,
-        classifyLemma hasSpecificLemmas tc lemSel lemma == AsAxiom,
-        Just normalized <-
-          [normalizeAllTraceFormula (simplifyFormula lemma._lFormula)]
+        classifyLemma hasSpecificLemmas tc lemSel lemma == AsAxiom
       ]
-    rewrittenAxiomFormulas =
-      map
-        (mapTopLevelConjunctsFormula rewriteFormulaForAxiom)
-        normalizedAxiomFormulas
+    preparedAxiomPlans =
+      [ (lemma._lName, prepareAxiomProperty completionEvent lemma)
+      | lemma <- selectedAxiomLemmas
+      ]
+    emittedAxiomPlans =
+      [ prepared
+      | (_, PropertyEmitted prepared) <- preparedAxiomPlans
+      ]
     lemmaSharedEvents =
       S.unions
         ( [ eventsRequiringRuleIds lemma._lFormula
@@ -558,7 +577,9 @@ prettyProVerifTheory m noReuseLemmas noSourceLemmas noRestrictions noMultiset no
               `S.union` translatedTemporalEqualityEvents lemma
           | lemma <- selectedQueryLemmas
           ]
-            ++ map eventsRequiringRuleIds normalizedAxiomFormulas
+            ++ concatMap
+              (map eventsRequiringRuleIds . preparedAxiomBeforeCompletion)
+              emittedAxiomPlans
         )
     translatedTemporalEqualityEvents lemma =
       let rewritten = propertyAnalysisFormula lemma
@@ -570,7 +591,7 @@ prettyProVerifTheory m noReuseLemmas noSourceLemmas noRestrictions noMultiset no
         ( [ completionTriggersForFormula completionEvent (propertyAnalysisFormula lemma)
           | lemma <- selectedQueryLemmas
           ]
-            ++ map (completionTriggersForFormula completionEvent) rewrittenAxiomFormulas
+            ++ map preparedAxiomCompletionTriggers emittedAxiomPlans
         )
     restrictionSharedEvents = detectSharedTimepointEventsRestrictions (theoryRestrictions thy)
     sharedEventTags = lemmaSharedEvents `S.union` restrictionSharedEvents
@@ -583,7 +604,7 @@ prettyProVerifTheory m noReuseLemmas noSourceLemmas noRestrictions noMultiset no
         else loadRestrictions sharedEventTags tc typEnv thy
     queries = loadQueries thy
     (axioms, lemmas, lemmaHeaders) =
-      loadLemmas completionEvent propertyEventTags hasSpecificLemmas lemSel tc typEnv thy
+      loadLemmas completionEvent preparedAxiomPlans propertyEventTags hasSpecificLemmas lemSel tc typEnv thy
     (ruleproc, ruleComb, ruleHeaders) =
       loadRules completionEvent sharedEventTags completionTriggerEvents thy m
     (macroproc, macroprochd) =
@@ -3696,6 +3717,7 @@ eventsRequiringRuleIds fm =
 
 loadLemmas ::
   String ->  -- completionEvent: allocated internal completion event
+  [(String, PropertyOutcome PreparedAxiomProperty)] ->
   S.Set String ->  -- sharedEventTags: events that need rule IDs
   Bool ->  -- hasSpecificLemmas: whether --lemma flag was used
   (ProtoLemma LNFormula ProofSkeleton -> Bool) ->
@@ -3703,7 +3725,7 @@ loadLemmas ::
   TypingEnvironment ->
   OpenTheory ->
   ([Doc], [Doc], S.Set ProVerifHeader)  -- (axioms, queries, headers)
-loadLemmas completionEvent sharedEventTags hasSpecificLemmas lemSel tc te thy = (axiomDocs, queryDocs, headers)
+loadLemmas completionEvent preparedAxiomPlans sharedEventTags hasSpecificLemmas lemSel tc te thy = (axiomDocs, queryDocs, headers)
   where
     thyLemmas = theoryLemmas thy
 
@@ -3718,7 +3740,15 @@ loadLemmas completionEvent sharedEventTags hasSpecificLemmas lemSel tc te thy = 
     allIncludedLemmas = axiomsLemmas ++ queryLemmas
 
     -- Translate axioms using ppAxiomLemma
-    axiomDocs = map (ppAxiomLemma completionEvent sharedEventTags te) axiomsLemmas
+    axiomDocs =
+      [ ppAxiomLemma
+          completionEvent
+          sharedEventTags
+          te
+          lemma
+          (fromMaybe PropertyExcluded (lookup lemma._lName preparedAxiomPlans))
+      | lemma <- axiomsLemmas
+      ]
 
     -- Translate queries using existing ppLemma
     queryDocs = map (ppLemma completionEvent sharedEventTags te) queryLemmas
@@ -5212,22 +5242,17 @@ ppRestr ruleIdEvents te rstr =
         else ridOccurrenceNames ruleIdEvents f
 
     renderStandaloneRestriction formula =
-      let formulaNeedsRuleId = formulaHasSharedTimepoints formula
-          (formula', origins) =
-            if formulaNeedsRuleId
-              then makeTimeVarsDistinctWithOrigins formula
-              else (formula, M.empty)
-          formulaRidNames =
-            if formulaNeedsRuleId
+      let formulaRidNames =
+            if needsRuleId
               then
                 ridOccurrenceNamesWithOriginsPreservingSingle
                   ruleIdEvents
-                  origins
-                  formula'
-              else ridOccurrenceNames ruleIdEvents formula'
+                  splitTimeOrigins
+                  formula
+              else ridOccurrenceNames ruleIdEvents formula
        in Precise.evalFresh
-            (ppRestrictFormulaR R formulaRidNames ruleIdEvents te formula' "")
-            (avoidPrecise formula')
+            (ppRestrictFormulaR R formulaRidNames ruleIdEvents te formula "")
+            (avoidPrecise formula)
 
     -- A forbidden positive witness whose body is a disjunction can be
     -- represented by one prohibition per DNF branch:
@@ -5328,9 +5353,48 @@ ppRestr ruleIdEvents te rstr =
 
 -- | Printer for reuse/src lemmas as ProVerif axioms.
 -- | Different than ppLemma in that it ignores timepoints and does transformations custom to these lemmas.
-ppAxiomLemma :: String -> S.Set String -> TypingEnvironment -> Lemma ProofSkeleton -> Doc
-ppAxiomLemma _completionEvent _ruleIdEvents _te l
-  | Just reason <- assumptionKnowledgeFragmentFailure l._lFormula =
+prepareAxiomProperty :: String -> Lemma ProofSkeleton -> PropertyOutcome PreparedAxiomProperty
+prepareAxiomProperty completionEvent lemma
+  | Just reason <- assumptionKnowledgeFragmentFailure lemma._lFormula =
+      PropertyOmitted reason
+  | otherwise =
+      PropertyEmitted
+        PreparedAxiomProperty
+          { preparedAxiomBeforeCompletion = [rewrittenBeforeCompletion],
+            preparedAxiomFormulas = map prepareRenderedFormula axiomFormulas,
+            preparedAxiomCompletionTriggers = completionTriggers
+          }
+  where
+    simplified = simplifyFormula lemma._lFormula
+    sharedNormalization = normalizeAllTraceFormula simplified
+    normalized = fromMaybe simplified sharedNormalization
+    rewrittenBeforeCompletion
+      | isJust sharedNormalization =
+          mapTopLevelConjunctsFormula rewriteFormulaForAxiom normalized
+      | otherwise = rewriteFormulaForAxiom normalized
+    (guarded, completionTriggers) =
+      guardSameActionConclusions completionEvent rewrittenBeforeCompletion
+    axiomFormulas
+      | isJust sharedNormalization =
+          let (formulas, _, _) = splitTopLvlConns AllTraces 1 guarded
+           in formulas
+      | otherwise = [guarded]
+
+prepareRenderedFormula :: LNFormula -> PreparedFormula
+prepareRenderedFormula formula =
+  PreparedFormula
+    { preparedFormula = renderedFormula,
+      preparedTimeOrigins = timeOrigins,
+      preparedHadTimepointSplit = needsRuleId
+    }
+  where
+    needsRuleId = formulaHasSharedTimepoints formula
+    (renderedFormula, timeOrigins)
+      | needsRuleId = makeTimeVarsDistinctWithOrigins formula
+      | otherwise = (formula, M.empty)
+
+ppAxiomLemma :: String -> S.Set String -> TypingEnvironment -> Lemma ProofSkeleton -> PropertyOutcome PreparedAxiomProperty -> Doc
+ppAxiomLemma _completionEvent _ruleIdEvents _te l (PropertyOmitted reason) =
       text "(*"
         <> text l._lName
         <> text " [reuse/source lemma not translated as axiom]"
@@ -5338,20 +5402,19 @@ ppAxiomLemma _completionEvent _ruleIdEvents _te l
         $$ text ("(* Axiom translation failed: " ++ reason ++ ". *)")
         $$ text "(*" <> prettyLNFormula l._lFormula <> text "*)"
         $$ text ""
-ppAxiomLemma completionEvent ruleIdEvents te l =
+ppAxiomLemma _ _ _ _ PropertyExcluded = emptyDoc
+ppAxiomLemma _completionEvent ruleIdEvents te l (PropertyEmitted prepared) =
   timepointComment
     $$ text "(*"
     <> text l._lName
     <> text " [reuse/source lemma translated as axiom]"
     <> text "*)"
-    $$ vcat (intersperse (text "") (map renderAxiom axiomFormulas))
+    $$ vcat (intersperse (text "") (map renderAxiom prepared.preparedAxiomFormulas))
   where
-    renderAxiom simplifiedFm =
-      let needsRuleId = formulaHasSharedTimepoints simplifiedFm
-          (fm, splitTimeOrigins) =
-            if needsRuleId
-              then makeTimeVarsDistinctWithOrigins simplifiedFm
-              else (simplifiedFm, M.empty)
+    renderAxiom preparedFormulaPlan =
+      let fm = preparedFormulaPlan.preparedFormula
+          needsRuleId = preparedFormulaPlan.preparedHadTimepointSplit
+          splitTimeOrigins = preparedFormulaPlan.preparedTimeOrigins
           ridNames =
             if needsRuleId
               then
@@ -5385,25 +5448,7 @@ ppAxiomLemma completionEvent ruleIdEvents te l =
                         (ppRestrictFormulaR RSL ridNames ruleIdEvents te fm "")
                         (avoidPrecise fm)
 
-    sharedNormalization =
-      normalizeAllTraceFormula (simplifyFormula l._lFormula)
-    normalizedFormula =
-      fromMaybe l._lFormula sharedNormalization
-    simplifiedFormulaBeforeCompletion
-      | isJust sharedNormalization =
-          mapTopLevelConjunctsFormula rewriteFormulaForAxiom normalizedFormula
-      | otherwise = rewriteFormulaForAxiom normalizedFormula
-    simplifiedFormula
-      | isJust sharedNormalization =
-          fst (guardSameActionConclusions completionEvent simplifiedFormulaBeforeCompletion)
-      | otherwise = simplifiedFormulaBeforeCompletion
-    axiomFormulas
-      | isJust sharedNormalization =
-          let (formulas, _, _) =
-                splitTopLvlConns AllTraces 1 simplifiedFormula
-           in formulas
-      | otherwise = [simplifiedFormula]
-    timepointComment = if any formulaHasSharedTimepoints axiomFormulas
+    timepointComment = if any preparedHadTimepointSplit prepared.preparedAxiomFormulas
                        then text "(* Timepoints in lemma have been split *)\n"
                        else text ""
 

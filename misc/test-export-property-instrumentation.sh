@@ -114,14 +114,16 @@ if "$tamarin" -d=0 -m=proverif --quit-on-warning --lemma=rejected_ku \
   exit 1
 fi
 
-# The restriction-provenance and identity-axiom assertions still characterize
-# the current broken output. The name-allocation assertions below state the
-# fixed invariants.
+# Focused invariants for prepared properties and allocated instrumentation.
 refactoring_collision="$tmp_dir/refactoring-collision.pv"
 export_model_lemma "$refactoring_model" generated_rule_id_avoids_source_variable "$refactoring_collision"
-require_pattern 'event\(eBranchB\( rid_j1, x \)\)' "$refactoring_collision"
-require_pattern 'event\(eBranchC\( rid_j2, x \)\)' "$refactoring_collision"
-require_pattern '^event eAxiomA\(bitstring\)\.$' "$refactoring_collision"
+require_pattern 'event\(eBranchB\( rid, x \)\)' "$refactoring_collision"
+require_pattern 'event\(eBranchC\( rid, x \)\)' "$refactoring_collision"
+require_pattern '^event eAxiomA\(bitstring, bitstring\)\.$' "$refactoring_collision"
+require_pattern 'event\(eAxiomA\( rid, x \)\).*event\(eAxiomB\( rid, x \)\)' "$refactoring_collision"
+require_pattern 'event\(eRuleCompleted_1\( rid \)\)' "$refactoring_collision"
+require_pattern 'event\(eAxiomC\( rid, x \)\)' "$refactoring_collision"
+require_pattern 'event eRuleCompleted_1\(rid_rEmitAxiomEvents\)\.' "$refactoring_collision"
 require_pattern 'new rid_rCollision_1: bitstring;' "$refactoring_collision"
 require_pattern 'in\(publicChannel, rid_rCollision: bitstring\);' "$refactoring_collision"
 require_pattern 'event eCollisionA\(rid_rCollision_1, rid_rCollision\);' "$refactoring_collision"
