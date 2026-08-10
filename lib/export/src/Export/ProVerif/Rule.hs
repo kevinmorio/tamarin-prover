@@ -8,7 +8,7 @@
 -- Portability : GHC only
 --
 -- Translation from multiset rewrite rules to ProVerif
-module RuleTranslation
+module Export.ProVerif.Rule
   ( loadRules,
     translateEmbeddedRuleAction,
     ppFunSym,
@@ -30,7 +30,7 @@ import Data.Maybe (catMaybes, fromMaybe, mapMaybe)
 import Data.Set qualified as S
 import Extension.Data.Label qualified as L
 import Export.Name
-import ProVerifHeader
+import Export.ProVerif.Header
 import Sapic.Exceptions
 import Sapic.Facts
 import Theory

@@ -54,8 +54,8 @@ library
     Export.Types
     Export.Diagnostic
     Export.Name
-    RuleTranslation
-    ProVerifHeader
+    Export.ProVerif.Rule
+    Export.ProVerif.Header
 
   default-extensions:
     DuplicateRecordFields

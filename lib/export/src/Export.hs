@@ -38,9 +38,9 @@ import Data.Set qualified as S
 import Extension.Data.Label qualified as L
 import Export.Diagnostic
 import Export.Name
+import Export.ProVerif.Header
+import Export.ProVerif.Rule
 import Export.Types
-import ProVerifHeader
-import RuleTranslation
 import Sapic.Annotation
 import Sapic.Report
 import Sapic.States

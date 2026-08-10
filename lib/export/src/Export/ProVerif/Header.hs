@@ -1,4 +1,4 @@
-module ProVerifHeader where
+module Export.ProVerif.Header where
 
 -- ProVerif Headers need to be ordered, and declared only once. We order them by type, and will update a set of headers.
 data ProVerifHeader
