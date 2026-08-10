@@ -1,5 +1,3 @@
-{-# LANGUAGE LambdaCase #-}
-
 -- |
 -- Copyright   : (c) 2022 Julian Biehl
 -- License     : GPL v3 (see LICENSE)
@@ -12,7 +10,6 @@ module Export.ProVerif.Rule
   ( loadRules,
     translateEmbeddedRuleAction,
     ppFunSym,
-    sanitizeSymbol,
     replaceTrueFalse,
     makeEventHeaders,
     multisetTheory
@@ -23,15 +20,14 @@ where
 
 import Control.Exception
 import Data.ByteString.Char8 qualified as BC
-import Data.Char
 import Data.List as List
 import Data.Map qualified as M
-import Data.Maybe (catMaybes, fromMaybe, listToMaybe, mapMaybe)
+import Data.Maybe (catMaybes, fromMaybe, mapMaybe)
 import Data.Set qualified as S
 import Extension.Data.Label qualified as L
 import Export.Name
 import Export.ProVerif.Header
-import Export.Types (translationFail)
+import Export.Types (translationFail, translationInvariantFail)
 import Sapic.Exceptions
 import Sapic.Facts
 import Theory
@@ -83,7 +79,7 @@ loadRules completionEvent ruleIdEvents completionTriggerEvents thy m = case theo
       -- want to export restrictions and reuse/src lemmas => need to introduce fresh stamps (as there no timepoints in such formulas)
       rulesMod = map (\(OpenProtoRule ruE rusAC) -> OpenProtoRule (applyMacroInRule (theoryMacros thy) ruE) rusAC) $ case m of
         ModuleProVerif -> rules
-        _ -> translationFail "Rule translation was invoked for an incompatible output module."
+        _ -> translationInvariantFail "Rule translation was invoked for an incompatible output module."
 
 translateEmbeddedRuleAction ::
   (HighlightDocument d) =>
@@ -144,7 +140,7 @@ multisetTheory thy =
    in if hasDistinctFact
         then case addRestriction (parseAndConvertRestriction resDistinctFact) thy' of
                Just thy'' -> thy''
-               Nothing    -> translationFail "Could not add the generated multiset restriction to the theory."
+               Nothing    -> translationInvariantFail "Could not add the generated multiset restriction to the theory."
         else thy'
 
 -- Helper to check if a rule has a DistinctFact action
@@ -165,8 +161,8 @@ parseAndConvertRestriction s =
     Right (Restriction name synFormula _) ->
       case toLNFormula synFormula of
         Just lnFormula -> Restriction name lnFormula Nothing
-        Nothing -> translationFail "Could not convert the generated multiset restriction."
-    _ -> translationFail $ "Could not parse the generated multiset restriction: " ++ s
+        Nothing -> translationInvariantFail "Could not convert the generated multiset restriction."
+    _ -> translationInvariantFail $ "Could not parse the generated multiset restriction: " ++ s
 
 multisetSemantics :: HasRuleName (Rule i) => Rule i -> Rule i
 multisetSemantics r = r
@@ -225,7 +221,7 @@ makeDestructorHeader ((dDef, atom), dName) =
   case break (== '#') dDef of
     (declarations, _ : body) ->
       Eq "reduc" declarations (dName ++ "(" ++ body ++ ") = " ++ showAtom False atom) "[private]"
-    _ -> translationFail "A generated destructor definition has no body."
+    _ -> translationInvariantFail "A generated destructor definition has no body."
 
 makeHeadersFromRule :: S.Set String -> OpenProtoRule -> OpenTheory -> S.Set ProVerifHeader
 makeHeadersFromRule ruleIdEvents (OpenProtoRule ruE _) = makeHeadersFromProtoRule ruleIdEvents ruE
@@ -377,7 +373,7 @@ translateProtoRule completionEvent ruleIdNames ruleIdEvents completionTriggerEve
         completionEvent
         ruleIdEvents
         completionTriggerEvents
-        (fromMaybe (translationFail ("missing allocated rule-ID name for " ++ rname)) (M.lookup rname ruleIdNames))
+        (fromMaybe (translationInvariantFail ("missing allocated rule-ID name for " ++ rname)) (M.lookup rname ruleIdNames))
         ru._rPrems
         (notDiffRuleActs ru)
         ru._rConcs
@@ -678,78 +674,7 @@ translatePatternFact (Fact tag _ ts) factType vars helperVars =
       IN -> case doclist of
         document : _ -> text "in(publicChannel," <-> document <> text ": bitstring);"
         [] -> translationFail "An input pattern requires one term."
-      _ -> translationFail "Pattern translation received a fact other than get or input."
-
-sanitizeSymbol :: Char -> String -> String
-sanitizeSymbol pre s =
-  if (s `elem` reservedWords) || maybe False Data.Char.isDigit (listToMaybe s)
-    then pre : s
-    else s
-
-reservedWords :: [String]
-reservedWords =
-  [ "among",
-    "axiom",
-    "channel",
-    "choice",
-    "clauses",
-    "const",
-    "def",
-    "diff",
-    "do",
-    "elimtrue",
-    "else",
-    "equation",
-    "equivalence",
-    "event",
-    "expand",
-    "fail",
-    "for",
-    "forall",
-    "foreach",
-    "free",
-    "fun",
-    "get",
-    "if",
-    "implementation",
-    "in",
-    "inj-event",
-    "insert",
-    "lemma",
-    "let",
-    "letfun",
-    "letproba",
-    "new",
-    "noninterf",
-    "noselect",
-    "not",
-    "nounif",
-    "or",
-    "otherwise",
-    "out",
-    "param",
-    "phase",
-    "pred",
-    "proba",
-    "process",
-    "proof",
-    "public_vars",
-    "putbegin",
-    "query",
-    "reduc",
-    "restriction",
-    "secret",
-    "select",
-    "set",
-    "sid",
-    "suchthat",
-    "sync",
-    "table",
-    "then",
-    "type",
-    "weaksecret",
-    "yield"
-  ]
+      _ -> translationInvariantFail "Pattern translation received a fact other than get or input."
 
 startsWith :: Char -> String -> Bool
 startsWith expected (actual : _) = expected == actual

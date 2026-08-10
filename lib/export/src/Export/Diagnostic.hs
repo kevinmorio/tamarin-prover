@@ -14,7 +14,7 @@ import Data.Map qualified as M
 import Data.Sequence (Seq)
 import Data.Sequence qualified as Seq
 import Data.Set qualified as S
-import Export.Sapic (BuiltinTranslation (..), builtins)
+import Export.ProVerif.Header (BuiltinTranslation (..), builtins)
 import Export.Types
 import Sapic.Typing
 import Text.PrettyPrint.Class

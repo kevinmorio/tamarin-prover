@@ -15,6 +15,7 @@ module Export.Types
     exportModule,
     captureExport,
     translationFail,
+    translationInvariantFail,
   )
 where
 
@@ -69,13 +70,18 @@ data ExportResult = ExportResult
     exportDiagnostics :: Seq ExportDiagnostic
   }
 
-newtype ExportException = ExportException String
+data ExportException
+  = ExportInputException String
+  | ExportInvariantException String
   deriving (Show)
 
 instance Exception.Exception ExportException
 
 translationFail :: String -> a
-translationFail = Exception.throw . ExportException
+translationFail = Exception.throw . ExportInputException
+
+translationInvariantFail :: String -> a
+translationInvariantFail = Exception.throw . ExportInvariantException
 
 data Translation
   = ProVerif
@@ -124,16 +130,17 @@ captureExport diagnostics renderDocument = do
   case rendered of
     Left exception -> pure (Left (exceptionToExportError exception))
     Right document -> do
-      forced <- Exception.try (Exception.evaluate (length (render document))) :: IO (Either Exception.SomeException Int)
+      forced <-
+        Exception.try
+          ( Exception.evaluate
+              (length (render document) + length (show diagnostics))
+          ) :: IO (Either Exception.SomeException Int)
       case forced of
         Left exception -> pure (Left (exceptionToExportError exception))
         Right _ -> pure (Right (ExportResult document diagnostics))
   where
     exceptionToExportError exception =
       case Exception.fromException exception of
-        Just (ExportException message) -> ExportError "EXP-FATAL-INPUT" message
+        Just (ExportInputException message) -> ExportError "EXP-FATAL-INPUT" message
+        Just (ExportInvariantException message) -> ExportError "EXP-FATAL-INVARIANT" message
         Nothing -> ExportError "EXP-FATAL-RENDER" (Exception.displayException exception)
-
-------------------------------------------------------------------------------
--- Core ProVerif Export
-------------------------------------------------------------------------------

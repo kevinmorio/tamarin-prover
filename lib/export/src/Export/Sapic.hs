@@ -9,6 +9,7 @@ import Data.List as List
 import Data.Map qualified as M
 import Data.Maybe
 import Data.Set qualified as S
+import Export.Name (sanitizeSymbol)
 import Export.ProVerif.Header
 import Export.ProVerif.Rule
 import Export.Types
@@ -162,84 +163,6 @@ ppFact tc (Fact tag _ ts)
         (pts, shs) = unzip $ map (ppSapicTerm tc) ts2
         sh = S.unions shs
 
-stateHeaders :: S.Set ProVerifHeader
-stateHeaders =
-  S.fromList
-    [ Table "tbl_states_handle" "(bitstring,channel)", -- the table for linking states identifiers and channels
-      Table "tbl_locks_handle" "(bitstring,channel)" -- the table for linking locks identifiers and channels
-    ]
-
-data BuiltinTranslation
-  = NotSupportedBuiltin String
-  | AccurateBuiltin [ProVerifHeader]
-  | BestEffortBuiltin [ProVerifHeader]
-
-builtins :: String -> BuiltinTranslation
-builtins "diffie-hellman" =
-  BestEffortBuiltin
-    [ Sym "const" "g" ":bitstring" [],
-      Fun "fun" "exp" 2 "(bitstring,bitstring):bitstring" [],
-      Eq "equation" "forall a:bitstring,b:bitstring;" "exp( exp(g,a),b) = exp(exp(g,b),a)" ""
-      -- Note: The following commented out functions and equations are not supported by ProVerif.
-      -- Fun "fun" "inv" 1 "(bitstring):bitstring" [],
-      -- Eq "equation" "forall a:bitstring,b:bitstring;" "exp( exp(a,b), inv(b)) = a" "",
-      -- Eq "equation" "forall a:bitstring;" "inv( inv(a)) = a" ""
-    ]
-builtins "locations-report" =
-  AccurateBuiltin
-    [ Fun "fun" "rep" 2 "(bitstring,bitstring):bitstring" ["private"]
-    ]
-builtins "xor" =
-  BestEffortBuiltin
-    [ Fun "fun" "xor" 2 "(bitstring,bitstring):bitstring" [],
-      Fun "fun" "zero" 0 "():bitstring" []
-    ]
-builtins "hashing" =
-  AccurateBuiltin
-    [ Fun "fun" "h" 1 "(bitstring):bitstring" []
-    ]
-builtins "asymmetric-encryption" =
-  AccurateBuiltin
-    [ Fun "fun" "aenc" 2 "(bitstring,bitstring):bitstring" [],
-      Fun "fun" "pk" 1 "(bitstring):bitstring" []
-    ] -- Don't need to define the reduc equations here because they are already read from the theory
-builtins "signing" =
-  AccurateBuiltin
-    [ Fun "fun" "sign" 2 "(bitstring,bitstring):bitstring" [],
-      Fun "fun" "pk" 1 "(bitstring):bitstring" [],
-      Fun "fun" "okay" 0 "():bitstring" []
-    ]
-builtins "revealing-signing" =
-  AccurateBuiltin
-    [ Fun "fun" "revealSign" 2 "(bitstring,bitstring):bitstring" [],
-      Fun "fun" "revealVerify" 3 "(bitstring,bitstring,bitstring):bitstring" [],
-      Fun "fun" "getMessage" 1 "(bitstring):bitstring" [],
-      Fun "fun" "pk" 1 "(bitstring):bitstring" [],
-      Fun "fun" "okay" 0 "():bitstring" []
-    ]
-builtins "symmetric-encryption" =
-  AccurateBuiltin
-    [ Fun "fun" "senc" 2 "(bitstring,bitstring):bitstring" []
-    ]
-builtins "multiset" =
-  NotSupportedBuiltin
-    "Multiset is not supported in ProVerif. If you want to model natural numbers, you can use the dedicated Tamarin builtin."
-builtins "bilinear-pairing" =
-  NotSupportedBuiltin
-    "Bilinear pairings are not supported in ProVerif."
-builtins name
-  | name
-      `elem` [ "dest-pairing",
-               "dest-asymmetric-encryption",
-               "dest-signing",
-               "dest-symmetric-encryption",
-               "natural-numbers",
-               "reliable-channel"
-             ] = AccurateBuiltin []
-builtins name =
-  NotSupportedBuiltin
-    ("Builtin `" ++ name ++ "` is not supported by this export backend.")
-
 ppAction ::
   ProcessAnnotation LVar ->
   TranslationContext ->
@@ -389,7 +312,7 @@ ppAction ProcessAnnotation {stateChannel = Just (AnVar lvar), pureState = _} tc@
 -- Should never happen
 ppAction ProcessAnnotation {stateChannel = Nothing, pureState = True} TranslationContext {trans} (Insert _ _)
   | trans == ProVerif =
-      (text "TRANSLATIONERROR", S.empty, True)
+      translationInvariantFail "SAPIC invariant failed: a pure-state insert has no state channel."
 -- must rely on the table
 ppAction ProcessAnnotation {stateChannel = Nothing, pureState = False} tc@TranslationContext {trans} (Insert t t2)
   | trans == ProVerif =
@@ -527,7 +450,7 @@ ppSapic renderFormula tc (ProcessComb (Lookup _ c) ProcessAnnotation {stateChann
     (ppl, pshl) = ppSapic renderFormula tc pl
 
 ppSapic _ _ (ProcessComb (Lookup _ _) ProcessAnnotation {stateChannel = Nothing, pureState = True} _ (ProcessNull _)) =
-  translationFail "SAPIC invariant failed: a pure-state lookup has no state channel."
+  translationInvariantFail "SAPIC invariant failed: a pure-state lookup has no state channel."
 ppSapic renderFormula tc (ProcessComb (Lookup _ c) ProcessAnnotation {stateChannel = Just (AnVar lvar), pureState = False} pl (ProcessNull _)) =
   ( text "in("
       <> pt
@@ -768,12 +691,7 @@ loadEquivProcs renderFormula tc thy ((p1, p2) : q) =
       Just _ -> (tc, S.empty)
     tc3 = tc2 {hasBoundStates = hasBoundSt, hasUnboundStates = snd hasStates1 || snd hasStates2}
 
-------------------------------------------------------------------------------
--- Printer for Lemmas
-------------------------------------------------------------------------------
-
 -- | Smaller-or-equal / More-or-equally-specific relation on types.
--- SECTION 7: Lemma Translation
 
 headersOfType :: [SapicType] -> S.Set ProVerifHeader
 headersOfType types =
@@ -787,12 +705,12 @@ headersOfType types =
       types
 
 headerOfFunSym :: SapicFunSym -> S.Set ProVerifHeader
-headerOfFunSym ((NoEqUser (f, (k, pub, Constructor, _))), inTypes, outType) =
+headerOfFunSym (NoEqUser (f, (k, pub, Constructor, _)), inTypes, outType) =
   Fun "fun" (ppFunSym f) k ("(" ++ makeArgtypes inTypes ++ "):" ++ ppType outType) (priv_or_pub pub) `S.insert` headersOfType (outType : inTypes)
   where
     priv_or_pub Public = []
     priv_or_pub Private = ["private"]
-headerOfFunSym ((ACfctUser f), _, _) = translationFail $ "User defined AC function " ++ show f ++ "not supported."-- "AC function not supported"
+headerOfFunSym (ACfctUser f, _, _) = translationFail $ "User defined AC function " ++ show f ++ "not supported."-- "AC function not supported"
 headerOfFunSym _ = S.empty
 
 -- | Load headers from an OpenTheory into a set of ProVerif Headers
@@ -888,72 +806,6 @@ headersOfRule tc typeEnv r | (lhs `RRule` rhs) <- ctxtStRuleToRRule r = do
     ppFreeTyped (v, Nothing) = ppLVar v <> text ":bitstring"
     ppFreeTyped (v, Just s) = ppLVar v <> text ":" <> text (ppType s)
 
-prettyProVerifHeader :: ProVerifHeader -> Doc
-prettyProVerifHeader = \case
-  Type s -> text "type " <> text s <> text "."
-  HEvent s ty -> text "event " <> text s <> text ty <> text "."
-  Table s ty -> text "table " <> text s <> text ty <> text "."
-  Eq eqtype quant eq pub -> text eqtype <> text " " <> text quant <> text " " <> text eq <> text pub <> text "."
-  Sym symkind name symtype [] -> text symkind <> text " " <> text name <> text symtype <> text "."
-  Sym symkind name symtype attr -> text symkind <> text " " <> text name <> text symtype <> text "[" <> fsep (punctuate comma (map text attr)) <> text "]" <> text "."
-  Fun "" _ _ _ _ -> text ""
-  Fun fkind name _ symtype [] -> text fkind <> text " " <> text name <> text symtype <> text "."
-  Fun fkind name _ symtype attr ->
-    text fkind <> text " " <> text name <> text symtype <> text "[" <> fsep (punctuate comma (map text attr)) <> text "]" <> text "."
-
-prettyDeepSecHeader :: ProVerifHeader -> Doc
-prettyDeepSecHeader = \case
-  Type _ -> text "" -- no types in deepsec
-  Eq "reduc" _ eq _ -> text "reduc" <> text " " <> text eq <> text "."
-  Eq eqtype _ eq _ -> translationFail $ "DeepSec does not support equations: " ++ eqtype ++ " " ++ eq
-  HEvent _ _ -> text ""
-  Table _ _ -> text ""
-  -- drop symtypes in symbol declarations
-  Sym symkind name _ [] -> text symkind <> text " " <> text name <> text "."
-  Sym symkind name _ attr ->
-    if "private" `elem` attr
-      then text symkind <> text " " <> text name <> text "[private]" <> text "."
-      else text symkind <> text " " <> text name <> text "."
-  -- only keep arity for fun declarations
-  Fun "" _ _ _ _ -> text ""
-  Fun fkind name arity _ [] ->
-    text fkind
-      <> text " "
-      <> text name
-      <> text "/"
-      <> text (show arity)
-      <> text "."
-  Fun fkind name arity _ attr ->
-    if "private" `elem` attr
-      then
-        text fkind
-          <> text " "
-          <> text name
-          <> text "/"
-          <> text (show arity)
-          <> text "[private]"
-          <> text "."
-      else text fkind <> text " " <> text name <> text "/" <> text (show arity) <> text "."
-
-attribHeaders :: TranslationContext -> [ProVerifHeader] -> [Doc]
-attribHeaders tc hd =
-  sym ++ fun ++ eq
-  where
-    (eq, fun, sym) = splitHeaders hd
-    pph = case trans tc of
-      ProVerif -> prettyProVerifHeader
-      DeepSec -> prettyDeepSecHeader
-    splitHeaders [] = ([], [], [])
-    splitHeaders (x : xs)
-      | Sym {} <- x = (e1, f1, pph x : s1)
-      | Fun {} <- x = (e1, pph x : f1, s1)
-      | Eq {} <- x = (pph x : e1, f1, s1)
-      | HEvent _ _ <- x = (pph x : e1, f1, s1)
-      | Table _ _ <- x = (pph x : e1, f1, s1)
-      | Type _ <- x = (e1, f1, pph x : s1)
-      where
-        (e1, f1, s1) = splitHeaders xs
-
 attChanName :: String
 attChanName = "att"
 
@@ -983,7 +835,7 @@ getAttackerChannel ::
 getAttackerChannel tc t1 = case (t1, attackerChannel tc) of
   (Just tt1, _) -> ppSapicTerm tc tt1
   (Nothing, Just (LVar n _ _)) -> (text n, S.empty)
-  _ -> translationFail "SAPIC invariant failed: the implicit attacker channel was not allocated."
+  _ -> translationInvariantFail "SAPIC invariant failed: the implicit attacker channel was not allocated."
 
 ------------------------------------------------------------------------------
 -- Some utility functions

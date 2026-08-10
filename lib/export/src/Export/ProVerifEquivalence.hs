@@ -6,7 +6,7 @@ import Data.List (intersperse)
 import Data.Set qualified as Set
 import Export.Diagnostic
 import Export.ProVerif (loadQueries)
-import Export.ProVerif.Header (checkDuplicates', filterHeaders)
+import Export.ProVerif.Header (attribHeaders, checkDuplicates', filterHeaders, stateHeaders)
 import Export.ProVerif.Render (renderSapicFormula)
 import Export.Sapic
 import Export.Types
@@ -46,7 +46,7 @@ prettyProVerifEquivTheory (thy, typeEnvironment) =
       | otherwise = Set.empty
     finalProcesses
       | length equivalenceLemmas + length diffEquivalenceLemmas > 1 =
-          fail "Error: ProVerif can only support at most one equivalence or diff equivalence query."
+          translationFail "ProVerif supports at most one equivalence or diff-equivalence query."
       | otherwise = pure (equivalenceLemmas ++ diffEquivalenceLemmas)
     queries = loadQueries thy
     (macroProcesses, macroHeaders)

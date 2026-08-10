@@ -5,6 +5,7 @@ module Export.DeepSec (prettyDeepSecTheory) where
 import Data.List (intersperse)
 import Data.Set qualified as Set
 import Export.Diagnostic
+import Export.ProVerif.Header (attribHeaders)
 import Export.ProVerif.Render (renderSapicFormula)
 import Export.Sapic
 import Export.Types

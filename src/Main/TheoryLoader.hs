@@ -427,9 +427,9 @@ lemmaSelector thyOpts lem
     lemmaNames = thyOpts.lemmaNames
 
     lemmaMatches :: String -> Bool
-    lemmaMatches pattern
-      | lastMay pattern == Just '*' = init pattern `isPrefixOf` lem.lName
-      | otherwise = lem.lName == pattern
+    lemmaMatches namePattern
+      | lastMay namePattern == Just '*' = init namePattern `isPrefixOf` lem.lName
+      | otherwise = lem.lName == namePattern
 
 data TheoryLoadError
   = ParserError ParseError
@@ -804,12 +804,14 @@ prettyOpenTheoryByModule version report thyOpts thy = case thyOpts.outputModule 
     liftIO
       ( Export.prettyProVerifTheory
           ModuleProVerif
-          noReuseLemmas
-          noSourceLemmas
-          noRestrictions
-          noMultiset
-          noPrecise
-          hasSpecificLemmas
+          Export.ProVerifOptions
+            { Export.omitReuseLemmas = noReuseLemmas,
+              Export.omitSourceLemmas = noSourceLemmas,
+              Export.omitRestrictions = noRestrictions,
+              Export.omitMultisetTranslation = noMultiset,
+              Export.omitPreciseActions = noPrecise,
+              Export.selectSpecificLemmas = hasSpecificLemmas
+            }
           lemmas
           typedTheory
       )

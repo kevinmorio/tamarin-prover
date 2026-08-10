@@ -8,6 +8,7 @@ import Data.List as List
 import Data.Map qualified as M
 import Data.Maybe
 import Data.Set qualified as S
+import Export.Name (freshNameAvoiding)
 import Theory
 import Theory.Tools.Wellformedness (formulaFacts)
 
@@ -24,7 +25,7 @@ buildDisjunction formulas = foldr1 (.||.) formulas
 formulaContainsAction :: LNFormula -> Bool
 formulaContainsAction =
   foldFormula
-    (\atom -> case atom of Action _ _ -> True; _ -> False)
+    (\case Action _ _ -> True; _ -> False)
     (const False)
     id
     (\_ left right -> left || right)
@@ -206,7 +207,7 @@ makeBinderHintsGloballyUnique formula = snd (go S.empty formula)
     go used (Qua q (name, srt) body) =
       let name'
             | name `S.notMember` used = name
-            | otherwise = freshName name used
+            | otherwise = freshNameAvoiding "_" (reserved `S.union` used) name
           (used', body') = go (S.insert name' used) body
        in (used', Qua q (name', srt) body')
     go used (Not body) =
@@ -224,15 +225,6 @@ makeBinderHintsGloballyUnique formula = snd (go S.empty formula)
     collectHintNames (Conn _ left right) =
       collectHintNames left `S.union` collectHintNames right
     collectHintNames _ = S.empty
-
-    freshName name used =
-      head
-        [ candidate
-        | i <- [(1 :: Integer) ..],
-          let candidate = name ++ "_" ++ show i,
-          candidate `S.notMember` reserved,
-          candidate `S.notMember` used
-        ]
 
 -- | Check if a formula represents a valid existential disjunction pattern.
 -- Valid patterns include:
@@ -429,10 +421,6 @@ applyRewriteForShape shape fm = case shape of
     collectNegatedAtoms (Conn Or p q) = collectNegatedAtoms p ++ collectNegatedAtoms q
     collectNegatedAtoms (Not p) = [p]
     collectNegatedAtoms _ = []
-
--- ===========================================================================
--- SECTION 9: Timepoint Variable Handling
--- ===========================================================================
 
 -- | Eliminate temporal equality constraints by unifying the equated timepoint
 -- variables (one-point rule). In Tamarin, @Ex #j. B()\@j & #i = #j@ is
@@ -751,7 +739,7 @@ eliminateTemporalEqualities fm0 =
     -- itself becomes trivial (t = t) and is removed by the final
     -- simplifyFormula.
     substituteBinder :: BVar LVar -> LNFormula -> LNFormula
-    substituteBinder repl = mapAtoms (\d a -> fmap (mapLits (fmap (adjust d))) a)
+    substituteBinder repl = mapAtoms (fmap . mapLits . fmap . adjust)
       where
         adjust d (Bound i)
           | i == d = case repl of
@@ -1201,26 +1189,6 @@ hasNegatedEventInFormula = go
     hasEventAnywhere (Qua _ _ f) = hasEventAnywhere f
     hasEventAnywhere _ = False
 
--- | Check if a negated restriction can potentially be rewritten to positive form.
--- Pattern: not(Ex... (P & Q) & (i ≠ j)) can become All... (P & Q) => (i = j)
--- Returns a description of the pattern if found, Nothing otherwise.
-canRewriteNegatedRestriction :: LNFormula -> Maybe String
-canRewriteNegatedRestriction (Not fm@(Qua Ex _ _)) =
-  -- Check if the body has a conjunction ending with an inequality
-  let body = getExistentialBody fm
-  in if hasInequalityInConj body
-     then Just "Pattern: not(Ex... P & (i ≠ j)) can be rewritten as All... P => (i = j)"
-     else Nothing
-  where
-    getExistentialBody (Qua Ex _ b) = getExistentialBody b
-    getExistentialBody b = b
-
-    hasInequalityInConj (Conn And _ (Not (Ato (EqE _ _)))) = True
-    hasInequalityInConj (Conn And (Not (Ato (EqE _ _))) _) = True
-    hasInequalityInConj (Conn And p q) = hasInequalityInConj p || hasInequalityInConj q
-    hasInequalityInConj _ = False
-canRewriteNegatedRestriction _ = Nothing
-
 -- | Check if a formula has a simple negated action pattern that cannot be translated.
 -- Pattern: not(Ex x. Action(x)@i) - this cannot be rewritten to a positive form
 isSimpleNegatedAction :: LNFormula -> Bool
@@ -1435,7 +1403,7 @@ rewritePositiveWitnessExistsTrace fm = do
 
     containsAction =
       foldFormula
-        (\atom -> case atom of Action _ _ -> True; _ -> False)
+        (\case Action _ _ -> True; _ -> False)
         (const False)
         id
         (\_ p q -> p || q)
@@ -1455,7 +1423,7 @@ rewritePositiveWitnessExistsTrace fm = do
         (foldMap indicesInTerm)
         (const S.empty)
         id
-        (\_ -> S.union)
+        (const S.union)
         (\_ _ -> id)
 
     indicesInTerm term =
@@ -1609,7 +1577,7 @@ rewriteCompoundAllTraceFormula fm =
 
     containsAction =
       foldFormula
-        (\atom -> case atom of Action _ _ -> True; _ -> False)
+        (\case Action _ _ -> True; _ -> False)
         (const False)
         id
         (\_ left right -> left || right)
@@ -1705,7 +1673,7 @@ rewriteGuardedAllTraceFormula fm = do
                   || not (all isSupportedPositivePremise movedParts)
                   || not (formulaContainsAction (buildConjunction movedParts))
                   || null obligations
-                  || any (not . isSupportedObligation) obligations
+                  || not (all isSupportedObligation obligations)
                 then Nothing
                 else
                   Just $

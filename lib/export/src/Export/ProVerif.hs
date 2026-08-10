@@ -7,7 +7,8 @@
 --
 -- Translation from Sapic processes to ProVerif
 module Export.ProVerif
-  ( prettyProVerifTheory,
+  ( ProVerifOptions (..),
+    prettyProVerifTheory,
     loadQueries,
   )
 where
@@ -34,10 +35,6 @@ import Theory
 import Theory.Module
 import Theory.Tools.Wellformedness (formulaFacts)
 
--- ===========================================================================
--- SECTION 1: Module Header & Types
--- ===========================================================================
-
 -- | Classification for how a lemma should be translated
 data LemmaTranslationMode
   = AsQuery       -- ^ Regular lemma, translate as query
@@ -45,10 +42,15 @@ data LemmaTranslationMode
   | ExcludeLemma  -- ^ Don't translate at all
   deriving (Eq, Ord, Show)
 
--- ===========================================================================
--- Helper Functions for Formula Construction
--- ===========================================================================
-
+data ProVerifOptions = ProVerifOptions
+  { omitReuseLemmas :: Bool,
+    omitSourceLemmas :: Bool,
+    omitRestrictions :: Bool,
+    omitMultisetTranslation :: Bool,
+    omitPreciseActions :: Bool,
+    selectSpecificLemmas :: Bool
+  }
+  deriving (Eq, Ord, Show)
 
 proverifTemplate :: (Document d) => Bool -> [d] -> [d] -> d -> [d] -> [d] -> [d] -> [d] -> [d] -> [d] -> d
 proverifTemplate skipPrecise headers queries process macroproc ruleproc restrictions axioms lemmas comments =
@@ -67,16 +69,11 @@ proverifTemplate skipPrecise headers queries process macroproc ruleproc restrict
 
 prettyProVerifTheory ::
   ModuleType ->
-  Bool -> -- noReuseLemmas
-  Bool -> -- noSourceLemmas
-  Bool -> -- noRestrictions
-  Bool -> -- noMultiset
-  Bool -> -- noPrecise
-  Bool -> -- hasSpecificLemmas
+  ProVerifOptions ->
   (ProtoLemma LNFormula ProofSkeleton -> Bool) ->
   (OpenTheory, TypingEnvironment) ->
   IO (Either ExportError ExportResult)
-prettyProVerifTheory m noReuseLemmas noSourceLemmas noRestrictions noMultiset noPrecise hasSpecificLemmas lemSel (thy', typEnv) =
+prettyProVerifTheory m options lemSel (thy', typEnv) =
   captureExport diagnostics $ do
     headersTheory <- loadHeaders propertyEventTags tc thy typEnv -- load headers from theory
     let headersTranslation =
@@ -91,6 +88,12 @@ prettyProVerifTheory m noReuseLemmas noSourceLemmas noRestrictions noMultiset no
     let hd = attribHeaders tc headers
     pure $ proverifTemplate (skipPrecise tc) hd queries proc' macroproc ruleproc restrictions axioms lemmas comments
   where
+    noReuseLemmas = options.omitReuseLemmas
+    noSourceLemmas = options.omitSourceLemmas
+    noRestrictions = options.omitRestrictions
+    noMultiset = options.omitMultisetTranslation
+    noPrecise = options.omitPreciseActions
+    hasSpecificLemmas = options.selectSpecificLemmas
     thy = if noMultiset then thy' else multisetTheory thy'
 
     tc =
@@ -353,8 +356,6 @@ allocateCompletionEvent typeEnvironment thy =
              fact <- formulaFacts restriction._rstrFormula
            ]
 
--- Loader of the export functions
-------------------------------------------------------------------------------
 loadQueries :: Theory sig c b p TranslationElement -> [Doc]
 loadQueries thy =
   map (text . (._eText)) (lookupExportInfo "queries" thy)

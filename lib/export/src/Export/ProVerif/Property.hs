@@ -4,7 +4,10 @@
 -- Explicit semantic outcomes and prepared values for ProVerif properties.
 module Export.ProVerif.Property where
 
+import Control.Applicative ((<|>))
+import Control.Monad.Fresh (MonadFresh)
 import Control.Monad.Trans.PreciseFresh qualified as Precise
+import Data.Either (fromRight)
 import Data.List as List
 import Data.List.NonEmpty qualified as NE
 import Data.Map qualified as M
@@ -14,6 +17,7 @@ import Data.Set qualified as S
 import Data.Set qualified as Set
 import Export.ProVerif.Formula
 import Export.ProVerif.Instrumentation
+import Export.Types (translationInvariantFail)
 import Sapic.Typing
 import Theory
 import Theory.Tools.Wellformedness (formulaFacts)
@@ -96,7 +100,7 @@ prepareQueryProperty completionEvent typeEnvironment lemma
   | otherwise =
       PropertyEmitted
         PreparedQueryProperty
-          { preparedQueryFormulas = NE.fromList (map fst preparedCandidates),
+          { preparedQueryFormulas = preparedNonEmpty "query" (map fst preparedCandidates),
             preparedQueryRecombination = recombination,
             preparedQueryCompletionTriggers = completionTriggers
           }
@@ -244,7 +248,7 @@ prepareRestrictionProperty _typeEnvironment restriction
   | otherwise =
       PropertyEmitted
         PreparedRestrictionProperty
-          { preparedRestrictionFormulas = NE.fromList (map prepareCandidate candidates),
+          { preparedRestrictionFormulas = preparedNonEmpty "restriction" (map prepareCandidate candidates),
             preparedRestrictionWasRewritten = wasRewritten,
             preparedRestrictionApproximation = approximation
           }
@@ -278,7 +282,7 @@ prepareRestrictionProperty _typeEnvironment restriction
       | hasVariableCaptureInNestedImplication formulaWithDistinctTimepoints =
           Left "flattening a nested quantified implication would capture a variable"
       | otherwise = Right ([formulaWithDistinctTimepoints], False)
-    (rawCandidates, wasRewritten) = either (const ([], False)) id selectedCandidates
+    (rawCandidates, wasRewritten) = fromRight ([], False) selectedCandidates
     candidates = map (flattenNestedImplications . allImplExLessWoTmps) rawCandidates
     renderFailure =
       listToMaybe
@@ -301,8 +305,8 @@ prepareRestrictionProperty _typeEnvironment restriction
       let distinctBranches = List.nub branches
       if null prefix
           || length distinctBranches < 2
-          || any (not . isSupportedPositivePremise) distinctBranches
-          || any (not . formulaContainsAction) distinctBranches
+          || not (all isSupportedPositivePremise distinctBranches)
+          || not (all formulaContainsAction distinctBranches)
         then Nothing
         else
           Just
@@ -361,7 +365,7 @@ prepareAxiomProperty completionEvent _typeEnvironment lemma
   | otherwise =
       PropertyEmitted
         PreparedAxiomProperty
-          { preparedAxiomFormulas = NE.fromList (map prepareRenderedFormula renderedAxiomFormulas),
+          { preparedAxiomFormulas = preparedNonEmpty "axiom" (map prepareRenderedFormula renderedAxiomFormulas),
             preparedAxiomCompletionTriggers = completionTriggers,
             preparedAxiomApproximation = approximation
           }
@@ -400,9 +404,7 @@ prepareAxiomProperty completionEvent _typeEnvironment lemma
       let (left', leftApproximation) = rewriteTopLevelConjuncts left
           (right', rightApproximation) = rewriteTopLevelConjuncts right
        in ( Conn And left' right',
-            case leftApproximation of
-              Just message -> Just message
-              Nothing -> rightApproximation
+            leftApproximation <|> rightApproximation
           )
     rewriteTopLevelConjuncts formula = rewriteFormulaForAxiomWithDiagnostic formula
 
@@ -481,6 +483,20 @@ preparedFormulaRuleIdEvents :: PreparedFormula -> S.Set String
 preparedFormulaRuleIdEvents prepared =
   formulaRuleIdEventsWithOrigins prepared.preparedTimeOrigins prepared.preparedFormula
 
+supportsUniversalFormula :: MonadFresh m => Bool -> LNFormula -> m Bool
+supportsUniversalFormula _ body
+  | isQuantifierFree body = pure True
+supportsUniversalFormula _ (Conn Imp premise conclusion)
+  | isQuantifierFree premise = do
+      existentialDisjunction <- isExistentialDisjunction conclusion
+      if existentialDisjunction
+        then pure True
+        else isNestedImplicationOk conclusion
+supportsUniversalFormula True quantified@(Qua Ex _ _) = do
+  (_, _, body) <- openFormulaPrefix quantified
+  supportsUniversalFormula True body
+supportsUniversalFormula _ _ = pure False
+
 supportsQueryFormula :: LNFormula -> Bool
 supportsQueryFormula formula =
   Precise.evalFresh (go formula) (avoidPrecise formula)
@@ -492,27 +508,14 @@ supportsQueryFormula formula =
       pure (isQuantifierFree body)
     go (Not fm@(Qua All _ _)) = do
       (_, _, body) <- openFormulaPrefix fm
-      supportsUniversal body
+      supportsUniversalFormula True body
     go fm@(Qua Ex _ _) = do
       (_, _, body) <- openFormulaPrefix fm
       pure (isQuantifierFree body)
     go fm@(Qua All _ _) = do
       (_, _, body) <- openFormulaPrefix fm
-      supportsUniversal body
+      supportsUniversalFormula True body
     go _ = pure False
-
-    supportsUniversal body
-      | isQuantifierFree body = pure True
-    supportsUniversal (Conn Imp premise conclusion)
-      | isQuantifierFree premise = do
-          existentialDisjunction <- isExistentialDisjunction conclusion
-          if existentialDisjunction
-            then pure True
-            else isNestedImplicationOk conclusion
-    supportsUniversal fm@(Qua Ex _ _) = do
-      (_, _, body) <- openFormulaPrefix fm
-      supportsUniversal body
-    supportsUniversal _ = pure False
 
 supportsAssumptionFormula :: LNFormula -> Bool
 supportsAssumptionFormula formula
@@ -529,18 +532,8 @@ supportsAssumptionFormula formula
       pure (isQuantifierFree body)
     go fm@(Qua All _ _) = do
       (_, _, body) <- openFormulaPrefix fm
-      supportsUniversal body
+      supportsUniversalFormula False body
     go _ = pure False
-
-    supportsUniversal body
-      | isQuantifierFree body = pure True
-    supportsUniversal (Conn Imp premise conclusion)
-      | isQuantifierFree premise = do
-          existentialDisjunction <- isExistentialDisjunction conclusion
-          if existentialDisjunction
-            then pure True
-            else isNestedImplicationOk conclusion
-    supportsUniversal _ = pure False
 
 hasNestedImplicationInConclusion :: LNFormula -> Bool
 hasNestedImplicationInConclusion = check False
@@ -559,14 +552,7 @@ hasDistinctFact =
 requiresAxiomTimepoints :: LNFormula -> Bool
 requiresAxiomTimepoints formula = hasDistinctFact formula || conclusionHasTimeConstraint formula
   where
-    actionTimepoints =
-      foldFormula
-        (\case Action timepoint _ -> [timepoint]; _ -> [])
-        (const [])
-        id
-        (\_ left right -> left ++ right)
-        (\_ _ body -> body)
-        formula
+    actionTimepoints = formulaActionTimepoints formula
     conclusionHasTimeConstraint (Qua _ _ body) = conclusionHasTimeConstraint body
     conclusionHasTimeConstraint (Conn Imp _ conclusion) = hasTimeConstraint conclusion
     conclusionHasTimeConstraint body = hasTimeConstraint body
@@ -585,14 +571,7 @@ requiresAxiomTimepoints formula = hasDistinctFact formula || conclusionHasTimeCo
 hasUnsupportedPremiseTimeConstraint :: LNFormula -> Bool
 hasUnsupportedPremiseTimeConstraint formula = go False formula
   where
-    actionTimepoints =
-      foldFormula
-        (\case Action timepoint _ -> [timepoint]; _ -> [])
-        (const [])
-        id
-        (\_ left right -> left ++ right)
-        (\_ _ body -> body)
-        formula
+    actionTimepoints = formulaActionTimepoints formula
     hasConstraint = foldFormula atomConstraint (const False) id (\_ l r -> l || r) (\_ _ body -> body)
     atomConstraint (Less _ _) = True
     atomConstraint (EqE left _) = left `elem` actionTimepoints
@@ -604,6 +583,15 @@ hasUnsupportedPremiseTimeConstraint formula = go False formula
     go True _ = False
     go False (Ato atom) = atomConstraint atom
     go False _ = False
+
+formulaActionTimepoints :: LNFormula -> [VTerm Name (BVar LVar)]
+formulaActionTimepoints =
+  foldFormula
+    (\case Action timepoint _ -> [timepoint]; _ -> [])
+    (const [])
+    id
+    (\_ left right -> left ++ right)
+    (\_ _ body -> body)
 
 
 hasNegatedActionInFormula :: LNFormula -> Bool
@@ -646,3 +634,12 @@ hasTopLevelNegatedAction (Conn Imp _ concl) = hasNegatedEventInConclusion concl
     hasNegatedEventInConclusion (Conn Or p q) = hasNegatedEventInConclusion p || hasNegatedEventInConclusion q
     hasNegatedEventInConclusion _ = False
 hasTopLevelNegatedAction _ = False
+
+-- Property splitting always retains at least the unsplit source formula.
+-- Reaching the empty case therefore indicates an internal preparation bug,
+-- not unsupported user input.
+preparedNonEmpty :: String -> [a] -> NE.NonEmpty a
+preparedNonEmpty propertyKind =
+  fromMaybe
+    (translationInvariantFail ("property preparation invariant failed: emitted " ++ propertyKind ++ " has no formulas"))
+    . NE.nonEmpty

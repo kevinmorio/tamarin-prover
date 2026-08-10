@@ -7,7 +7,6 @@ import Data.Map qualified as M
 import Data.Set qualified as S
 import Export.Name
 import Export.ProVerif.Formula
-import Export.ProVerif.Rule (sanitizeSymbol)
 import Theory
 
 data InstrumentationPlan = InstrumentationPlan
@@ -88,16 +87,20 @@ guardSameActionConclusions completionEvent fm =
                     | occurrence@(origin, _, _, _) <- premiseOccurrences,
                       origin `S.member` demandingConclusionOrigins
                     ]
-                  firstPerOrigin =
+                  -- fromListWith receives the new value first, so this keeps
+                  -- the last premise occurrence for each origin. Any member
+                  -- is semantically sufficient because the split occurrences
+                  -- share one allocated rule identifier.
+                  lastPerOrigin =
                     M.elems $
                       M.fromListWith
-                        (\first _ -> first)
+                        const
                         [ (origin, occurrence)
                         | occurrence@(origin, _, _, _) <- sharedPremiseOccurrences
                         ]
                   completionActions =
                     [ Ato (Action timepoint completionFact)
-                    | (_, timepoint, _, _) <- firstPerOrigin
+                    | (_, timepoint, _, _) <- lastPerOrigin
                     ]
                   triggers =
                     S.fromList
@@ -375,22 +378,10 @@ makeTimeVarsDistinctWithOrigins fm =
         )
 
     allocateGenerated used candidate =
-      let generated
-            | candidate `S.notMember` used = candidate
-            | otherwise = freshSuffixedName candidate used
+      let generated = freshNameAvoiding "_" used candidate
        in (S.insert generated used, generated)
 
-    freshOrigin name usedOrigins
-      | name `S.notMember` usedOrigins = name
-      | otherwise = freshSuffixedName name usedOrigins
-
-    freshSuffixedName name used =
-      head
-        [ candidate
-        | i <- [(1 :: Integer) ..],
-          let candidate = name ++ "_" ++ show i,
-          candidate `S.notMember` used
-        ]
+    freshOrigin name usedOrigins = freshNameAvoiding "_" usedOrigins name
 
 -- | Find time variables (LSortNode quantifiers) that are used more than once
 -- Returns: Map from (variable name, quantifier depth) to occurrence count
@@ -498,14 +489,10 @@ splitTimeVars splitNames fm =
 
     splitAndReindexTimeVars _ _ _ seenCounts f = (f, seenCounts)
 
--- ===========================================================================
--- SECTION 10: Constraint Movement
--- ===========================================================================
-
 formulaUsesRuleIdEvents :: S.Set String -> ProtoFormula syn (a, LSort) c LVar -> Bool
 formulaUsesRuleIdEvents ruleIdEvents =
   foldFormula
-    ( \atom -> case atom of
+    ( \case
         Action _ (Fact tag _ _) -> factTagName tag `S.member` ruleIdEvents
         _ -> False
     )

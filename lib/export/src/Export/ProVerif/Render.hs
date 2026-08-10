@@ -9,6 +9,7 @@ import Data.List.NonEmpty qualified as NE
 import Data.Map qualified as M
 import Data.Maybe
 import Data.Set qualified as S
+import Export.Name (freshNameAvoiding)
 import Export.ProVerif.Formula
 import Export.ProVerif.Instrumentation
 import Export.ProVerif.Property
@@ -131,7 +132,7 @@ ppNAtom eventTimeMode ridNames ruleIdEvents te b =
 
 extractFree :: BVar p -> p
 extractFree (Free v) = v
-extractFree (Bound i) = translationFail $ "prettyFormula: illegal bound variable '" ++ show i ++ "'"
+extractFree (Bound i) = translationInvariantFail $ "prettyFormula: illegal bound variable '" ++ show i ++ "'"
 
 toLAt :: (Ord (f1 b), Ord (f1 (BVar b)), Functor f2, Functor f1) => f2 (Term (f1 (BVar b))) -> f2 (Term (f1 b))
 toLAt = fmap (mapLits (fmap extractFree))
@@ -251,6 +252,12 @@ ppTimeTypeVar te lvar =
     Nothing -> ppLVar lvar <> text ":bitstring"
     Just t -> ppLVar lvar <> text ":" <> text (ppType t)
 
+collectBinderHints :: LNFormula -> [(String, LSort)]
+collectBinderHints (Qua _ binderHint body) = binderHint : collectBinderHints body
+collectBinderHints (Not body) = collectBinderHints body
+collectBinderHints (Conn _ left right) = collectBinderHints left ++ collectBinderHints right
+collectBinderHints _ = []
+
 -- | Rename timepoint variables whose name collides with a term variable.
 -- Tamarin keeps term variables ('t') and timepoint variables ('#t') in
 -- separate namespaces, but a ProVerif query has a single namespace. The term
@@ -264,7 +271,7 @@ renameCollidingTimepoints fm extravs
   | M.null renaming = (renaming, fm, extravs)
   | otherwise = (renaming, renameFrees (renameHints fm), map renameVar extravs)
   where
-    hints = collectHints fm
+    hints = collectBinderHints fm
     freeVars = frees fm ++ extravs
     termNames =
       S.fromList $
@@ -279,13 +286,8 @@ renameCollidingTimepoints fm extravs
       M.fromList . snd $
         List.mapAccumL freshen usedNames (S.toList (termNames `S.intersection` nodeNames))
     freshen used n =
-      let n' = head [c | i <- [(1 :: Integer) ..], let c = n ++ show i, c `S.notMember` used]
+      let n' = freshNameAvoiding "" used n
        in (S.insert n' used, (n, n'))
-
-    collectHints (Qua _ h p) = h : collectHints p
-    collectHints (Not p) = collectHints p
-    collectHints (Conn _ p q) = collectHints p ++ collectHints q
-    collectHints _ = []
 
     renameHints (Qua q (n, s) p)
       | s == LSortNode, Just n' <- M.lookup n renaming = Qua q (n', s) (renameHints p)
@@ -328,11 +330,7 @@ renameConjunctiveDuplicateBinders fm extravs = snd (go True M.empty st0 fm)
         `S.union` S.fromList (map printedName (frees fm ++ extravs))
     printedName (LVar n _ 0) = n
     printedName (LVar n _ i) = n ++ "_" ++ show i
-    hints = collectHints fm
-    collectHints (Qua _ h p) = h : collectHints p
-    collectHints (Not p) = collectHints p
-    collectHints (Conn _ p q) = collectHints p ++ collectHints q
-    collectHints _ = []
+    hints = collectBinderHints fm
 
     -- A positive disjunction separates its branches; under negation the roles
     -- of conjunction and disjunction swap. Implication premises count as
@@ -372,7 +370,7 @@ renameConjunctiveDuplicateBinders fm extravs = snd (go True M.empty st0 fm)
     -- 'n_i' matches how the freshness machinery would have printed a
     -- disambiguated duplicate, keeping the output stable for formulas it
     -- already handled (nested duplicates).
-    freshName n used = head [c | i <- [(1 :: Integer) ..], let c = n ++ "_" ++ show i, c `S.notMember` used]
+    freshName name used = freshNameAvoiding "_" used name
 
 ppFormulaEx :: DeclarationMode -> M.Map String String -> S.Set String -> TypingEnvironment -> LNFormula -> [LVar] -> String -> Doc
 ppFormulaEx mode originalRuleIdNames ruleIdEvents typeEnvironment originalFormula originalVariables attributes =
@@ -405,7 +403,7 @@ renderPreparedQuery ridNames ruleIdEvents typeEnvironment prepared attributes =
     go quantified@(Qua Ex _ _) = openAndRender quantified
     go (Not quantified@(Qua All _ _)) = pure (renderFormula quantified [])
     go quantified@(Qua All _ _) = pure (renderFormula quantified [])
-    go _ = translationFail "prepared query violated the supported-fragment invariant"
+    go _ = translationInvariantFail "prepared query violated the supported-fragment invariant"
 
 ppLemma :: String -> S.Set String -> TypingEnvironment -> Lemma ProofSkeleton -> PropertyOutcome PreparedQueryProperty -> Doc
 ppLemma _completionEvent _ruleIdEvents _te p (PropertyOmitted reason) =
@@ -452,12 +450,6 @@ ppLemma _completionEvent ruleIdEvents te p (PropertyEmitted prepared) =
       Just DisjoinQueryResults ->
         text "(* To reconstruct lemma " <> text p._lName <> text ", combine the query results with ∨. *)"
 
--- ===========================================================================
--- SECTION 7b: Formula Shape Classification
--- ===========================================================================
-
--- | Resolve a timepoint term to its variable name if it is a node-sorted
-
 renderPreparedAssumption ::
   PVElement ->
   S.Set String ->
@@ -482,7 +474,7 @@ renderPreparedAssumption element ruleIdEvents typeEnvironment prepared attribute
       (variables, _, body) <- openFormulaPrefix quantified
       pure (renderFormula body variables)
     go quantified@(Qua All _ _) = pure (renderFormula quantified [])
-    go _ = translationFail "prepared assumption violated the supported-fragment invariant"
+    go _ = translationInvariantFail "prepared assumption violated the supported-fragment invariant"
 ppAxiomLemma :: String -> S.Set String -> TypingEnvironment -> Lemma ProofSkeleton -> PropertyOutcome PreparedAxiomProperty -> Doc
 ppAxiomLemma _completionEvent _ruleIdEvents _te l (PropertyOmitted reason) =
       text "(*"
@@ -531,6 +523,3 @@ ppRestr ruleIdEvents typeEnvironment restriction (PropertyEmitted prepared) =
       | otherwise = emptyDoc
     renderFormula preparedFormulaPlan =
       renderPreparedAssumption R ruleIdEvents typeEnvironment preparedFormulaPlan ""
-
--- | Printer for reuse/src lemmas as ProVerif axioms.
--- | Different than ppLemma in that it ignores timepoints and does transformations custom to these lemmas.
