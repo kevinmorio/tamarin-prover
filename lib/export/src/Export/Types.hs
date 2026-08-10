@@ -7,9 +7,12 @@ module Export.Types
     ExportDiagnostic (..),
     ExportError (..),
     ExportResult (..),
+    ExportException (..),
+    translationFail,
   )
 where
 
+import Control.Exception qualified as Exception
 import Data.Sequence (Seq)
 import Text.PrettyPrint.Class (Doc)
 
@@ -54,3 +57,10 @@ data ExportResult = ExportResult
     exportDiagnostics :: Seq ExportDiagnostic
   }
 
+newtype ExportException = ExportException String
+  deriving (Show)
+
+instance Exception.Exception ExportException
+
+translationFail :: String -> a
+translationFail = Exception.throw . ExportException

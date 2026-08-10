@@ -16,8 +16,6 @@ module Export.ProVerif
     collectBuiltinDiagnostics,
     collectTypingDiagnostics,
     loadHeaders,
-    filterHeaders,
-    checkDuplicates',
     attribHeaders,
     stateHeaders,
     loadQueries,
@@ -39,7 +37,6 @@ import Data.Map qualified as M
 import Data.Maybe
 import Data.Sequence qualified as Seq
 import Data.Set qualified as S
-import Extension.Data.Label qualified as L
 import Export.Name
 import Export.ProVerif.Formula
 import Export.ProVerif.Header
@@ -71,14 +68,6 @@ data LemmaTranslationMode
   = AsQuery       -- ^ Regular lemma, translate as query
   | AsAxiom       -- ^ Reuse/source lemma, translate as axiom
   | ExcludeLemma  -- ^ Don't translate at all
-  deriving (Eq, Ord, Show)
-
--- | How the evaluation harness reconstructs a Tamarin lemma result from the
--- generated ProVerif query result. This is query metadata: it must not be
--- inferred later from the rendered query's superficial syntax.
-data QueryPolarity
-  = DirectResult
-  | InvertResult
   deriving (Eq, Ord, Show)
 
 -- ===========================================================================
@@ -369,17 +358,6 @@ isNestedImplicationOk (Conn Imp q r) | isQuantifierFree q = do
         else isNestedImplicationOk r
 isNestedImplicationOk _ = pure False
 
-newtype ExportException = ExportException String
-  deriving (Show)
-
-instance Exception.Exception ExportException
-
--- | Abort pure rendering. The public entry points force and catch this
--- exception before returning an 'ExportResult', so callers never receive a
--- partial target model.
-translationFail :: String -> a
-translationFail = Exception.throw . ExportException
-
 captureExport :: Seq.Seq ExportDiagnostic -> IO Doc -> IO (Either ExportError ExportResult)
 captureExport diagnostics renderDocument = do
   rendered <- Exception.try renderDocument :: IO (Either Exception.SomeException Doc)
@@ -467,69 +445,71 @@ prettyProVerifTheory m noReuseLemmas noSourceLemmas noRestrictions noMultiset no
       | lemma <- theoryLemmas thy,
         classifyLemma hasSpecificLemmas tc lemSel lemma == AsQuery
       ]
-    propertyAnalysisFormula lemma =
-      let simplified = simplifyFormula lemma._lFormula
-          dualized
-            | lemma._lTraceQuantifier == ExistsTrace =
-                rewritePositiveWitnessExistsTrace simplified
-            | otherwise = Nothing
-          normalized
-            | lemma._lTraceQuantifier == AllTraces =
-                normalizeAllTraceFormula simplified
-            | otherwise = Nothing
-          formula =
-            fromMaybe
-              (fromMaybe simplified normalized)
-              dualized
-       in if isJust normalized
-            then
-              mapTopLevelConjunctsFormula
-                (rewriteFormulaForQuery lemma._lTraceQuantifier)
-                formula
-            else rewriteFormulaForQuery lemma._lTraceQuantifier formula
-    propertyBaseFormula lemma =
-      let simplified = simplifyFormula lemma._lFormula
-       in if lemma._lTraceQuantifier == AllTraces
-            then fromMaybe simplified (normalizeAllTraceFormula simplified)
-            else simplified
+    unannotatedQueryPlans =
+      [ (lemma._lName, prepareQueryProperty completionEvent typEnv lemma)
+      | lemma <- selectedQueryLemmas
+      ]
+    emittedQueryPlans =
+      [ prepared
+      | (_, PropertyEmitted prepared) <- unannotatedQueryPlans
+      ]
     selectedAxiomLemmas =
       [ lemma
       | lemma <- theoryLemmas thy,
         classifyLemma hasSpecificLemmas tc lemSel lemma == AsAxiom
       ]
-    preparedAxiomPlans =
-      [ (lemma._lName, prepareAxiomProperty completionEvent lemma)
+    unannotatedAxiomPlans =
+      [ (lemma._lName, prepareAxiomProperty completionEvent typEnv lemma)
       | lemma <- selectedAxiomLemmas
       ]
     emittedAxiomPlans =
       [ prepared
-      | (_, PropertyEmitted prepared) <- preparedAxiomPlans
+      | (_, PropertyEmitted prepared) <- unannotatedAxiomPlans
+      ]
+    unannotatedRestrictionPlans
+      | skipRestrictions tc = []
+      | otherwise =
+          [ (restriction._rstrName, prepareRestrictionProperty typEnv restriction)
+          | restriction <- theoryRestrictions thy
+          ]
+    emittedRestrictionPlans =
+      [ prepared
+      | (_, PropertyEmitted prepared) <- unannotatedRestrictionPlans
       ]
     lemmaSharedEvents =
       S.unions
-        ( [ eventsRequiringRuleIds lemma._lFormula
-              `S.union` eventsRequiringRuleIds (propertyBaseFormula lemma)
-              `S.union` translatedTemporalEqualityEvents lemma
-          | lemma <- selectedQueryLemmas
+        ( [ preparedFormulaRuleIdEvents queryFormula.preparedQueryBody
+          | prepared <- emittedQueryPlans,
+            queryFormula <- prepared.preparedQueryFormulas
           ]
             ++ concatMap
-              (map eventsRequiringRuleIds . preparedAxiomBeforeCompletion)
+              (map preparedFormulaRuleIdEvents . preparedAxiomFormulas)
               emittedAxiomPlans
         )
-    translatedTemporalEqualityEvents lemma =
-      let rewritten = propertyAnalysisFormula lemma
-       in if countQuantifierAlternations rewritten <= 1
-            then temporalEqualityLinkedEventsByBinder rewritten
-            else S.empty
     completionTriggerEvents =
       S.unions
-        ( [ completionTriggersForFormula completionEvent (propertyAnalysisFormula lemma)
-          | lemma <- selectedQueryLemmas
-          ]
+        ( map preparedQueryCompletionTriggers emittedQueryPlans
             ++ map preparedAxiomCompletionTriggers emittedAxiomPlans
         )
-    restrictionSharedEvents = detectSharedTimepointEventsRestrictions (theoryRestrictions thy)
+    restrictionSharedEvents =
+      S.unions
+        [ preparedFormulaRuleIdEvents restrictionFormula
+        | prepared <- emittedRestrictionPlans,
+          restrictionFormula <- prepared.preparedRestrictionFormulas
+        ]
     sharedEventTags = lemmaSharedEvents `S.union` restrictionSharedEvents
+    preparedQueryPlans =
+      [ (name, mapPropertyOutcome (annotateQueryProperty sharedEventTags) outcome)
+      | (name, outcome) <- unannotatedQueryPlans
+      ]
+    preparedAxiomPlans =
+      [ (name, mapPropertyOutcome (annotateAxiomProperty sharedEventTags) outcome)
+      | (name, outcome) <- unannotatedAxiomPlans
+      ]
+    preparedRestrictionPlans =
+      [ (name, mapPropertyOutcome (annotateRestrictionProperty sharedEventTags) outcome)
+      | (name, outcome) <- unannotatedRestrictionPlans
+      ]
     instrumentationPlan =
       InstrumentationPlan
         { instrumentationCompletionEvent = completionEvent,
@@ -540,10 +520,10 @@ prettyProVerifTheory m noReuseLemmas noSourceLemmas noRestrictions noMultiset no
     (restrictions, restrictionHeaders) =
       if skipRestrictions tc
         then ([], S.empty)
-        else loadRestrictions sharedEventTags tc typEnv thy
+        else loadRestrictions sharedEventTags typEnv preparedRestrictionPlans thy
     queries = loadQueries thy
     (axioms, lemmas, lemmaHeaders) =
-      loadLemmas completionEvent preparedAxiomPlans propertyEventTags hasSpecificLemmas lemSel tc typEnv thy
+      loadLemmas completionEvent preparedQueryPlans preparedAxiomPlans propertyEventTags hasSpecificLemmas lemSel tc typEnv thy
     (ruleproc, ruleComb, ruleHeaders) =
       loadRules
         instrumentationPlan.instrumentationCompletionEvent
@@ -556,7 +536,7 @@ prettyProVerifTheory m noReuseLemmas noSourceLemmas noRestrictions noMultiset no
       if hasBoundState then ([text ""], S.empty) else loadMacroProc tc thy
     comments = [text "(*" $$ text bd $$ text "*)" | (_, bd) <- theoryFormalComments thy]
     diagnostics =
-      collectProVerifDiagnostics hasSpecificLemmas lemSel tc preparedAxiomPlans thy
+      collectProVerifDiagnostics hasSpecificLemmas lemSel tc preparedQueryPlans preparedAxiomPlans preparedRestrictionPlans thy
         <> collectTypingDiagnostics typEnv
 
 stateHeaders :: S.Set ProVerifHeader
@@ -575,10 +555,12 @@ collectProVerifDiagnostics ::
   Bool ->
   (ProtoLemma LNFormula ProofSkeleton -> Bool) ->
   TranslationContext ->
+  [(String, PropertyOutcome PreparedQueryProperty)] ->
   [(String, PropertyOutcome PreparedAxiomProperty)] ->
+  [(String, PropertyOutcome PreparedRestrictionProperty)] ->
   OpenTheory ->
   Seq.Seq ExportDiagnostic
-collectProVerifDiagnostics hasSpecificLemmas lemSel tc preparedAxiomPlans thy =
+collectProVerifDiagnostics hasSpecificLemmas lemSel tc preparedQueryPlans preparedAxiomPlans preparedRestrictionPlans thy =
   collectBuiltinDiagnostics thy
     <> Seq.fromList (lemmaDiagnostics ++ restrictionDiagnostics)
   where
@@ -588,9 +570,8 @@ collectProVerifDiagnostics hasSpecificLemmas lemSel tc preparedAxiomPlans thy =
       ]
     lemmaDiagnostics = concatMap diagnosticForLemma classified
     diagnosticForLemma (lemma, AsQuery) =
-      case queryKnowledgeFragmentFailure lemma._lTraceQuantifier lemma._lFormula of
-        Nothing -> []
-        Just reason ->
+      case lookup lemma._lName preparedQueryPlans of
+        Just (PropertyOmitted reason) ->
           [ ExportDiagnostic
               "PV-GOAL-OMITTED"
               DiagnosticWarning
@@ -598,6 +579,33 @@ collectProVerifDiagnostics hasSpecificLemmas lemSel tc preparedAxiomPlans thy =
               (LemmaSubject lemma._lName)
               ("produced no ProVerif query: " ++ reason)
           ]
+        Just (PropertyEmitted prepared) ->
+          splitNotice prepared ++ polarityNotice prepared
+        _ -> []
+      where
+        splitNotice prepared = case prepared.preparedQueryRecombination of
+          Nothing -> []
+          Just _ ->
+            [ ExportDiagnostic
+                "PV-GOAL-SPLIT"
+                DiagnosticNotice
+                Informational
+                (LemmaSubject lemma._lName)
+                ( "was emitted as "
+                    ++ show (length prepared.preparedQueryFormulas)
+                    ++ " queries; follow the adjacent reconstruction instruction"
+                )
+            ]
+        polarityNotice prepared
+          | any ((== InvertResult) . preparedQueryPolarity) prepared.preparedQueryFormulas =
+              [ ExportDiagnostic
+                  "PV-GOAL-INVERTED"
+                  DiagnosticNotice
+                  Informational
+                  (LemmaSubject lemma._lName)
+                  "contains an inverted query result; follow the adjacent interpretation instruction"
+              ]
+          | otherwise = []
     diagnosticForLemma (lemma, AsAxiom) =
       case lookup lemma._lName preparedAxiomPlans of
         Just (PropertyOmitted reason) ->
@@ -625,8 +633,8 @@ collectProVerifDiagnostics hasSpecificLemmas lemSel tc preparedAxiomPlans thy =
       | skipRestrictions tc = []
       | otherwise = mapMaybe diagnosticForRestriction (theoryRestrictions thy)
     diagnosticForRestriction restriction =
-      case assumptionKnowledgeFragmentFailure restriction._rstrFormula of
-        Just reason ->
+      case lookup restriction._rstrName preparedRestrictionPlans of
+        Just (PropertyOmitted reason) ->
           Just
             ( ExportDiagnostic
                 "PV-RESTRICTION-OMITTED"
@@ -635,27 +643,14 @@ collectProVerifDiagnostics hasSpecificLemmas lemSel tc preparedAxiomPlans thy =
                 (RestrictionSubject restriction._rstrName)
                 ("was not emitted: " ++ reason)
             )
-        Nothing ->
+        Just (PropertyEmitted prepared) ->
           ExportDiagnostic
             "PV-RESTRICTION-APPROXIMATED"
             DiagnosticWarning
             ChangedAssumptions
             (RestrictionSubject restriction._rstrName)
-            <$> restrictionApproximation restriction._rstrFormula
-    restrictionApproximation formula =
-      case pullNegationsToTop beforePull of
-        Left _ -> Just "negations could only be partially normalized; the emitted restriction is an approximation"
-        Right _ -> Nothing
-      where
-        beforePull =
-          simplifyFormula
-            . flattenNestedImplications
-            . expandNegatedTimepointComparisons
-            . moveNegatedActionsToConclusion
-            . moveConstraintsToConclusion
-            . eliminateTemporalEqualities
-            . simplifyFormula
-            $ formula
+            <$> prepared.preparedRestrictionApproximation
+        _ -> Nothing
 
 collectBuiltinDiagnostics :: OpenTheory -> Seq.Seq ExportDiagnostic
 collectBuiltinDiagnostics thy =
@@ -756,24 +751,6 @@ builtins name =
   NotSupportedBuiltin
     ("Builtin `" ++ name ++ "` is not supported by this export backend.")
 
--- We filter out some predefined headers that we don't want to redefine.
-filterHeaders :: S.Set ProVerifHeader -> S.Set ProVerifHeader
-filterHeaders = S.filter (not . isForbidden)
-  where
-    isForbidden (Fun "fun" "true" _ _ _) = True
-    isForbidden (Type "bitstring") = True
-    isForbidden (Type "channel") = True
-    isForbidden (Type "nat") = True
-    isForbidden _ = False
-
--- | Extract the “name” of any header that should be unique.
-getProVerifHeaderIdentifier :: ProVerifHeader -> Maybe String
-getProVerifHeaderIdentifier (Fun _ n _ _ _) = Just n
-getProVerifHeaderIdentifier (Sym _ n _ _) = Just n
-getProVerifHeaderIdentifier (HEvent n _) = Just n
-getProVerifHeaderIdentifier (Table n _) = Just n
-getProVerifHeaderIdentifier _ = Nothing
-
 allocateCompletionEvent :: TypingEnvironment -> OpenTheory -> String
 allocateCompletionEvent typeEnvironment thy =
   case targetEventText allocatedTarget of
@@ -812,35 +789,6 @@ allocateCompletionEvent typeEnvironment thy =
            | restriction <- theoryRestrictions thy,
              fact <- formulaFacts restriction._rstrFormula
            ]
-
--- | Fail if any identifier occurs more than once; otherwise return all headers
-checkDuplicates :: (MonadFail m) => [ProVerifHeader] -> m [ProVerifHeader]
-checkDuplicates headers = do
-  let identMap :: M.Map String [ProVerifHeader]
-      identMap =
-        M.fromListWith
-          (<>)
-          [ (n, [h])
-            | h <- headers,
-              Just n <- [getProVerifHeaderIdentifier h]
-          ]
-      conflicts = M.toList $ M.filter ((> 1) . length) identMap
-
-  -- if there are conflicts, bail; otherwise return the whole input
-  unless (null conflicts) $
-    fail $
-      unlines
-        ( "ProVerif constructs (functions, constants, events, tables) must be distinct.\
-          \ Please rename these duplicates:"
-            : [ intercalate ", " (map show defs)
-                | (_, defs) <- conflicts
-              ]
-        )
-
-  return headers
-
-checkDuplicates' :: S.Set ProVerifHeader -> IO [ProVerifHeader]
-checkDuplicates' = checkDuplicates . S.toList
 
 ppPubName :: NameId -> Doc
 ppPubName (NameId n) = text $ case n of
@@ -1706,7 +1654,7 @@ ppQueryFormula ::
   ProtoFormula Unit2 (String, LSort) Name LVar ->
   [LVar] ->
   String ->
-  m Doc
+  m (Doc, Bool)
 ppQueryFormula ridNames ruleIdEvents te fm extravs attrs = do
   (vs, (p, typeVars)) <- renderQuery fm
   -- The shared "rid" variable is needed for rule-id instrumented events
@@ -1727,8 +1675,11 @@ ppQueryFormula ridNames ruleIdEvents te fm extravs attrs = do
   let timepointVarsWithCollision = [n | LVar n LSortNode _ <- allVarsList, S.member n termVarNames]
   -- If there's a collision, we can't translate this query
   if not (null timepointVarsWithCollision)
-    then pure $ text "(* Variable name collision: '" <> text (head timepointVarsWithCollision) <>
-                text "' is used both as term and timepoint. Please rename one in the Tamarin source. *)"
+    then pure
+      ( text "(* Variable name collision: '" <> text (head timepointVarsWithCollision)
+          <> text "' is used both as term and timepoint. Please rename one in the Tamarin source. *)",
+        False
+      )
     else do
       let allVars = map (ppTimeTypeVar typeVars) allVarsList
       let quantifiedVars =
@@ -1738,11 +1689,13 @@ ppQueryFormula ridNames ruleIdEvents te fm extravs attrs = do
               [] -> text "query;"
               _ -> text "query " <> fsep (punctuate comma quantifiedVars) <> text ";"
       let attrsDoc = if null attrs then text "" else text attrs
-      pure $
-        sep
-          [ queryLine,
-            nest 1 p <> attrsDoc <> text "."
-          ]
+      pure
+        ( sep
+            [ queryLine,
+              nest 1 p <> attrsDoc <> text "."
+            ],
+          True
+        )
   where
     -- ProVerif has no 'true' query premise. In queries only, attacker(())
     -- supplies an always-true premise accepted by the evaluation build.
@@ -1891,7 +1844,7 @@ renameConjunctiveDuplicateBinders fm extravs = snd (go True M.empty st0 fm)
     -- already handled (nested duplicates).
     freshName n used = head [c | i <- [(1 :: Integer) ..], let c = n ++ "_" ++ show i, c `S.notMember` used]
 
-ppQueryFormulaEx :: M.Map String String -> S.Set String -> TypingEnvironment -> LNFormula -> [LVar] -> String -> Doc
+ppQueryFormulaEx :: M.Map String String -> S.Set String -> TypingEnvironment -> LNFormula -> [LVar] -> String -> (Doc, Bool)
 ppQueryFormulaEx ridNames0 ruleIdEvents te fm0 vs0 attrs =
   Precise.evalFresh (ppQueryFormula ridNames ruleIdEvents te fm vs attrs) (avoidPrecise fm)
   where
@@ -1919,7 +1872,7 @@ ppRestrictFormula ridNames ruleIdEvents te frm attrs =
       (vs, _, fm') <- openFormulaPrefix fm
       pure
         ( if isQuantifierFree fm'
-            then (ppOk fm' vs, True)
+            then ppOk fm' vs
             else (ppFail (Just "lemma is not quantifier-free") fm, False)
         )
     -- Handle Not(All...) - translate the inner All formula and mark as having leading negation
@@ -1931,7 +1884,7 @@ ppRestrictFormula ridNames ruleIdEvents te frm attrs =
       (vs, _, fm') <- openFormulaPrefix fm
       pure
         ( if isQuantifierFree fm'
-            then (ppOk fm' vs, True)
+            then ppOk fm' vs
             else (ppFail (Just "lemma is not quantifier-free") fm, False)
         )
     renderFormula fm@(Qua All _ _) = do
@@ -1942,18 +1895,18 @@ ppRestrictFormula ridNames ruleIdEvents te frm attrs =
     ppFail Nothing fm = text "(* Lemma outside of logic fragment *)" $$ text "(*" <> prettyLNFormula fm <> text "*)"
     ppFail (Just reason) fm = text "(*" <> text reason <> text "*)" $$ text "(*" <> prettyLNFormula fm <> text "*)"
 
-    handleUniversalFormula fm_original fm | isQuantifierFree fm = pure (ppOk fm_original [], True)
+    handleUniversalFormula fm_original fm | isQuantifierFree fm = pure (ppOk fm_original [])
     handleUniversalFormula fm_original (Conn Imp p fm) | isQuantifierFree p = do
       isExDisj <- isExistentialDisjunction fm
       if isExDisj
-        then pure (ppOk fm_original [], True)
+        then pure (ppOk fm_original [])
         else do
           -- Try handling nested implications/universals
           -- Pattern: P => (All x. Q => R) is equivalent to P & Q => R (with x bound)
           isNestedOk <- isNestedImplicationOk fm
           pure $
             if isNestedOk
-              then (ppOk fm_original [], True)
+              then ppOk fm_original []
               else (ppFail (Just "conclusion is not an existential disjunction") fm_original, False)
     -- Handle Ex... (P => Q) case - existentials wrapping an implication
     -- This arises from transforming not(Ex... P & not(Ex... Q))
@@ -1977,234 +1930,207 @@ ppRestrictFormula ridNames ruleIdEvents te frm attrs =
 -- 2. Split shared timepoints if needed
 -- 3. Split top-level connectives (AND for all-traces, OR for exists-trace)
 -- 4. Apply final transformations and print each subformula
-ppLemma :: String -> S.Set String -> TypingEnvironment -> Lemma ProofSkeleton -> Doc
-ppLemma _completionEvent _ruleIdEvents _te p
-  | Just reason <- queryKnowledgeFragmentFailure p._lTraceQuantifier p._lFormula =
-      text "(*" <> text p._lName <> text "*)"
-        $$ text ("(* Lemma translation failed: " ++ reason ++ ". *)")
-        $$ text "(*" <> prettyLNFormula p._lFormula <> text "*)"
-        $$ text ""
-ppLemma completionEvent ruleIdEvents te p =
-  let subformulas = vcat (intersperse (text "") (zipWith (curry renderSubformula) fms queryPolarities))
-  in if isEmpty comments
-     then subformulas $$ text ""
-     else subformulas $$ text "" $$ reconstructionComment
+prepareQueryProperty :: String -> TypingEnvironment -> Lemma ProofSkeleton -> PropertyOutcome PreparedQueryProperty
+prepareQueryProperty completionEvent typeEnvironment lemma
+  | Just reason <- queryKnowledgeFragmentFailure lemma._lTraceQuantifier lemma._lFormula =
+      PropertyOmitted reason
+  | Just reason <- listToMaybe [reason | (_, Just reason) <- preparedCandidates] =
+      PropertyOmitted reason
+  | otherwise =
+      PropertyEmitted
+        PreparedQueryProperty
+          { preparedQueryFormulas = map fst preparedCandidates,
+            preparedQueryRecombination = recombination,
+            preparedQueryCompletionTriggers = completionTriggers
+          }
   where
-    simplifiedFormula = simplifyFormula p._lFormula
+    simplifiedFormula = simplifyFormula lemma._lFormula
+    standardRewrittenFormula = rewriteFormulaForQuery lemma._lTraceQuantifier simplifiedFormula
+    standardNeedsRuleId = formulaHasSharedTimepoints standardRewrittenFormula
+    standardFormulaForProcessing
+      | standardNeedsRuleId = makeTimeVarsDistinct standardRewrittenFormula
+      | otherwise = standardRewrittenFormula
+    (standardFormulas, _, _) =
+      splitTopLvlConns lemma._lTraceQuantifier 1 standardFormulaForProcessing
+    standardTranslationRejected =
+      not (null standardFormulas)
+        && all standardSubformulaRejected standardFormulas
+    standardSubformulaRejected formula =
+      let (transformed, _) = transformQueryFormula lemma DirectResult formula
+          (formulaToRender, _) = queryFormulaToTranslate lemma transformed
+       in isJust (queryFormulaFailure typeEnvironment formulaToRender)
     positiveWitnessDualization
-      | p._lTraceQuantifier == ExistsTrace,
-        standardTranslationRejected =
-          rewritePositiveWitnessExistsTrace simplifiedFormula
+      | lemma._lTraceQuantifier == ExistsTrace,
+        standardTranslationRejected = rewritePositiveWitnessExistsTrace simplifiedFormula
       | otherwise = Nothing
     allTraceNormalization
-      | p._lTraceQuantifier == AllTraces,
-        standardTranslationRejected =
-          normalizeAllTraceFormula simplifiedFormula
+      | lemma._lTraceQuantifier == AllTraces,
+        standardTranslationRejected = normalizeAllTraceFormula simplifiedFormula
       | otherwise = Nothing
-    -- This dualization is a fallback, not an alternative rendering for
-    -- formulas the exporter already supports. Preserve every established
-    -- translation byte-for-byte by enabling it only when all subformulas in
-    -- the standard pipeline would be rejected.
-    standardTranslationRejected =
-      not (null standardQueryPlans)
-        && all (not . standardSubformulaSucceeds . fst) standardQueryPlans
-    standardRewrittenFormula =
-      rewriteFormulaForQuery p._lTraceQuantifier simplifiedFormula
-    standardNeedsRuleId =
-      formulaHasSharedTimepoints standardRewrittenFormula
-    standardFormulaForProcessing =
-      if standardNeedsRuleId
-        then makeTimeVarsDistinct standardRewrittenFormula
-        else standardRewrittenFormula
-    (standardFms, _, _) =
-      splitTopLvlConns p._lTraceQuantifier 1 standardFormulaForProcessing
-    standardQueryPlans = map (transformFm DirectResult) standardFms
-    standardSubformulaSucceeds fm =
-      let (fmToTranslate, _) = formulaToTranslate fm
-       in countQuantifierAlternations fmToTranslate <= 1
-            && not (hasNegatedActionInFormula fmToTranslate)
-            && snd (renderFormula standardNeedsRuleId fmToTranslate)
     formulaBeforeRewrites =
       fromMaybe
         (fromMaybe simplifiedFormula allTraceNormalization)
         positiveWitnessDualization
-    initialQueryPolarity =
-      case positiveWitnessDualization of
-        Just _ -> InvertResult
-        Nothing -> DirectResult
-    -- Apply rewriting transformations FIRST before time splitting
-    -- This ensures De Bruijn indices remain correct when quantifiers are moved
-    rewrittenFormulaBeforeCompletion
+    initialPolarity
+      | isJust positiveWitnessDualization = InvertResult
+      | otherwise = DirectResult
+    rewrittenBeforeCompletion
       | isJust allTraceNormalization =
           mapTopLevelConjunctsFormula
-            (rewriteFormulaForQuery p._lTraceQuantifier)
+            (rewriteFormulaForQuery lemma._lTraceQuantifier)
             formulaBeforeRewrites
-      | otherwise =
-          rewriteFormulaForQuery p._lTraceQuantifier formulaBeforeRewrites
-    -- ProVerif emits the action facts of one Tamarin rule sequentially.  If a
-    -- final correspondence observes a fact from the premise's Tamarin action
-    -- in its conclusion, delay the trigger until the generic completion event
-    -- for that rule instance has occurred.
-    (rewrittenFormula, _) =
-      guardSameActionConclusions completionEvent rewrittenFormulaBeforeCompletion
-    needsRuleId = formulaHasSharedTimepoints rewrittenFormula
-    hadTimepointSplit = needsRuleId
-    (formulaForProcessing, splitTimeOrigins) =
-      if needsRuleId
-        then makeTimeVarsDistinctWithOrigins rewrittenFormula
-        else (rewrittenFormula, M.empty)
-    queryPlans = map (transformFm initialQueryPolarity) fms'
-    fms = map fst queryPlans
-    queryPolarities = map snd queryPlans
+      | otherwise = rewriteFormulaForQuery lemma._lTraceQuantifier formulaBeforeRewrites
+    (guardedFormula, completionTriggers) =
+      guardSameActionConclusions completionEvent rewrittenBeforeCompletion
+    needsRuleId = formulaHasSharedTimepoints guardedFormula
+    (formulaForProcessing, splitTimeOrigins)
+      | needsRuleId = makeTimeVarsDistinctWithOrigins guardedFormula
+      | otherwise = (guardedFormula, M.empty)
+    (splitFormulas, _, _) =
+      splitTopLvlConns lemma._lTraceQuantifier 1 formulaForProcessing
+    preparedCandidates = map prepareCandidate splitFormulas
+    prepareCandidate formula =
+      ( PreparedQueryFormula
+          { preparedQueryBody =
+              PreparedFormula
+                { preparedFormula = formulaToRender,
+                  preparedTimeOrigins = splitTimeOrigins,
+                  preparedHadTimepointSplit = needsRuleId,
+                  preparedRuleIdNames = M.empty
+                },
+            preparedQueryPolarity = finalPolarity,
+            preparedQueryUseOriginRuleIds = initialPolarity == InvertResult
+          },
+        queryFormulaFailure typeEnvironment formulaToRender
+      )
+      where
+        (transformed, transformedPolarity) =
+          transformQueryFormula lemma initialPolarity formula
+        (formulaToRender, isExistentialNegation) =
+          queryFormulaToTranslate lemma transformed
+        finalPolarity
+          | isExistentialNegation = InvertResult
+          | otherwise = transformedPolarity
+    recombination
+      | length preparedCandidates < 2 = Nothing
+      | lemma._lTraceQuantifier == AllTraces = Just ConjoinQueryResults
+      | otherwise = Just DisjoinQueryResults
 
-    -- Rule-id instrumented events get per-occurrence rule-id variables, and
-    -- temporal equalities that survive rewriting are translated as rule-id
-    -- equalities.
-    renderFormula timepointsWereSplit f' =
-      let ridNames =
-            if timepointsWereSplit
-              then M.empty
-              else ridOccurrenceNames ruleIdEvents f'
-       in Precise.evalFresh (ppRestrictFormula ridNames ruleIdEvents te f' useInduction) (avoidPrecise f')
-    formula f' =
-      let ridNames
-            | isJust positiveWitnessDualization =
-                ridOccurrenceNamesWithOrigins
-                  ruleIdEvents
-                  splitTimeOrigins
-                  f'
-            | hadTimepointSplit =
-                ridOccurrenceNamesWithOriginsPreservingSingle
-                  ruleIdEvents
-                  splitTimeOrigins
-                  f'
-            | otherwise = ridOccurrenceNames ruleIdEvents f'
-       in Precise.evalFresh (ppRestrictFormula ridNames ruleIdEvents te f' useInduction) (avoidPrecise f')
+queryFormulaFailure :: TypingEnvironment -> LNFormula -> Maybe String
+queryFormulaFailure typeEnvironment formula
+  | alternations > 1 =
+      Just ("formula has " ++ show alternations ++ " quantifier alternations; ProVerif supports at most one")
+  | hasNegatedActionInFormula formula =
+      Just "formula contains a negated event that ProVerif cannot express"
+  | not (snd rendered) =
+      Just "formula is outside the supported ProVerif query fragment"
+  | otherwise = Nothing
+  where
+    alternations = countQuantifierAlternations formula
+    rendered =
+      Precise.evalFresh
+        (ppRestrictFormula M.empty S.empty typeEnvironment formula "")
+        (avoidPrecise formula)
 
-    -- Lemma name comment (always shown)
+transformQueryFormula :: Lemma ProofSkeleton -> QueryPolarity -> LNFormula -> (LNFormula, QueryPolarity)
+transformQueryFormula lemma inheritedPolarity formula
+  | inheritedPolarity == DirectResult,
+    lemma._lTraceQuantifier == ExistsTrace,
+    Just dualized <- rewriteEventFreeExistsTrace formula =
+      (dualized, InvertResult)
+transformQueryFormula lemma inheritedPolarity formula =
+  (finalFormula, queryPolarity)
+  where
+    hasLeadingNotEx = case formula of
+      Not (Qua Ex _ _) -> True
+      _ -> False
+    hasAllImpliesFalse = case formula of
+      Qua All _ body -> checkAllImpliesNot body
+      _ -> False
+    checkAllImpliesNot (Qua All _ body) = checkAllImpliesNot body
+    checkAllImpliesNot (Not _) = True
+    checkAllImpliesNot (Conn Imp _ (TF False)) = True
+    checkAllImpliesNot _ = False
+    notExists = isNegatedExistsWithConjunction formula
+    existsConjunction = isExistsWithNegatedExistentials formula
+    hadLeadingNegation =
+      hasLeadingNotEx
+        || hasAllImpliesFalse
+        || notExists
+        || (existsConjunction && lemma._lTraceQuantifier == ExistsTrace)
+    movedToConclusion =
+      moveNegatedActionsToConclusion $ moveConstraintsToConclusion formula
+    shape = classifyFormulaShape lemma._lTraceQuantifier movedToConclusion
+    finalFormula =
+      simplifyFormula $ expandNegatedTimepointComparisons $ applyRewriteForShape shape movedToConclusion
+    queryPolarity
+      | inheritedPolarity == InvertResult || hadLeadingNegation || isNegated finalFormula = InvertResult
+      | otherwise = DirectResult
+    isNegated (Not _) = True
+    isNegated _ = False
+
+queryFormulaToTranslate :: Lemma ProofSkeleton -> LNFormula -> (LNFormula, Bool)
+queryFormulaToTranslate lemma formula =
+  case formula of
+    Not inner@(Qua Ex _ _) -> (inner, True)
+    Not inner
+      | isAllImpliesExists inner,
+        lemma._lTraceQuantifier == ExistsTrace -> (inner, True)
+    _
+      | lemma._lTraceQuantifier == AllTraces,
+        Just existential <- universalNegationAsExists formula -> (existential, True)
+    _ -> (formula, False)
+
+ppLemma :: String -> S.Set String -> TypingEnvironment -> Lemma ProofSkeleton -> PropertyOutcome PreparedQueryProperty -> Doc
+ppLemma _completionEvent _ruleIdEvents _te p (PropertyOmitted reason) =
+      text "(*" <> text p._lName <> text "*)"
+        $$ text ("(* Lemma translation failed: " ++ reason ++ ". *)")
+        $$ text "(*" <> prettyLNFormula p._lFormula <> text "*)"
+        $$ text ""
+ppLemma _ _ _ _ PropertyExcluded = emptyDoc
+ppLemma _completionEvent ruleIdEvents te p (PropertyEmitted prepared) =
+  vcat (intersperse (text "") (map renderSubformula prepared.preparedQueryFormulas))
+    $$ reconstructionComment
+  where
     lemmaNameComment = text "(*" <> text p._lName <> text "*)"
-
-    -- For soem reason, "use_induction" attribute is named InvariantLemma.
     useInduction
       | InvariantLemma `elem` p._lAttributes = "[induction]"
       | otherwise = ""
-
-    -- assuming all formulas we are concerned with have quantifiers at their top level (after splitTopLvlConns)
-    -- Returns the transformed formula together with the polarity needed to
-    -- reconstruct the original Tamarin result.
-    -- Note: Main rewriting has already been done by rewriteFormulaForQuery
-    transformFm :: QueryPolarity -> LNFormula -> (LNFormula, QueryPolarity)
-    transformFm inheritedPolarity fm
-      | inheritedPolarity == DirectResult,
-        p._lTraceQuantifier == ExistsTrace,
-        Just dualized <- rewriteEventFreeExistsTrace fm =
-          (dualized, InvertResult)
-    transformFm inheritedPolarity fm =
-      let -- Detect if formula has leading negation
-          -- Check for simple Not (Ex ...) pattern as well as complex patterns
-          hasLeadingNotEx = case fm of
-            Not (Qua Ex _ _) -> True
-            _ -> False
-          -- Check for All x. ... ==> False pattern (equivalent to not(Ex x. ...))
-          -- This appears as All x. All y. ... Not(...) after normalization
-          hasAllImpliesFalse = case fm of
-            Qua All _ body -> checkAllImpliesNot body
-            _ -> False
-            where
-              checkAllImpliesNot (Qua All _ body) = checkAllImpliesNot body
-              checkAllImpliesNot (Not _) = True
-              checkAllImpliesNot (Conn Imp _ (TF False)) = True
-              checkAllImpliesNot _ = False
-          notExists = isNegatedExistsWithConjunction fm
-          existsConj = isExistsWithNegatedExistentials fm
-          hadLeadingNegation = hasLeadingNotEx || hasAllImpliesFalse || notExists || (existsConj && p._lTraceQuantifier == ExistsTrace)
-          -- Apply final cleanup (constraint movement, negated action movement, simplification, and expand negated timepoint comparisons)
-          -- moveNegatedActionsToConclusion transforms: (A & not(B)) ==> C into A ==> (C | B)
-          -- After moving negated actions, apply shape-based transformation to handle patterns like A ==> (not(B) | C)
-          movedToConclusion = moveNegatedActionsToConclusion $ moveConstraintsToConclusion fm
-          -- Apply shape-based transformation to move negated disjuncts from conclusion to premise
-          shape = classifyFormulaShape p._lTraceQuantifier movedToConclusion
-          shapeTranformed = applyRewriteForShape shape movedToConclusion
-          finalFormula = simplifyFormula $ expandNegatedTimepointComparisons shapeTranformed
-          hasLeadingNegationAfterTransform = case finalFormula of
-            Not _ -> True
-            _ -> False
-          -- Combine both checks: original detection OR negation introduced by transformation
-          finalHadLeadingNegation = hadLeadingNegation || hasLeadingNegationAfterTransform
-          queryPolarity =
-            if inheritedPolarity == InvertResult || finalHadLeadingNegation
-              then InvertResult
-              else DirectResult
-          result = (finalFormula, queryPolarity)
-      in queryPolarity `seq` result
-
-    -- Split top-level connectives for the formula
-    (fms', comments, _) = splitTopLvlConns p._lTraceQuantifier 1 formulaForProcessing
-
-    -- Render a single subformula with appropriate comments
-    renderSubformula :: (LNFormula, QueryPolarity) -> Doc
-    renderSubformula (fm, transformedPolarity) =
-      let timepointComment = if hadTimepointSplit
-            then Just $ text "(* Timepoints in lemma have been split *)"
-            else Nothing
-          -- Get the formula to translate (inner formula for leading negation)
-          -- For Not (Qua Ex ...), strip the Not and emit the inner existential as a reachability query
-          -- ProVerif will check if it's reachable; if "true" (not reachable), the original property holds
-          (fmToTranslate, isExistentialNegation) = formulaToTranslate fm
-          queryPolarity =
-            if isExistentialNegation
-              then InvertResult
-              else transformedPolarity
-          -- Check for too many quantifier alternations AFTER all rewrites
-          alternations = countQuantifierAlternations fmToTranslate
-          -- Check if the formula to translate contains negated actions that will produce not(event(...))
-          -- This happens for exists-trace lemmas like "All x. A(x) ==> F" which become "Not (All x. A(x))"
-          -- and can't be transformed into a valid ProVerif query (ProVerif can't find a trace without an action)
-          hasNegatedActionInQuery = hasNegatedActionInFormula fmToTranslate
-          (queryDoc, succeeded)
-            | alternations > 1 =
-                (text "(* Lemma has " <> text (show alternations) <> text " quantifier alternations (e.g., All-Ex-All). ProVerif only supports at most 1 alternation. *)"
-                 $$ text "(*" <> prettyLNFormula fmToTranslate <> text "*)", False)
-            | hasNegatedActionInQuery =
-                (text "(* Lemma has negated event (from exists-trace lemma with negation). ProVerif cannot find a trace without an action. *)"
-                 $$ text "(*" <> prettyLNFormula fm <> text "*)", False)
-            | otherwise = formula fmToTranslate
-          -- Determine negation warning (no lemma name, that's separate)
-          negationWarning
-            | isExistentialNegation && succeeded = Just $ text "(* Existential lemma has a leading negation, interpret ProVerif's answers accordingly! *)"
-            | queryPolarity == InvertResult && succeeded = Just $ text "(* Lemma has a leading negation, interpret ProVerif's answers accordingly! *)"
-            | otherwise = Nothing
-          -- Build output: lemma name, timepoint comment, negation warning, query
-          parts = [lemmaNameComment]
-                  ++ catMaybes [timepointComment, negationWarning]
-                  ++ [queryDoc]
-      in vcat parts
-
-    formulaToTranslate fm =
-      case fm of
-        Not fm'@(Qua Ex _ _) -> (fm', True)
-        Not fm'
-          | isAllImpliesExists fm'
-              && p._lTraceQuantifier == ExistsTrace ->
-              (fm', True)
-        -- All x1..xn. not(F) is not(Ex x1..xn. F): same reachability query.
-        -- Rendering the negation literally would be rejected by ProVerif.
-        -- Only sound for all-traces lemmas: an exists-trace lemma of this
-        -- shape asks for a trace WITHOUT the events, which a reachability
-        -- query cannot establish (the negated-event check rejects it).
-        _
-          | p._lTraceQuantifier == AllTraces,
-            Just ex <- universalNegationAsExists fm ->
-              (ex, True)
-        _ -> (fm, False)
-
-    -- Reconstruction comment for split lemmas
-    reconstructionComment =
-      if isEmpty comments
-      then text ""
-      else text "(* To reconstruct lemma " <> text p._lName <> text ":"
-           $$ comments
-           $$ text "*)" $$ text ""
+    renderSubformula queryFormula =
+      vcat
+        ( [lemmaNameComment]
+            ++ catMaybes [timepointComment, negationWarning]
+            ++ [queryDoc]
+        )
+      where
+        preparedFormulaPlan = queryFormula.preparedQueryBody
+        formula = preparedFormulaPlan.preparedFormula
+        timepointComment
+          | preparedFormulaPlan.preparedHadTimepointSplit =
+              Just (text "(* Timepoints in lemma have been split *)")
+          | otherwise = Nothing
+        negationWarning
+          | queryFormula.preparedQueryPolarity == InvertResult =
+              Just (text "(* Lemma has a leading negation, interpret ProVerif's answers accordingly! *)")
+          | otherwise = Nothing
+        queryDoc =
+          fst
+            ( Precise.evalFresh
+                ( ppRestrictFormula
+                    preparedFormulaPlan.preparedRuleIdNames
+                    ruleIdEvents
+                    te
+                    formula
+                    useInduction
+                )
+                (avoidPrecise formula)
+            )
+    reconstructionComment = case prepared.preparedQueryRecombination of
+      Nothing -> text ""
+      Just ConjoinQueryResults ->
+        text "(* To reconstruct lemma " <> text p._lName <> text ", combine the query results with ∧. *)"
+      Just DisjoinQueryResults ->
+        text "(* To reconstruct lemma " <> text p._lName <> text ", combine the query results with ∨. *)"
 
 -- ===========================================================================
 -- SECTION 7b: Formula Shape Classification
@@ -2294,16 +2220,6 @@ applyRewriteForShape shape fm = case shape of
     collectNegatedAtoms (Conn Or p q) = collectNegatedAtoms p ++ collectNegatedAtoms q
     collectNegatedAtoms (Not p) = [p]
     collectNegatedAtoms _ = []
-
--- ===========================================================================
--- SECTION 8: Formula Transformations
--- ===========================================================================
-
--- | Apply pullNegationsToTop transformation with warning on partial rewrite
-transformWithPullNots :: LNFormula -> LNFormula
-transformWithPullNots f = case pullNegationsToTop f of
-  Left f' -> f'
-  Right f' -> f'
 
 -- ===========================================================================
 -- SECTION 9: Timepoint Variable Handling
@@ -2764,10 +2680,6 @@ guardSameActionConclusions completionEvent fm =
         (ProtoFact Linear completionEvent 0)
         S.empty
         []
-
--- | Property-only demand analysis used before rule rendering.
-completionTriggersForFormula :: String -> LNFormula -> S.Set String
-completionTriggersForFormula completionEvent = snd . guardSameActionConclusions completionEvent
 
 -- | Collect pairs of time-variable names linked by a temporal equality:
 -- an equality atom #i = #j (possibly negated), or a negated strict
@@ -3701,8 +3613,23 @@ eventsRequiringRuleIds fm =
   let fm' = eliminateTemporalEqualities fm
    in eventsSharingTimepoints fm' `S.union` temporalEqualityLinkedEvents fm'
 
+preparedFormulaRuleIdEvents :: PreparedFormula -> S.Set String
+preparedFormulaRuleIdEvents prepared =
+  eventsRequiringRuleIds formula
+    `S.union` temporalEqualityLinkedEventsByBinder formula
+    `S.union` splitOriginEvents
+  where
+    formula = prepared.preparedFormula
+    splitOriginEvents =
+      S.fromList
+        [ tag
+        | (timepoint, tag) <- collectEventTimeVars formula,
+          timepoint `M.member` prepared.preparedTimeOrigins
+        ]
+
 loadLemmas ::
   String ->  -- completionEvent: allocated internal completion event
+  [(String, PropertyOutcome PreparedQueryProperty)] ->
   [(String, PropertyOutcome PreparedAxiomProperty)] ->
   S.Set String ->  -- sharedEventTags: events that need rule IDs
   Bool ->  -- hasSpecificLemmas: whether --lemma flag was used
@@ -3711,7 +3638,7 @@ loadLemmas ::
   TypingEnvironment ->
   OpenTheory ->
   ([Doc], [Doc], S.Set ProVerifHeader)  -- (axioms, queries, headers)
-loadLemmas completionEvent preparedAxiomPlans sharedEventTags hasSpecificLemmas lemSel tc te thy = (axiomDocs, queryDocs, headers)
+loadLemmas completionEvent preparedQueryPlans preparedAxiomPlans sharedEventTags hasSpecificLemmas lemSel tc te thy = (axiomDocs, queryDocs, headers)
   where
     thyLemmas = theoryLemmas thy
 
@@ -3721,9 +3648,6 @@ loadLemmas completionEvent preparedAxiomPlans sharedEventTags hasSpecificLemmas 
     -- Separate into axioms and queries
     axiomsLemmas = [lem | (lem, AsAxiom) <- classified]
     queryLemmas = [lem | (lem, AsQuery) <- classified]
-
-    -- Include both axioms and queries for fact extraction
-    allIncludedLemmas = axiomsLemmas ++ queryLemmas
 
     -- Translate axioms using ppAxiomLemma
     axiomDocs =
@@ -3736,12 +3660,32 @@ loadLemmas completionEvent preparedAxiomPlans sharedEventTags hasSpecificLemmas 
       | lemma <- axiomsLemmas
       ]
 
-    -- Translate queries using existing ppLemma
-    queryDocs = map (ppLemma completionEvent sharedEventTags te) queryLemmas
+    -- Render exactly the query plans used during instrumentation analysis.
+    queryDocs =
+      [ ppLemma
+          completionEvent
+          sharedEventTags
+          te
+          lemma
+          (fromMaybe PropertyExcluded (lookup lemma._lName preparedQueryPlans))
+      | lemma <- queryLemmas
+      ]
 
     allFacts =
-      filter (not . isKnowledgeFact) $
-        concatMap (formulaFacts . L.get lFormula) allIncludedLemmas
+      filter (not . isKnowledgeFact)
+        [ fact
+        | formula <- preparedFormulas,
+          fact <- formulaFacts formula
+        ]
+    preparedFormulas =
+      [ queryFormula.preparedQueryBody.preparedFormula
+      | (_, PropertyEmitted prepared) <- preparedQueryPlans,
+        queryFormula <- prepared.preparedQueryFormulas
+      ]
+        ++ [ preparedFormulaPlan.preparedFormula
+           | (_, PropertyEmitted prepared) <- preparedAxiomPlans,
+             preparedFormulaPlan <- prepared.preparedAxiomFormulas
+           ]
     headers = makeEventHeaders sharedEventTags allFacts
 
 -- | Classify how a lemma should be translated based on selector and attributes
@@ -3926,7 +3870,7 @@ prettyDeepSecHeader :: ProVerifHeader -> Doc
 prettyDeepSecHeader = \case
   Type _ -> text "" -- no types in deepsec
   Eq "reduc" _ eq _ -> text "reduc" <> text " " <> text eq <> text "."
-  Eq eqtype _ eq _ -> error $ "Deepsec does not support equations ATM: " ++ eqtype ++ " " ++ eq
+  Eq eqtype _ eq _ -> translationFail $ "DeepSec does not support equations: " ++ eqtype ++ " " ++ eq
   HEvent _ _ -> text ""
   Table _ _ -> text ""
   -- drop symtypes in symbol declarations
@@ -4940,22 +4884,19 @@ ppRestrictFormulaR ::
   TypingEnvironment ->
   LNFormula ->
   String ->
-  Precise.FreshT Data.Functor.Identity.Identity Doc
+  Precise.FreshT Data.Functor.Identity.Identity (Doc, Bool)
 ppRestrictFormulaR pe ridNames ruleIdEvents te frm attrs =
   if formulaContainsKUFact frm -- don't allow KU facts, nothing corresponding in PV
     || (hasLessOrTmpEqInPremise frm && not (hasDistinctFact frm)) -- by this point we have stripped the less if that was possible in the 1st place
-    then pure $ ppFail frm
-    else let transformedFrm = allImplExLessWoTmps frm
-             -- Flatten nested implications for axioms: A => (B => C) becomes (A & B) => C
-             flattenedFrm = flattenNestedImplications transformedFrm
-         in if hasTopLevelNegatedAction flattenedFrm
-            then pure $ ppFailNegatedAction flattenedFrm
+    then pure (ppFail frm, False)
+    else if hasTopLevelNegatedAction frm
+            then pure (ppFailNegatedAction frm, False)
             -- ProVerif rejects nested implications ("nested queries") in the
             -- conclusion of lemmas, axioms, and restrictions alike; emitting
             -- them makes the whole file unparseable.
-            else if hasNestedImplicationInConclusion flattenedFrm
-            then pure $ ppFailNestedImpl flattenedFrm
-            else pp flattenedFrm
+            else if hasNestedImplicationInConclusion frm
+            then pure (ppFailNestedImpl frm, False)
+            else pp frm
   where
     hasNestedImplicationInConclusion = checkNested False
       where
@@ -4978,18 +4919,18 @@ ppRestrictFormulaR pe ridNames ruleIdEvents te frm attrs =
       (vs, _, fm') <- openFormulaPrefix fm
       -- Check if this is a simple negated action that can't be rewritten
       if isSimpleNegatedAction (Not fm)
-        then pure $ ppFailSimpleNegatedAction (Not fm)
+        then pure (ppFailSimpleNegatedAction (Not fm), False)
         else if isQuantifierFree fm'
-          then pure $ ppOk fm' vs
+          then pure (ppOk fm' vs, True)
           else
             -- Check if it could be rewritten to positive form
             case canRewriteNegatedRestriction (Not fm) of
-              Just rewriteHint -> pure $ ppFailWithRewriteHint (Not fm) rewriteHint
-              Nothing -> pure $ ppFail (Not fm)
+              Just rewriteHint -> pure (ppFailWithRewriteHint (Not fm) rewriteHint, False)
+              Nothing -> pure (ppFail (Not fm), False)
     pp fm@(Qua All _ _) = do
       (_, _, fm') <- openFormulaPrefix fm
       handleUniversalFormula fm fm'
-    pp fm = pure $ ppFail fm
+    pp fm = pure (ppFail fm, False)
     ppOk f l = ppQueryFormulaExR keepTimeVars pe ridNames ruleIdEvents te f l attrs
       where
         keepTimeVars = case pe of
@@ -5031,19 +4972,19 @@ ppRestrictFormulaR pe ridNames ruleIdEvents te frm attrs =
           RSL -> "Axiom"
 
     handleUniversalFormula fm_original fm | isQuantifierFree fm = do
-      pure $ ppOk fm_original []
+      pure (ppOk fm_original [], True)
     handleUniversalFormula fm_original (Conn Imp p fm) | isQuantifierFree p = do
       isExDisj <- isExistentialDisjunction fm
       if isExDisj
-        then pure $ ppOk fm_original []
+        then pure (ppOk fm_original [], True)
         else do
           -- Try handling nested implications/universals
           isNestedOk <- isNestedImplicationOk fm
           pure $
             if isNestedOk
-              then ppOk fm_original []
-              else ppFail fm_original
-    handleUniversalFormula fm_original _ = pure $ ppFail fm_original
+              then (ppOk fm_original [], True)
+              else (ppFail fm_original, False)
+    handleUniversalFormula fm_original _ = pure (ppFail fm_original, False)
 
     hasDistinctFact fm =
       any (\(Fact tag _ _) -> factTagName tag == "DistinctFact") (formulaFacts fm)
@@ -5103,211 +5044,176 @@ ppRestrictFormulaR pe ridNames ruleIdEvents te frm attrs =
           Action tf _ -> [tf]
           _ -> []
 
--- | Translate a restriction to ProVerif format
-ppRestr :: S.Set String -> TypingEnvironment -> Restriction -> Doc
-ppRestr _ruleIdEvents _te rstr
-  | Just reason <- assumptionKnowledgeFragmentFailure rstr._rstrFormula =
-      text "(*" <> text rstr._rstrName <> text "*)"
-        $$ text ("(* Restriction translation failed: " ++ reason ++ ". *)")
-        $$ text "(*" <> prettyLNFormula rstr._rstrFormula <> text "*)"
-        $$ text ""
-ppRestr ruleIdEvents te rstr =
-  timepointComment
-    $$ text "(*" <> text rstr._rstrName <> text "*)"
-    $$ case tryRewriteForbiddenAlternatives fm of
-         Just rewritten ->
-           text "(* Original: " <> prettyLNFormula rstr._rstrFormula <> text " *)"
-           $$ vcat
-                (intersperse (text "") (map renderStandaloneRestriction rewritten))
-         Nothing ->
-           case tryRewriteNegatedRestriction fm of
-             Just rewritten ->
-               -- Successfully rewrote the negated restriction
-               text "(* Original: " <> prettyLNFormula rstr._rstrFormula <> text " *)"
-               $$ Precise.evalFresh (ppRestrictFormulaR R (ridNamesFor rewritten) ruleIdEvents te rewritten "") (avoidPrecise rewritten)
-             Nothing ->
-               -- Check for unsupported patterns
-               if hasNestedImplicationInConjunction fm
-               then text "(* " <> prettyLNFormula rstr._rstrFormula <> text " *)"
-                    $$ text "(* Formula has nested implications inside conjunctions (e.g., A => ((B => C) & D))."
-                    $$ text "   This pattern cannot be soundly transformed to ProVerif's supported fragment."
-                    $$ text "   The formula is outside the supported ProVerif fragment. *)"
-                    $$ text ""
-               else if hasVariableCaptureInNestedImplication fm
-               then text "(* " <> prettyLNFormula rstr._rstrFormula <> text " *)"
-                    $$ text "(* Formula has variable capture in nested quantified implications (e.g., A(x) => (All x. B => C))."
-                    $$ text "   Flattening would change the semantics. *)"
-                    $$ text ""
-               else if hasProblematicNegation fm
-               then text "(* " <> prettyLNFormula fm <> text " *)"
-                    $$ text "(* Restriction has negated event which is not supported in ProVerif. *)"
-                    $$ text ""
-               else Precise.evalFresh (ppRestrictFormulaR R (ridNamesFor fm) ruleIdEvents te fm "") (avoidPrecise fm)
+prepareRestrictionProperty :: TypingEnvironment -> Restriction -> PropertyOutcome PreparedRestrictionProperty
+prepareRestrictionProperty typeEnvironment restriction
+  | Just reason <- assumptionKnowledgeFragmentFailure restriction._rstrFormula =
+      PropertyOmitted reason
+  | Left reason <- selectedCandidates = PropertyOmitted reason
+  | Just reason <- renderFailure = PropertyOmitted reason
+  | otherwise =
+      PropertyEmitted
+        PreparedRestrictionProperty
+          { preparedRestrictionFormulas = map prepareCandidate candidates,
+            preparedRestrictionWasRewritten = wasRewritten,
+            preparedRestrictionApproximation = approximation
+          }
   where
-    -- Apply transformations for restrictions:
-    -- 1. First simplify (converts A => F to Not A)
-    -- 2. Then eliminate temporal equalities by unifying the equated timepoints
-    --    (must happen before constraints are moved to the conclusion)
-    -- 3. Then move constraints to conclusion
-    -- 4. Then move negated actions to conclusion: (A & not(B)) => C -> A => (C | B)
-    -- 5. Then expand negated timepoint comparisons
-    -- 6. Then flatten nested implications: A => (B => C) -> (A & B) => C
-    --    (ProVerif doesn't allow nested implications in restrictions)
-    -- 7. Finally pull negations to top (converts All x. Not A to Not (Ex x. A))
-    -- This order is important: simplify first so A => F becomes Not A,
-    -- then pullNegationsToTop can pull that Not to the top level
-    simplifiedFormula =
-      transformWithPullNots
-        $ simplifyFormula
-        $ flattenNestedImplications
-        $ expandNegatedTimepointComparisons
-        $ moveNegatedActionsToConclusion
-        $ moveConstraintsToConclusion
-        $ eliminateTemporalEqualities
-        $ simplifyFormula rstr._rstrFormula
-    needsRuleId = formulaHasSharedTimepoints simplifiedFormula
-    timepointComment = if needsRuleId
-                       then text "(* Timepoints in restriction have been split *)"
-                       else text ""
-    (fm, splitTimeOrigins) =
-      if needsRuleId
-        then makeTimeVarsDistinctWithOrigins simplifiedFormula
-        else (simplifiedFormula, M.empty)
-    -- Per-occurrence rule-id variables (and rule-id equalities for surviving
-    -- temporal equalities, e.g. uniqueness restrictions on instrumented
-    -- events). Split-timepoint restrictions preserve each independent
-    -- original timepoint group while retaining the established shared "rid"
-    -- rendering when only one group remains in a subformula.
-    ridNamesFor f =
-      if needsRuleId
-        then
-          ridOccurrenceNamesWithOriginsPreservingSingle
-            ruleIdEvents
-            splitTimeOrigins
-            f
-        else ridOccurrenceNames ruleIdEvents f
+    beforePull =
+      simplifyFormula
+        . flattenNestedImplications
+        . expandNegatedTimepointComparisons
+        . moveNegatedActionsToConclusion
+        . moveConstraintsToConclusion
+        . eliminateTemporalEqualities
+        . simplifyFormula
+        $ restriction._rstrFormula
+    (normalized, approximation) = case pullNegationsToTop beforePull of
+      Left partiallyNormalized ->
+        ( partiallyNormalized,
+          Just "negations could only be partially normalized; the emitted restriction is an approximation"
+        )
+      Right fullyNormalized -> (fullyNormalized, Nothing)
+    needsRuleId = formulaHasSharedTimepoints normalized
+    (formulaWithDistinctTimepoints, splitTimeOrigins)
+      | needsRuleId = makeTimeVarsDistinctWithOrigins normalized
+      | otherwise = (normalized, M.empty)
+    selectedCandidates
+      | Just alternatives <- tryRewriteForbiddenAlternatives formulaWithDistinctTimepoints =
+          Right (alternatives, True)
+      | Just rewritten <- tryRewriteNegatedRestriction formulaWithDistinctTimepoints =
+          Right ([rewritten], True)
+      | hasNestedImplicationInConjunction formulaWithDistinctTimepoints =
+          Left "formula has a nested implication inside a conjunction"
+      | hasVariableCaptureInNestedImplication formulaWithDistinctTimepoints =
+          Left "flattening a nested quantified implication would capture a variable"
+      | otherwise = Right ([formulaWithDistinctTimepoints], False)
+    (rawCandidates, wasRewritten) = either (const ([], False)) id selectedCandidates
+    candidates = map (flattenNestedImplications . allImplExLessWoTmps) rawCandidates
+    renderFailure =
+      listToMaybe
+        [ "formula is outside the supported ProVerif restriction fragment"
+        | formula <- candidates,
+          not
+            ( snd
+                ( Precise.evalFresh
+                    (ppRestrictFormulaR R M.empty S.empty typeEnvironment formula "")
+                    (avoidPrecise formula)
+                )
+            )
+        ]
+    prepareCandidate formula =
+      PreparedFormula
+        { preparedFormula = formula,
+          preparedTimeOrigins = splitTimeOrigins,
+          preparedHadTimepointSplit = needsRuleId,
+          preparedRuleIdNames = M.empty
+        }
 
-    renderStandaloneRestriction formula =
-      let formulaRidNames =
-            if needsRuleId
-              then
-                ridOccurrenceNamesWithOriginsPreservingSingle
-                  ruleIdEvents
-                  splitTimeOrigins
-                  formula
-              else ridOccurrenceNames ruleIdEvents formula
-       in Precise.evalFresh
-            (ppRestrictFormulaR R formulaRidNames ruleIdEvents te formula "")
-            (avoidPrecise formula)
-
-    -- A forbidden positive witness whose body is a disjunction can be
-    -- represented by one prohibition per DNF branch:
-    --
-    --   not (Ex xs. C1 or ... or Cn)
-    --     iff
-    --   (All xs. C1 ==> false) and ... and (All xs. Cn ==> false).
-    --
-    -- This is purely structural. Every resulting branch must be a
-    -- quantifier-free positive correspondence premise containing an event.
-    -- The small cap prevents an accidental exponential exporter blow-up.
-    tryRewriteForbiddenAlternatives :: LNFormula -> Maybe [LNFormula]
     tryRewriteForbiddenAlternatives (Not positive) = do
-      let normalized = pnf positive
-          (prefix, body) = collectExistentialPrefix normalized
+      let (prefix, body) = collectExistentialPrefix (pnf positive)
+      branches <- positiveDnf 16 body
+      let distinctBranches = List.nub branches
       if null prefix
+          || length distinctBranches < 2
+          || any (not . isSupportedPositivePremise) distinctBranches
+          || any (not . formulaContainsAction) distinctBranches
         then Nothing
-        else do
-          branches <- positiveDnf 16 body
-          let distinctBranches = List.nub branches
-          if length distinctBranches < 2
-              || any (not . isSupportedPositivePremise) distinctBranches
-              || any (not . formulaContainsAction) distinctBranches
-            then Nothing
-            else
-              Just
-                [ rewrapBoundPrefix All prefix (Conn Imp branch (TF False))
-                | branch <- distinctBranches
-                ]
+        else
+          Just
+            [ rewrapBoundPrefix All prefix (Conn Imp branch (TF False))
+            | branch <- distinctBranches
+            ]
     tryRewriteForbiddenAlternatives _ = Nothing
 
-    collectExistentialPrefix (Qua Ex v body) =
+    collectExistentialPrefix (Qua Ex binder body) =
       let (rest, inner) = collectExistentialPrefix body
-       in (v : rest, inner)
+       in (binder : rest, inner)
     collectExistentialPrefix body = ([], body)
 
-    positiveDnf limit formula =
-      case formula of
-        Conn Or left right -> do
-          leftBranches <- positiveDnf limit left
-          rightBranches <- positiveDnf (limit - length leftBranches) right
-          let branches = leftBranches ++ rightBranches
-          if length branches <= limit then Just branches else Nothing
-        Conn And left right -> do
-          leftBranches <- positiveDnf limit left
-          rightBranches <- positiveDnf limit right
-          let branchCount = length leftBranches * length rightBranches
-          if branchCount <= limit
-            then
-              Just
-                [ buildConjunction
-                    (flattenConjunction leftBranch ++ flattenConjunction rightBranch)
-                | leftBranch <- leftBranches,
-                  rightBranch <- rightBranches
-                ]
-            else Nothing
-        _
-          | limit >= 1,
-            isQuantifierFree formula -> Just [formula]
-          | otherwise -> Nothing
+    positiveDnf limit formula = case formula of
+      Conn Or left right -> do
+        leftBranches <- positiveDnf limit left
+        rightBranches <- positiveDnf (limit - length leftBranches) right
+        let branches = leftBranches ++ rightBranches
+        if length branches <= limit then Just branches else Nothing
+      Conn And left right -> do
+        leftBranches <- positiveDnf limit left
+        rightBranches <- positiveDnf limit right
+        let branchCount = length leftBranches * length rightBranches
+        if branchCount <= limit
+          then
+            Just
+              [ buildConjunction (flattenConjunction leftBranch ++ flattenConjunction rightBranch)
+              | leftBranch <- leftBranches,
+                rightBranch <- rightBranches
+              ]
+          else Nothing
+      _
+        | limit >= 1,
+          isQuantifierFree formula -> Just [formula]
+        | otherwise -> Nothing
 
     flattenConjunction (Conn And left right) =
       flattenConjunction left ++ flattenConjunction right
     flattenConjunction formula = [formula]
 
-    -- Check if a formula has a problematic negation (negated event at top level)
-    hasProblematicNegation (Not f) = hasEventAnywhere f
-    hasProblematicNegation _ = False
-
-    hasEventAnywhere (Ato (Action _ _)) = True
-    hasEventAnywhere (Not f) = hasEventAnywhere f
-    hasEventAnywhere (Conn _ f1 f2) = hasEventAnywhere f1 || hasEventAnywhere f2
-    hasEventAnywhere (Qua _ _ f) = hasEventAnywhere f
-    hasEventAnywhere _ = False
-
-    -- Try to rewrite negated restrictions to positive form
-    -- Pattern: not((A@i & B@j) & (i ≠ j)) → (A@i & B@j) => (i = j)
-    -- Pattern: not(Ex... (A@i & A@j) & (i ≠ j)) → All... (A@i & A@j) => (i = j)
-    tryRewriteNegatedRestriction :: LNFormula -> Maybe LNFormula
-    tryRewriteNegatedRestriction (Not fm') = tryRewriteNegatedBody fm'
+    tryRewriteNegatedRestriction (Not formula) = tryRewriteNegatedBody formula
     tryRewriteNegatedRestriction _ = Nothing
-
-    -- Try to rewrite the body of a negated formula
-    tryRewriteNegatedBody :: LNFormula -> Maybe LNFormula
-    -- not(Ex x. P) -> All x. not(P) ... but we need to rewrite not(P) further
-    tryRewriteNegatedBody (Qua Ex v f) = do
-      rewritten <- tryRewriteNegatedBody f
-      Just $ Qua All v rewritten
-    -- Pattern: not((P) & (i ≠ j)) -> P => (i = j)
-    -- Note: inequality (i ≠ j) is represented as Not (EqE i j)
-    tryRewriteNegatedBody (Conn And premise (Not (Ato (EqE t1 t2)))) =
-      Just $ Conn Imp premise (Ato (EqE t1 t2))
-    -- Pattern: not((P) & (#t1 < #t2)) -> P => ((#t2 < #t1) | (#t1 = #t2))
-    -- The negated temporal order becomes its complement in the conclusion.
-    tryRewriteNegatedBody (Conn And premise (Ato (Less t1 t2))) =
-      Just $ Conn Imp premise (Conn Or (Ato (Less t2 t1)) (Ato (EqE t1 t2)))
+    tryRewriteNegatedBody (Qua Ex binder body) =
+      Qua All binder <$> tryRewriteNegatedBody body
+    tryRewriteNegatedBody (Conn And premise (Not (Ato (EqE left right)))) =
+      Just (Conn Imp premise (Ato (EqE left right)))
+    tryRewriteNegatedBody (Conn And premise (Ato (Less left right))) =
+      Just (Conn Imp premise (Conn Or (Ato (Less right left)) (Ato (EqE left right))))
     tryRewriteNegatedBody _ = Nothing
+
+ppRestr :: S.Set String -> TypingEnvironment -> Restriction -> PropertyOutcome PreparedRestrictionProperty -> Doc
+ppRestr _ _ restriction (PropertyOmitted reason) =
+  text "(*" <> text restriction._rstrName <> text "*)"
+    $$ text ("(* Restriction translation failed: " ++ reason ++ ". *)")
+    $$ text "(*" <> prettyLNFormula restriction._rstrFormula <> text "*)"
+    $$ text ""
+ppRestr _ _ _ PropertyExcluded = emptyDoc
+ppRestr ruleIdEvents typeEnvironment restriction (PropertyEmitted prepared) =
+  timepointComment
+    $$ text "(*" <> text restriction._rstrName <> text "*)"
+    $$ originalComment
+    $$ vcat (intersperse (text "") (map renderFormula prepared.preparedRestrictionFormulas))
+  where
+    timepointComment
+      | any preparedHadTimepointSplit prepared.preparedRestrictionFormulas =
+          text "(* Timepoints in restriction have been split *)"
+      | otherwise = emptyDoc
+    originalComment
+      | prepared.preparedRestrictionWasRewritten =
+          text "(* Original: " <> prettyLNFormula restriction._rstrFormula <> text " *)"
+      | otherwise = emptyDoc
+    renderFormula preparedFormulaPlan =
+      let formula = preparedFormulaPlan.preparedFormula
+       in fst
+            ( Precise.evalFresh
+                ( ppRestrictFormulaR
+                    R
+                    preparedFormulaPlan.preparedRuleIdNames
+                    ruleIdEvents
+                    typeEnvironment
+                    formula
+                    ""
+                )
+                (avoidPrecise formula)
+            )
 
 -- | Printer for reuse/src lemmas as ProVerif axioms.
 -- | Different than ppLemma in that it ignores timepoints and does transformations custom to these lemmas.
-prepareAxiomProperty :: String -> Lemma ProofSkeleton -> PropertyOutcome PreparedAxiomProperty
-prepareAxiomProperty completionEvent lemma
+prepareAxiomProperty :: String -> TypingEnvironment -> Lemma ProofSkeleton -> PropertyOutcome PreparedAxiomProperty
+prepareAxiomProperty completionEvent typeEnvironment lemma
   | Just reason <- assumptionKnowledgeFragmentFailure lemma._lFormula =
       PropertyOmitted reason
+  | Just reason <- axiomFailure = PropertyOmitted reason
   | otherwise =
       PropertyEmitted
         PreparedAxiomProperty
-          { preparedAxiomBeforeCompletion = [rewrittenBeforeCompletion],
-            preparedAxiomFormulas = map prepareRenderedFormula axiomFormulas,
+          { preparedAxiomFormulas = map prepareRenderedFormula renderedAxiomFormulas,
             preparedAxiomCompletionTriggers = completionTriggers,
             preparedAxiomApproximation = approximation
           }
@@ -5325,6 +5231,30 @@ prepareAxiomProperty completionEvent lemma
           let (formulas, _, _) = splitTopLvlConns AllTraces 1 guarded
            in formulas
       | otherwise = [guarded]
+    renderedAxiomFormulas =
+      map (flattenNestedImplications . allImplExLessWoTmps) axiomFormulas
+    axiomFailure =
+      listToMaybe
+        ( [ "formula has a nested implication inside a conjunction"
+          | any hasNestedImplicationInConjunction axiomFormulas
+          ]
+            ++ [ "flattening a nested quantified implication would capture a variable"
+               | any hasVariableCaptureInNestedImplication axiomFormulas
+               ]
+            ++ [ "formula contains a negated event that ProVerif cannot express"
+               | any hasNegatedEventInFormula axiomFormulas
+               ]
+            ++ [ "formula is outside the supported ProVerif axiom fragment"
+               | formula <- renderedAxiomFormulas,
+                 not
+                   ( snd
+                       ( Precise.evalFresh
+                           (ppRestrictFormulaR RSL M.empty S.empty typeEnvironment formula "")
+                           (avoidPrecise formula)
+                       )
+                   )
+               ]
+        )
     rewriteTopLevelConjuncts (Conn And left right) =
       let (left', leftApproximation) = rewriteTopLevelConjuncts left
           (right', rightApproximation) = rewriteTopLevelConjuncts right
@@ -5340,13 +5270,67 @@ prepareRenderedFormula formula =
   PreparedFormula
     { preparedFormula = renderedFormula,
       preparedTimeOrigins = timeOrigins,
-      preparedHadTimepointSplit = needsRuleId
+      preparedHadTimepointSplit = needsRuleId,
+      preparedRuleIdNames = M.empty
     }
   where
     needsRuleId = formulaHasSharedTimepoints formula
     (renderedFormula, timeOrigins)
       | needsRuleId = makeTimeVarsDistinctWithOrigins formula
       | otherwise = (formula, M.empty)
+
+mapPropertyOutcome :: (a -> b) -> PropertyOutcome a -> PropertyOutcome b
+mapPropertyOutcome transform (PropertyEmitted prepared) =
+  PropertyEmitted (transform prepared)
+mapPropertyOutcome _ (PropertyOmitted reason) = PropertyOmitted reason
+mapPropertyOutcome _ PropertyExcluded = PropertyExcluded
+
+annotatePreparedFormula :: Bool -> S.Set String -> PreparedFormula -> PreparedFormula
+annotatePreparedFormula useOriginRuleIds ruleIdEvents prepared =
+  prepared {preparedRuleIdNames = ruleIdNames}
+  where
+    formula = prepared.preparedFormula
+    ruleIdNames
+      | prepared.preparedHadTimepointSplit && useOriginRuleIds =
+          ridOccurrenceNamesWithOrigins
+            ruleIdEvents
+            prepared.preparedTimeOrigins
+            formula
+      | prepared.preparedHadTimepointSplit =
+          ridOccurrenceNamesWithOriginsPreservingSingle
+            ruleIdEvents
+            prepared.preparedTimeOrigins
+            formula
+      | otherwise = ridOccurrenceNames ruleIdEvents formula
+
+annotateQueryProperty :: S.Set String -> PreparedQueryProperty -> PreparedQueryProperty
+annotateQueryProperty ruleIdEvents prepared =
+  prepared
+    { preparedQueryFormulas = map annotateQuery prepared.preparedQueryFormulas
+    }
+  where
+    annotateQuery queryFormula =
+      queryFormula
+        { preparedQueryBody =
+            annotatePreparedFormula
+              queryFormula.preparedQueryUseOriginRuleIds
+              ruleIdEvents
+              queryFormula.preparedQueryBody
+        }
+
+annotateAxiomProperty :: S.Set String -> PreparedAxiomProperty -> PreparedAxiomProperty
+annotateAxiomProperty ruleIdEvents prepared =
+  prepared
+    { preparedAxiomFormulas =
+        map (annotatePreparedFormula False ruleIdEvents) prepared.preparedAxiomFormulas
+    }
+
+annotateRestrictionProperty :: S.Set String -> PreparedRestrictionProperty -> PreparedRestrictionProperty
+annotateRestrictionProperty ruleIdEvents prepared =
+  prepared
+    { preparedRestrictionFormulas =
+        map (annotatePreparedFormula False ruleIdEvents) prepared.preparedRestrictionFormulas
+    }
 
 ppAxiomLemma :: String -> S.Set String -> TypingEnvironment -> Lemma ProofSkeleton -> PropertyOutcome PreparedAxiomProperty -> Doc
 ppAxiomLemma _completionEvent _ruleIdEvents _te l (PropertyOmitted reason) =
@@ -5368,40 +5352,12 @@ ppAxiomLemma _completionEvent ruleIdEvents te l (PropertyEmitted prepared) =
   where
     renderAxiom preparedFormulaPlan =
       let fm = preparedFormulaPlan.preparedFormula
-          needsRuleId = preparedFormulaPlan.preparedHadTimepointSplit
-          splitTimeOrigins = preparedFormulaPlan.preparedTimeOrigins
-          ridNames =
-            if needsRuleId
-              then
-                ridOccurrenceNamesWithOriginsPreservingSingle
-                  ruleIdEvents
-                  splitTimeOrigins
-                  fm
-              else ridOccurrenceNames ruleIdEvents fm
-       in if hasNestedImplicationInConjunction fm
-            then
-              text "(* " <> prettyLNFormula l._lFormula <> text " *)"
-                $$ text "(* Formula has nested implications inside conjunctions (e.g., A => ((B => C) & D))."
-                $$ text "   This pattern cannot be soundly transformed to ProVerif's supported fragment."
-                $$ text "   The formula is outside the supported ProVerif fragment. *)"
-                $$ text ""
-            else
-              if hasVariableCaptureInNestedImplication fm
-                then
-                  text "(* " <> prettyLNFormula l._lFormula <> text " *)"
-                    $$ text "(* Formula has variable capture in nested quantified implications (e.g., A(x) => (All x. B => C))."
-                    $$ text "   Flattening would change the semantics. *)"
-                    $$ text ""
-                else
-                  if hasNegatedEventInFormula fm
-                    then
-                      text "(* " <> prettyLNFormula l._lFormula <> text " *)"
-                        $$ text "(* Axiom has negated event (not(...event...)) which is not supported in ProVerif. *)"
-                        $$ text ""
-                    else
-                      Precise.evalFresh
-                        (ppRestrictFormulaR RSL ridNames ruleIdEvents te fm "")
-                        (avoidPrecise fm)
+          ridNames = preparedFormulaPlan.preparedRuleIdNames
+       in fst
+            ( Precise.evalFresh
+                (ppRestrictFormulaR RSL ridNames ruleIdEvents te fm "")
+                (avoidPrecise fm)
+            )
 
     timepointComment = if any preparedHadTimepointSplit prepared.preparedAxiomFormulas
                        then text "(* Timepoints in lemma have been split *)\n"
@@ -5482,11 +5438,28 @@ hasTopLevelNegatedAction (Conn Imp _ concl) = hasNegatedEventInConclusion concl
     hasNegatedEventInConclusion _ = False
 hasTopLevelNegatedAction _ = False
 
-loadRestrictions :: S.Set String -> TranslationContext -> TypingEnvironment -> OpenTheory -> ([Doc], S.Set ProVerifHeader)
-loadRestrictions sharedEventTags _ te thy =
+loadRestrictions ::
+  S.Set String ->
+  TypingEnvironment ->
+  [(String, PropertyOutcome PreparedRestrictionProperty)] ->
+  OpenTheory ->
+  ([Doc], S.Set ProVerifHeader)
+loadRestrictions sharedEventTags te preparedRestrictionPlans thy =
   let rs = theoryRestrictions thy
-      docs = map (ppRestr sharedEventTags te) rs
-      allFacts = concatMap (formulaFacts . L.get rstrFormula) rs
+      docs =
+        [ ppRestr
+            sharedEventTags
+            te
+            restriction
+            (fromMaybe PropertyExcluded (lookup restriction._rstrName preparedRestrictionPlans))
+        | restriction <- rs
+        ]
+      allFacts =
+        [ fact
+        | (_, PropertyEmitted prepared) <- preparedRestrictionPlans,
+          preparedFormulaPlan <- prepared.preparedRestrictionFormulas,
+          fact <- formulaFacts preparedFormulaPlan.preparedFormula
+        ]
       validFacts =
         [ f
         | f@(Fact tag _ _) <- allFacts,
@@ -5495,8 +5468,3 @@ loadRestrictions sharedEventTags _ te thy =
         ]
       headers = makeEventHeaders sharedEventTags validFacts
    in (docs, headers)
-
--- | Detect events that share timepoints in restrictions
-detectSharedTimepointEventsRestrictions :: [Restriction] -> S.Set String
-detectSharedTimepointEventsRestrictions restrictions =
-  S.unions $ map (eventsSharingTimepoints . eliminateTemporalEqualities . _rstrFormula) restrictions

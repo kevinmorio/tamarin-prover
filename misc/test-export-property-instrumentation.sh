@@ -52,6 +52,19 @@ require_pattern '^event eFirst\(bitstring, bitstring\)\.$' "$temporal"
 require_pattern '^event eSecond\(bitstring, bitstring\)\.$' "$temporal"
 require_pattern '\(rid_[[:alnum:]_]+ = rid_[[:alnum:]_]+\)' "$temporal"
 
+split_notice="$tmp_dir/split-notice.pv"
+if ! "$tamarin" -d=0 -m=proverif --quit-on-warning --lemma=split_queries_notice \
+  "-o=$split_notice" "$model" >/dev/null 2>&1; then
+  echo "informational query recombination triggered --quit-on-warning" >&2
+  exit 1
+fi
+require_pattern '^Export notes$' "$split_notice"
+require_pattern 'Lemma `split_queries_notice`: was emitted as 2 queries.*\[PV-GOAL-SPLIT\]' "$split_notice"
+if grep -q '^WARNING: export omitted or approximated proof-relevant input\.$' "$split_notice"; then
+  echo "informational query recombination was rendered as a warning" >&2
+  exit 1
+fi
+
 restriction="$tmp_dir/restriction.pv"
 "$tamarin" -d=0 -m=proverif --lemma=no_link_chain "-o=$restriction" "$restriction_model" >/dev/null
 if [ "$(grep -c '==> (false)' "$restriction")" -ne 2 ]; then
@@ -166,6 +179,11 @@ if command -v proverif >/dev/null 2>&1; then
   proverif -parse-only "$refactoring_query_collision" >/dev/null
   proverif -parse-only "$refactoring_completion" >/dev/null
   proverif -parse-only "$equivalence" >/dev/null
+elif [ -n "${CI:-}" ]; then
+  echo "proverif is required for export parser validation in CI" >&2
+  exit 1
+else
+  echo "skipping export parser validation: proverif not found" >&2
 fi
 
 echo "export property instrumentation regression passed"

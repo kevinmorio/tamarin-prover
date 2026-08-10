@@ -5,6 +5,7 @@ module Export.ProVerifEquivalence (prettyProVerifEquivTheory) where
 import Data.List (intersperse)
 import Data.Set qualified as Set
 import Export.ProVerif
+import Export.ProVerif.Header (checkDuplicates', filterHeaders)
 import Export.Sapic
 import Export.Types
 import Sapic.Typing (TypingEnvironment)

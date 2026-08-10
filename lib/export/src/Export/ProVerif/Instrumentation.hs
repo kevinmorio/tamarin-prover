@@ -20,4 +20,3 @@ instrumentationPropertyEvents plan
   | Set.null plan.instrumentationCompletionTriggers = plan.instrumentationRuleIdEvents
   | otherwise =
       Set.insert plan.instrumentationCompletionEvent plan.instrumentationRuleIdEvents
-

@@ -61,4 +61,3 @@ allocate namespace preferred allocator =
 namesIn :: TargetNamespace -> NameAllocator -> Set.Set String
 namesIn namespace (NameAllocator allocated) =
   Map.findWithDefault Set.empty namespace allocated
-

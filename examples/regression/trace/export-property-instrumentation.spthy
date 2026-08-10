@@ -25,4 +25,8 @@ lemma completion_not_required_for_same_fact:
 lemma temporal_equality_uses_rule_ids:
   "not (Ex x #i #j. First(x) @ i & Second(x) @ j & #i < #j)"
 
+lemma split_queries_notice:
+  "(All x #i. Trigger(x) @ i ==> Consequence(x) @ i)
+    & (All y #j. First(y) @ j ==> First(y) @ j)"
+
 end

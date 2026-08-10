@@ -26,11 +26,12 @@ import Data.ByteString.Char8 qualified as BC
 import Data.Char
 import Data.List as List
 import Data.Map qualified as M
-import Data.Maybe (catMaybes, fromMaybe, mapMaybe)
+import Data.Maybe (catMaybes, fromMaybe, listToMaybe, mapMaybe)
 import Data.Set qualified as S
 import Extension.Data.Label qualified as L
 import Export.Name
 import Export.ProVerif.Header
+import Export.Types (translationFail)
 import Sapic.Exceptions
 import Sapic.Facts
 import Theory
@@ -82,7 +83,7 @@ loadRules completionEvent ruleIdEvents completionTriggerEvents thy m = case theo
       -- want to export restrictions and reuse/src lemmas => need to introduce fresh stamps (as there no timepoints in such formulas)
       rulesMod = map (\(OpenProtoRule ruE rusAC) -> OpenProtoRule (applyMacroInRule (theoryMacros thy) ruE) rusAC) $ case m of
         ModuleProVerif -> rules
-        _ -> error "Incompatible module!"
+        _ -> translationFail "Rule translation was invoked for an incompatible output module."
 
 translateEmbeddedRuleAction ::
   (HighlightDocument d) =>
@@ -143,7 +144,7 @@ multisetTheory thy =
    in if hasDistinctFact
         then case addRestriction (parseAndConvertRestriction resDistinctFact) thy' of
                Just thy'' -> thy''
-               Nothing    -> error "Could not add restriction to theory"
+               Nothing    -> translationFail "Could not add the generated multiset restriction to the theory."
         else thy'
 
 -- Helper to check if a rule has a DistinctFact action
@@ -164,8 +165,8 @@ parseAndConvertRestriction s =
     Right (Restriction name synFormula _) ->
       case toLNFormula synFormula of
         Just lnFormula -> Restriction name lnFormula Nothing
-        Nothing -> error "Could not convert SyntacticRestriction to Restriction"
-    _ -> error $ "Could not parse restriction: " ++ s
+        Nothing -> translationFail "Could not convert the generated multiset restriction."
+    _ -> translationFail $ "Could not parse the generated multiset restriction: " ++ s
 
 multisetSemantics :: HasRuleName (Rule i) => Rule i -> Rule i
 multisetSemantics r = r
@@ -210,7 +211,7 @@ multisetSemantics r = r
     mkFreshFact fv = Fact FreshFact S.empty [fv]
 
     termsToPair :: [LNTerm] -> LNTerm
-    termsToPair []     = error "termsToNestedPair: empty list"
+    termsToPair []     = translationFail "Multiset export does not support a zero-arity linear fact."
     termsToPair [x]    = x
     termsToPair (x:xs) = fAppPair (x, termsToPair xs)
 
@@ -221,8 +222,10 @@ multisetSemantics r = r
 
 makeDestructorHeader :: ((String, String), String) -> ProVerifHeader
 makeDestructorHeader ((dDef, atom), dName) =
-  let (s1, s2) = break (== '#') dDef
-   in Eq "reduc" s1 (dName ++ "(" ++ tail s2 ++ ") = " ++ showAtom False atom) "[private]"
+  case break (== '#') dDef of
+    (declarations, _ : body) ->
+      Eq "reduc" declarations (dName ++ "(" ++ body ++ ") = " ++ showAtom False atom) "[private]"
+    _ -> translationFail "A generated destructor definition has no body."
 
 makeHeadersFromRule :: S.Set String -> OpenProtoRule -> OpenTheory -> S.Set ProVerifHeader
 makeHeadersFromRule ruleIdEvents (OpenProtoRule ruE _) = makeHeadersFromProtoRule ruleIdEvents ruE
@@ -275,10 +278,13 @@ searchTermForBitstrings :: (Show l) => Term l -> S.Set String
 searchTermForBitstrings =
   foldMap
     ( \l ->
-        if (head $ show l, last $ show l) == ('\'', '\'')
-          then S.singleton (showAtom True $ show l)
+        if isQuoted (show l)
+          then S.singleton (showAtom True (show l))
           else S.empty
     )
+  where
+    isQuoted ('\'' : rest) = not (null rest) && last rest == '\''
+    isQuoted _ = False
 
 makeTableHeaders :: [LNFact] -> [LNFact] -> S.Set ProVerifHeader
 makeTableHeaders rprems rconcls =
@@ -597,9 +603,9 @@ translateNonPatternsWithRuleId ruleIdEvents ruleIdName facts factType filterFunc
             then translateFactWithRuleId prem factType vs ruleIdName
             else translateFact prem factType vs
         atoms = S.fromList $ foldMap (map show . lits) ts
-        checkForNewIDs = not (atoms `S.isSubsetOf` vs) && any (('$' ==) . head) (atoms `S.difference` vs)
+        checkForNewIDs = not (atoms `S.isSubsetOf` vs) && any (startsWith '$') (atoms `S.difference` vs)
         idConstructor = idExp . S.toList $ atoms `S.difference` vs
-        idExp = vcat . map (\a -> text "in(publicChannel, " <> text (showAtom True a) <> text ": bitstring);") . filter (('$' ==) . head)
+        idExp = vcat . map (\a -> text "in(publicChannel, " <> text (showAtom True a) <> text ": bitstring);") . filter (startsWith '$')
 
 translateNonPatterns :: (HighlightDocument d) => [LNFact] -> FactType -> (LNFact -> Bool) -> S.Set String -> ([d], S.Set String)
 translateNonPatterns facts factType filterFunction vars =
@@ -613,20 +619,20 @@ translateNonPatterns facts factType filterFunction vars =
             then idConstructor $-$ translateFact prem factType vs
             else translateFact prem factType vs
         atoms = S.fromList $ foldMap (map show . lits) ts
-        checkForNewIDs = not (atoms `S.isSubsetOf` vs) && any (('$' ==) . head) (atoms `S.difference` vs)
+        checkForNewIDs = not (atoms `S.isSubsetOf` vs) && any (startsWith '$') (atoms `S.difference` vs)
         idConstructor = idExp . S.toList $ atoms `S.difference` vs
-        idExp = vcat . map (\a -> text "in(publicChannel, " <> text (showAtom True a) <> text ": bitstring);") . filter (('$' ==) . head)
+        idExp = vcat . map (\a -> text "in(publicChannel, " <> text (showAtom True a) <> text ": bitstring);") . filter (startsWith '$')
 
 -- | Like translateFact but includes rule ID as first argument for EVENT facts
 translateFactWithRuleId :: (Document d) => LNFact -> FactType -> S.Set String -> String -> d
 translateFactWithRuleId (Fact tag _ ts) factType vars ruleIdName = case factType of
   GET -> text "get" <-> text (showFactName tag) <> translateTerms vars True <> text " in"
   IN ->
-    text "in(publicChannel," <-> translateTerm vars True (head ts)
-      <> text (if head (printTerm True vars True (head ts)) == '=' then ")" else ": bitstring)")
-  NEW -> text "new" <-> translateTerm S.empty False (head ts) <> text ": bitstring"
+    text "in(publicChannel," <-> translateTerm vars True firstTerm
+      <> text (if startsWith '=' (printTerm True vars True firstTerm) then ")" else ": bitstring)")
+  NEW -> text "new" <-> translateTerm S.empty False firstTerm <> text ": bitstring"
   INSERT -> text "insert" <-> text (showFactName tag) <> translateTerms S.empty False
-  OUT -> text "out(publicChannel," <-> translateTerm S.empty False (head ts) <> text ")"
+  OUT -> text "out(publicChannel," <-> translateTerm S.empty False firstTerm <> text ")"
   EVENT -> text "event" <-> text (showEventName tag) <> translateTermsWithRuleId S.empty False ruleIdName
   where
     translateTerms varSet checkEq =
@@ -634,20 +640,26 @@ translateFactWithRuleId (Fact tag _ ts) factType vars ruleIdName = case factType
     -- For events, prepend the rule ID to the term list
     translateTermsWithRuleId varSet checkEq rid =
       text "(" <> text rid <> (if null ts then text "" else comma <-> (fsep . punctuate comma $ map (translateTerm varSet checkEq) ts)) <> text ")"
+    firstTerm = case ts of
+      term : _ -> term
+      [] -> translationFail "Input, output, and fresh facts require one term."
 
 translateFact :: (Document d) => LNFact -> FactType -> S.Set String -> d
 translateFact (Fact tag _ ts) factType vars = case factType of
   GET -> text "get" <-> text (showFactName tag) <> translateTerms vars True <> text " in"
   IN ->
-    text "in(publicChannel," <-> translateTerm vars True (head ts)
-      <> text (if head (printTerm True vars True (head ts)) == '=' then ")" else ": bitstring)")
-  NEW -> text "new" <-> translateTerm S.empty False (head ts) <> text ": bitstring"
+    text "in(publicChannel," <-> translateTerm vars True firstTerm
+      <> text (if startsWith '=' (printTerm True vars True firstTerm) then ")" else ": bitstring)")
+  NEW -> text "new" <-> translateTerm S.empty False firstTerm <> text ": bitstring"
   INSERT -> text "insert" <-> text (showFactName tag) <> translateTerms S.empty False
-  OUT -> text "out(publicChannel," <-> translateTerm S.empty False (head ts) <> text ")"
+  OUT -> text "out(publicChannel," <-> translateTerm S.empty False firstTerm <> text ")"
   EVENT -> text "event" <-> text (showEventName tag) <> translateTerms S.empty False
   where
     translateTerms varSet checkEq =
       text "(" <> (fsep . punctuate comma $ map (translateTerm varSet checkEq) ts) <> text ")"
+    firstTerm = case ts of
+      term : _ -> term
+      [] -> translationFail "Input, output, and fresh facts require one term."
 
 translatePatternFact ::
   (Document d) =>
@@ -663,12 +675,14 @@ translatePatternFact (Fact tag _ ts) factType vars helperVars =
       foldl' (\acc@(_, helpers) t -> acc `accumulateResult` translatePatternTerm vars helpers t) ([], helperVars) ts
     factDoc = case factType of
       GET -> text "get" <-> text (showFactName tag) <> text "(" <> (fsep . punctuate comma $ doclist) <> text ") in"
-      IN -> text "in(publicChannel," <-> head doclist <> text ": bitstring);"
-      _ -> error "translatePatternFact: fact with type other than GET or IN" -- should not happen, such facts don't require special treatment
+      IN -> case doclist of
+        document : _ -> text "in(publicChannel," <-> document <> text ": bitstring);"
+        [] -> translationFail "An input pattern requires one term."
+      _ -> translationFail "Pattern translation received a fact other than get or input."
 
 sanitizeSymbol :: Char -> String -> String
 sanitizeSymbol pre s =
-  if (s `elem` reservedWords) || Data.Char.isDigit (head s)
+  if (s `elem` reservedWords) || maybe False Data.Char.isDigit (listToMaybe s)
     then pre : s
     else s
 
@@ -737,17 +751,23 @@ reservedWords =
     "yield"
   ]
 
+startsWith :: Char -> String -> Bool
+startsWith expected (actual : _) = expected == actual
+startsWith _ [] = False
+
 showAtom :: Bool -> String -> String
-showAtom sanitized a = case head a of
-  '~' -> sanitize . replaceDots $ tail a
-  '$' -> sanitize . replaceDots $ tail a
-  -- Needs to match ppPubName in Export.hs
-  '\'' -> sanitizeName $ 'v' : (replaceDots . init $ tail a)
-  _ -> sanitize $ replaceDots a
+showAtom sanitized atom = case atom of
+  '~' : rest -> sanitize (replaceDots rest)
+  '$' : rest -> sanitize (replaceDots rest)
+  '\'' : rest -> sanitizeName ('v' : replaceDots (dropLast rest))
+  _ : _ -> sanitize (replaceDots atom)
+  [] -> translationFail "Cannot translate an empty atom name."
   where
     replaceDots = map (\c -> if c == '.' then '_' else c)
     sanitize = if sanitized then sanitizeSymbol 'a' else ("var_" ++)
     sanitizeName = if sanitized then id else ("var_" ++)
+    dropLast [] = []
+    dropLast xs = init xs
 
 ppFunSym :: BC.ByteString -> String
 ppFunSym f = replaceTrueFalse . sanitizeSymbol 'f' $ BC.unpack f
@@ -771,7 +791,7 @@ translateTerm vars checkEq t = text $ printTerm True vars checkEq t
 
 printTerm :: (Show l) => Bool -> S.Set String -> Bool -> Term l -> String
 printTerm sanitizeAtoms vars checkEq t = case viewTerm t of
-  Lit l | checkEq && (S.member (show l) vars || head (show l) == '\'') -> '=' : showAtom sanitizeAtoms (show l)
+  Lit _ | checkEq && (S.member rendered vars || startsWith '\'' rendered) -> '=' : showAtom sanitizeAtoms rendered
   Lit l -> showAtom sanitizeAtoms $ show l
   FApp (AC Mult) ts -> printFuncApp "mult" ts
   FApp (AC Union) ts -> printFuncApp "union" ts
@@ -783,6 +803,9 @@ printTerm sanitizeAtoms vars checkEq t = case viewTerm t of
   FApp (C EMap) ts -> "em" ++ printTermsList ts
   FApp List ts -> printTermsList ts
   where
+    rendered = case viewTerm t of
+      Lit literal -> show literal
+      _ -> ""
     printTermsList ts = "(" ++ intercalate ", " (map (printTerm sanitizeAtoms vars checkEq) ts) ++ ")"
     printFuncApp acOp [t1, t2] = acOp ++ "(" ++ printTerm sanitizeAtoms vars checkEq t1 ++ ", " ++ printTerm sanitizeAtoms vars checkEq t2 ++ ")"
     printFuncApp acOp (tr : trs) = acOp ++ "(" ++ printTerm sanitizeAtoms vars checkEq tr ++ ", " ++ printFuncApp acOp trs ++ ")"
@@ -796,7 +819,7 @@ translatePatternTerm ::
   (d, M.Map String String)
 translatePatternTerm vars helperVars t = case viewTerm t of
   Lit l
-    | S.member (show l) vars || head (show l) == '\'' ->
+    | S.member (show l) vars || startsWith '\'' (show l) ->
         (text "=" <> (text . showAtom True $ show l), helperVars)
   Lit l ->
     (text . showAtom True $ show l, helperVars)
@@ -872,7 +895,7 @@ makeDestructorExpression vars helperVars destructors t a =
     (var, _) = makeVariable t helperVars
     (destr, newDestructors) = makeDestructorName destructors t a
     varDoc =
-      ( if S.member a vars || head a == '\''
+      ( if S.member a vars || startsWith '\'' a
           then
             text "let (="
               <> text (showAtom True a)

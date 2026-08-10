@@ -27,4 +27,3 @@ formulaContainsAction =
     id
     (\_ left right -> left || right)
     (\_ _ body -> body)
-

@@ -30,6 +30,7 @@ diagnosticsToWfReport =
 renderExportDiagnostics :: Seq ExportDiagnostic -> Doc
 renderExportDiagnostics diagnostics
   | null entries = emptyDoc
+  | null proofRelevant = renderSection "Export notes" Informational
   | otherwise =
       text "WARNING: export omitted or approximated proof-relevant input."
         $$ renderSection "Changed assumptions" ChangedAssumptions
@@ -38,6 +39,7 @@ renderExportDiagnostics diagnostics
         $$ renderSection "Export notes" Informational
   where
     entries = toList diagnostics
+    proofRelevant = filter diagnosticIsProofRelevant entries
     renderSection heading impact =
       case filter ((== impact) . (.diagnosticImpact)) entries of
         [] -> emptyDoc
