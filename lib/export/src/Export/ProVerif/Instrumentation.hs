@@ -83,7 +83,7 @@ guardSameActionConclusions completionEvent fm =
         Nothing -> (formula, S.empty, False)
 
     guardCorrespondence formula =
-      let (prefix, body) = collectAllPrefix formula
+      let (prefix, body) = collectQuantifierPrefix All formula
           ctx = reverse prefix
        in case (prefix, body) of
             (_ : _, Conn Imp premise conclusion) ->
@@ -131,11 +131,6 @@ guardSameActionConclusions completionEvent fm =
                           triggers
                         )
             _ -> Nothing
-
-    collectAllPrefix (Qua All v body) =
-      let (rest, inner) = collectAllPrefix body
-       in (v : rest, inner)
-    collectAllPrefix body = ([], body)
 
     collectOccurrences ctx (Ato (Action timepoint fact@(Fact tag _ _)))
       | tag == KUFact
@@ -297,17 +292,11 @@ formulaVariableAllocator formula =
   where
     variableNames =
       S.fromList
-        ( collectBinderNames formula
+        ( map (sanitizeSymbol 'a' . fst) (collectBinderHints formula)
             ++ [ sanitizeSymbol 'a' name
                | LVar name _ _ <- frees formula
                ]
         )
-    collectBinderNames (Qua _ (name, _) body) =
-      sanitizeSymbol 'a' name : collectBinderNames body
-    collectBinderNames (Not body) = collectBinderNames body
-    collectBinderNames (Conn _ left right) =
-      collectBinderNames left ++ collectBinderNames right
-    collectBinderNames _ = []
 
 -- | Event tags linked by temporal equalities that survive rewriting; these
 -- need rule-id instrumentation so the equality can be translated as a
@@ -368,12 +357,6 @@ makeTimeVarsDistinctWithOrigins fm =
         then (fm, M.empty)
         else (splitTimeVars splitNames fm, splitOrigins)
   where
-    collectBinderHintNames (Qua _ (name, _) body) =
-      S.insert name (collectBinderHintNames body)
-    collectBinderHintNames (Not body) = collectBinderHintNames body
-    collectBinderHintNames (Conn _ left right) =
-      collectBinderHintNames left `S.union` collectBinderHintNames right
-    collectBinderHintNames _ = S.empty
 
     allocateSplitNames used0 shared =
       let (_, _, allocated) =

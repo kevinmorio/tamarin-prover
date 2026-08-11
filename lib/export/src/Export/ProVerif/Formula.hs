@@ -7,11 +7,15 @@ module Export.ProVerif.Formula
     buildConjunction,
     classifyFormulaShape,
     collectActionsWithTimepoints,
+    collectBinderHintNames,
+    collectBinderHints,
+    collectQuantifierPrefix,
     collectTemporalEqKeyPairs,
     countQuantifierAlternations,
     eliminateTemporalEqualities,
     eventsSharingTimepoints,
     expandNegatedTimepointComparisons,
+    flattenConjuncts,
     flattenNestedImplications,
     formulaContainsAction,
     formulaContainsKUFact,
@@ -34,7 +38,7 @@ module Export.ProVerif.Formula
     moveConstraintsToConclusion,
     moveNegatedActionsToConclusion,
     normalizeAllTraceFormula,
-    pullNegationsToTop,
+    pullNegationsWithDiagnostic,
     queryKnowledgeFragmentFailure,
     rewrapBoundPrefix,
     rewriteEventFreeExistsTrace,
@@ -65,6 +69,43 @@ buildDisjunction :: [LNFormula] -> LNFormula
 buildDisjunction [] = TF False
 buildDisjunction [formula] = formula
 buildDisjunction formulas = foldr1 (.||.) formulas
+
+-- | Flatten nested conjunctions into the list of their conjuncts.
+flattenConjuncts :: LNFormula -> [LNFormula]
+flattenConjuncts (Conn And p q) = flattenConjuncts p ++ flattenConjuncts q
+flattenConjuncts formula = [formula]
+
+-- | Flatten nested disjunctions into the list of their disjuncts.
+flattenDisjuncts :: LNFormula -> [LNFormula]
+flattenDisjuncts (Conn Or p q) = flattenDisjuncts p ++ flattenDisjuncts q
+flattenDisjuncts formula = [formula]
+
+-- | Collect the leading binders of one quantifier kind, outermost first,
+-- together with the remaining body.
+collectQuantifierPrefix :: Quantifier -> LNFormula -> ([(String, LSort)], LNFormula)
+collectQuantifierPrefix q (Qua q' v body)
+  | q == q' =
+      let (rest, inner) = collectQuantifierPrefix q body
+       in (v : rest, inner)
+collectQuantifierPrefix _ body = ([], body)
+
+-- | Collect the binder hints of all quantifiers in a formula, outermost first.
+collectBinderHints :: LNFormula -> [(String, LSort)]
+collectBinderHints (Qua _ binderHint body) = binderHint : collectBinderHints body
+collectBinderHints (Not body) = collectBinderHints body
+collectBinderHints (Conn _ left right) = collectBinderHints left ++ collectBinderHints right
+collectBinderHints _ = []
+
+-- | The set of binder-hint names of all quantifiers in a formula.
+collectBinderHintNames :: LNFormula -> S.Set String
+collectBinderHintNames = S.fromList . map fst . collectBinderHints
+
+-- | Check whether a formula is an existentially quantified attacker-knowledge action.
+isExistentialKAction :: LNFormula -> Bool
+isExistentialKAction formula =
+  case collectQuantifierPrefix Ex formula of
+    (_ : _, Ato (Action _ fact)) -> isKLogFact fact
+    _ -> False
 
 formulaContainsAction :: LNFormula -> Bool
 formulaContainsAction =
@@ -209,6 +250,21 @@ rewriteFormulaForQuery traceQuantifier fm =
       hasNestedEx left || hasNestedEx right
     hasNestedEx _ = False
 
+-- | Pull negations to the top level, reporting a partial normalization as an
+-- approximation note for the given property kind.
+pullNegationsWithDiagnostic :: String -> LNFormula -> (LNFormula, Maybe String)
+pullNegationsWithDiagnostic propertyKind formula =
+  case pullNegationsToTop formula of
+    Left partiallyNormalized ->
+      ( partiallyNormalized,
+        Just
+          ( "negations could only be partially normalized; the emitted "
+              ++ propertyKind
+              ++ " is an approximation"
+          )
+      )
+    Right fullyNormalized -> (fullyNormalized, Nothing)
+
 rewriteFormulaForAxiomWithDiagnostic :: LNFormula -> (LNFormula, Maybe String)
 rewriteFormulaForAxiomWithDiagnostic formula =
   ( simplifyFormula
@@ -223,13 +279,7 @@ rewriteFormulaForAxiomWithDiagnostic formula =
         . moveNegatedActionsToConclusion
         . eliminateTemporalEqualities
         $ formula
-    (pulled, approximation) =
-      case pullNegationsToTop beforePull of
-        Left partiallyRewritten ->
-          ( partiallyRewritten,
-            Just "negations could only be partially normalized; the emitted axiom is an approximation"
-          )
-        Right rewritten -> (rewritten, Nothing)
+    (pulled, approximation) = pullNegationsWithDiagnostic "axiom" beforePull
 
 mapTopLevelConjunctsFormula :: (LNFormula -> LNFormula) -> LNFormula -> LNFormula
 mapTopLevelConjunctsFormula f (Conn And left right) =
@@ -246,7 +296,7 @@ mapTopLevelConjunctsFormula f fm = f fm
 makeBinderHintsGloballyUnique :: LNFormula -> LNFormula
 makeBinderHintsGloballyUnique formula = snd (go S.empty formula)
   where
-    reserved = collectHintNames formula
+    reserved = collectBinderHintNames formula
 
     go used (Qua q (name, srt) body) =
       let name'
@@ -262,13 +312,6 @@ makeBinderHintsGloballyUnique formula = snd (go S.empty formula)
           (used'', right') = go used' right
        in (used'', Conn conn left' right')
     go used body = (used, body)
-
-    collectHintNames (Qua _ (name, _) body) =
-      S.insert name (collectHintNames body)
-    collectHintNames (Not body) = collectHintNames body
-    collectHintNames (Conn _ left right) =
-      collectHintNames left `S.union` collectHintNames right
-    collectHintNames _ = S.empty
 
 -- | Check if a formula represents a valid existential disjunction pattern.
 -- Valid patterns include:
@@ -491,7 +534,7 @@ rewriteConditionalExistenceCase fm0@(Not outerEx@(Qua Ex _ _)) =
   where
     attempt = do
       (outerVars, _, body) <- openFormulaPrefix outerEx
-      let conjuncts = flattenAndList body
+      let conjuncts = flattenConjuncts body
           indexed = zip [0 :: Int ..] conjuncts
           outerNegatives =
             [ (idx, positive)
@@ -575,15 +618,12 @@ rewriteConditionalExistenceCase fm0@(Not outerEx@(Qua Ex _ _)) =
         go sorts body = (reverse sorts, body)
 
     positiveNegatedExistentials formula =
-      traverse positiveOf (flattenAndList formula)
+      traverse positiveOf (flattenConjuncts formula)
       where
         positiveOf (Not positive@(Qua Ex _ _))
           | isSupportedPositiveConclusion positive = Just positive
         positiveOf _ = Nothing
 
-    flattenAndList (Conn And left right) =
-      flattenAndList left ++ flattenAndList right
-    flattenAndList formula = [formula]
 rewriteConditionalExistenceCase _ = Nothing
 
 -- | Rewrite the standard injective-agreement idiom into an equivalent
@@ -643,7 +683,7 @@ rewriteInjectiveAgreement fm0@(Qua All _ _) =
           | [iP] <- [v | v <- allVars, lvarSort v == LSortNode],
             pTime == varTerm (Free iP),
             ptag /= KUFact && not (isKLogFact pf) -> do
-              let disjs = flattenOrList concl
+              let disjs = flattenDisjuncts concl
               results <- mapM (matchInjDisjunct iP ptag) disjs
               case [(k, r) | (k, Just r) <- zip [0 :: Int ..] results] of
                 [(k, (d', dup, nVars, i2))] -> do
@@ -667,7 +707,7 @@ rewriteInjectiveAgreement fm0@(Qua All _ _) =
     -- premise atom, and its quantified variables.
     matchInjDisjunct iP ptag d@(Qua Ex _ _) = do
       (dVars, _, dBody) <- openFormulaPrefix d
-      let conjs = flattenAndList dBody
+      let conjs = flattenConjuncts dBody
       results <- mapM (matchUniqConjunct iP ptag) conjs
       case [(k, r) | (k, Just r) <- zip [0 :: Int ..] results] of
         [(k, (dup, nVars, i2))]
@@ -682,7 +722,7 @@ rewriteInjectiveAgreement fm0@(Qua All _ _) =
     -- or the universal variant All ys #i2. P(cs)@i2 ==> #i2 = #i.
     matchUniqConjunct iP ptag (Not nEx@(Qua Ex _ _)) = do
       (nVars, _, nBody) <- openFormulaPrefix nEx
-      pure $ case List.partition isNegEq (flattenAndList nBody) of
+      pure $ case List.partition isNegEq (flattenConjuncts nBody) of
         ([Not (Ato (EqE e1 e2))], [Ato dup@(Action dTime (Fact dtag _ _))])
           | dtag == ptag,
             Just i2 <- timeVarOf nVars dTime,
@@ -710,10 +750,6 @@ rewriteInjectiveAgreement fm0@(Qua All _ _) =
     sameTimepoints iP i2 e1 e2 =
       S.fromList [e1, e2] == S.fromList [varTerm (Free iP), varTerm (Free i2)]
 
-    flattenOrList (Conn Or a b) = flattenOrList a ++ flattenOrList b
-    flattenOrList f = [f]
-    flattenAndList (Conn And a b) = flattenAndList a ++ flattenAndList b
-    flattenAndList f = [f]
     rebuildOr = foldr1 (Conn Or)
     rebuildAnd = foldr1 (Conn And)
     zip0 = zip [0 :: Int ..]
@@ -916,7 +952,7 @@ convertNegExWithTimeConstraint fm = case fm of
     -- ctx is the binder context (innermost first) for looking up bound variable sorts
     extractTrailingTimeConstraints :: [(String, LSort)] -> LNFormula -> Maybe ([LNFormula], [LNFormula])
     extractTrailingTimeConstraints ctx f =
-      let conjuncts = flattenConjunction f
+      let conjuncts = flattenConjunctsKeepEx f
           (timeCs, others) = partition (isNegatedTimeConstraintOrLess ctx) conjuncts
        in if null timeCs then Nothing else Just (others, timeCs)
 
@@ -941,11 +977,11 @@ convertNegExWithTimeConstraint fm = case fm of
          in i < length ctx && snd (ctx !! i) == LSortNode
       _ -> False  -- Compound terms are not time variables
 
-    -- Flatten a conjunction into a list
-    flattenConjunction :: LNFormula -> [LNFormula]
-    flattenConjunction (Conn And p q) = flattenConjunction p ++ flattenConjunction q
-    flattenConjunction (Qua Ex x body) = [Qua Ex x body]  -- Don't recurse into existentials
-    flattenConjunction f = [f]
+    -- Flatten a conjunction into a list, without recursing into existentials
+    flattenConjunctsKeepEx :: LNFormula -> [LNFormula]
+    flattenConjunctsKeepEx (Conn And p q) = flattenConjunctsKeepEx p ++ flattenConjunctsKeepEx q
+    flattenConjunctsKeepEx (Qua Ex x body) = [Qua Ex x body]
+    flattenConjunctsKeepEx f = [f]
 
     -- Build conclusion from extracted constraints
     -- For not(#i=#j), the conclusion is #i=#j (negation removed)
@@ -1223,15 +1259,10 @@ hasNegatedEventInFormula :: LNFormula -> Bool
 hasNegatedEventInFormula = go
   where
     go (Qua _ _ p) = go p
-    go (Not p) = hasEventAnywhere p || go p
+    go (Not p) = formulaContainsAction p || go p
     go (Conn _ p q) = go p || go q
     go _ = False
 
-    hasEventAnywhere (Ato (Action _ _)) = True
-    hasEventAnywhere (Not f) = hasEventAnywhere f
-    hasEventAnywhere (Conn _ f1 f2) = hasEventAnywhere f1 || hasEventAnywhere f2
-    hasEventAnywhere (Qua _ _ f) = hasEventAnywhere f
-    hasEventAnywhere _ = False
 
 -- | Check if a formula has a simple negated action pattern that cannot be translated.
 -- Pattern: not(Ex x. Action(x)@i) - this cannot be rewritten to a positive form
@@ -1306,15 +1337,10 @@ isAllImpliesExists f@(Conn Imp p q) = isQuantifierFree f || (isQuantifierFree p 
     hasOnlyExistentials (Qua Ex _ body') = isQuantifierFree body' || hasOnlyExistentials body'
     hasOnlyExistentials (Conn Or (Qua Ex _ b1) (Qua Ex _ b2)) = isQuantifierFree b1 || isQuantifierFree b2
     -- Allow temporal/equality constraints in disjunction with existentials
-    hasOnlyExistentials (Conn Or f1 f2) | isConstr f1 || isConstr f2 = hasOnlyExistentials f1 || hasOnlyExistentials f2 || isConstr f1 || isConstr f2
-    hasOnlyExistentials fm | isConstr fm = True
+    hasOnlyExistentials (Conn Or f1 f2) | isConstraintAtom f1 || isConstraintAtom f2 = hasOnlyExistentials f1 || hasOnlyExistentials f2 || isConstraintAtom f1 || isConstraintAtom f2
+    hasOnlyExistentials fm | isConstraintAtom fm = True
     hasOnlyExistentials _ = False
     -- Check if a formula is a temporal or equality constraint
-    isConstr (Ato (Less _ _)) = True
-    isConstr (Ato (EqE _ _)) = True
-    isConstr (Not (Ato (EqE _ _))) = True
-    isConstr (Conn Or g1 g2) = isConstr g1 && isConstr g2
-    isConstr _ = False
 isAllImpliesExists _ = False
 
 -- | All x1..xn. not(F) is equivalent to not(Ex x1..xn. F). Return the inner
@@ -1389,15 +1415,15 @@ rewritePositiveWitnessExistsTrace :: LNFormula -> Maybe LNFormula
 rewritePositiveWitnessExistsTrace fm = do
   let normalized = pnf (Not (makeBinderHintsGloballyUnique fm))
       (prefix, body) = collectPrefix normalized
-      disjuncts = flattenDisjunction body
+      disjuncts = flattenDisjuncts body
   (premiseAtoms, violationBranches) <- classifyDisjuncts prefix disjuncts
   let premise = buildConjunction premiseAtoms
       conclusion = buildDisjunction violationBranches
   if null prefix
       || null premiseAtoms
       || null violationBranches
-      || not (containsAction premise)
-      || not (containsAction conclusion)
+      || not (formulaContainsAction premise)
+      || not (formulaContainsAction conclusion)
     then Nothing
     else
       Just $
@@ -1409,9 +1435,6 @@ rewritePositiveWitnessExistsTrace fm = do
        in ((q, v) : rest, inner)
     collectPrefix body = ([], body)
 
-    flattenDisjunction (Conn Or p q) =
-      flattenDisjunction p ++ flattenDisjunction q
-    flattenDisjunction formula = [formula]
 
     classifyDisjuncts _ [] = Just ([], [])
     classifyDisjuncts prefix (formula : rest) = do
@@ -1442,13 +1465,6 @@ rewritePositiveWitnessExistsTrace fm = do
       isSupportedViolation p && isSupportedViolation q
     isSupportedViolation _ = False
 
-    containsAction =
-      foldFormula
-        (\case Action _ _ -> True; _ -> False)
-        (const False)
-        id
-        (\_ p q -> p || q)
-        (\_ _ p -> p)
 
     usesOnlyUniversalBinders prefix formula =
       all isUniversal (S.toList (boundIndices formula))
@@ -1509,13 +1525,13 @@ rewriteCompoundAllTraceFormula fm =
     -- P ==> (C1 & ... & Cn) is equivalent to
     -- (P ==> C1) & ... & (P ==> Cn).
     distributeCorrespondenceConclusion formula =
-      let (prefix, body) = collectPrefix All formula
+      let (prefix, body) = collectQuantifierPrefix All formula
        in case (prefix, body) of
             (_ : _, Conn Imp premise conclusion@(Conn And _ _)) ->
               Just $
                 buildConjunction
                   [ rewrapBoundPrefix All prefix (Conn Imp premise conjunct)
-                  | conjunct <- flattenConjunction conclusion
+                  | conjunct <- flattenConjuncts conclusion
                   ]
             _ -> Nothing
 
@@ -1529,7 +1545,7 @@ rewriteCompoundAllTraceFormula fm =
     -- All xs. (G & P) ==> C is equivalent to
     -- All xs. P ==> (C or not G).
     moveInnerSafetyGuard formula =
-      let (prefix, body) = collectPrefix All formula
+      let (prefix, body) = collectQuantifierPrefix All formula
        in case (prefix, body) of
             (_ : _, Conn Imp premise conclusion) -> do
               (safety, remaining) <- extractOneSafetyGuard premise
@@ -1552,23 +1568,15 @@ rewriteCompoundAllTraceFormula fm =
         else Nothing
     distributeAttackerDisjunction _ = Nothing
 
-    collectPrefix q (Qua q' v body)
-      | q == q' =
-          let (rest, inner) = collectPrefix q body
-           in (v : rest, inner)
-    collectPrefix _ body = ([], body)
 
     collectNonemptyExPrefix formula =
-      case collectPrefix Ex formula of
+      case collectQuantifierPrefix Ex formula of
         ([], _) -> Nothing
         result -> Just result
 
-    flattenConjunction (Conn And left right) =
-      flattenConjunction left ++ flattenConjunction right
-    flattenConjunction formula = [formula]
 
     addViolationToCorrespondence violation formula =
-      let (prefix, body) = collectPrefix All formula
+      let (prefix, body) = collectQuantifierPrefix All formula
        in case (prefix, body) of
             (_ : _, Conn Imp premise conclusion) ->
               Just $
@@ -1585,44 +1593,25 @@ rewriteCompoundAllTraceFormula fm =
         [(safety, remaining@(_ : _))] -> Just (safety, remaining)
         _ -> Nothing
       where
-        conjuncts = flattenConjunction premise
+        conjuncts = flattenConjuncts premise
 
     negateSafetyGuard safety
       | isUniversalSafetyGuard safety,
         let violation = simplifyFormula (nnf (Not safety)),
-        isSupportedPositiveViolation violation,
-        containsAction violation =
+        isSupportedPositiveConclusion violation,
+        formulaContainsAction violation =
           Just violation
       | otherwise = Nothing
 
     isUniversalSafetyGuard (Conn And left right) =
       isUniversalSafetyGuard left && isUniversalSafetyGuard right
     isUniversalSafetyGuard formula =
-      case collectPrefix All formula of
+      case collectQuantifierPrefix All formula of
         (_ : _, Conn Imp premise conclusion) ->
           isQuantifierFree premise && isQuantifierFree conclusion
         _ -> False
 
-    isSupportedPositiveViolation (Qua Ex _ body) =
-      isSupportedPositiveViolation body
-    isSupportedPositiveViolation (Conn And left right) =
-      isSupportedPositiveViolation left && isSupportedPositiveViolation right
-    isSupportedPositiveViolation (Conn Or left right) =
-      isSupportedPositiveViolation left && isSupportedPositiveViolation right
-    isSupportedPositiveViolation (Ato (Action _ _)) = True
-    isSupportedPositiveViolation (Ato (EqE _ _)) = True
-    isSupportedPositiveViolation (Ato (Less _ _)) = True
-    isSupportedPositiveViolation (Not (Ato (EqE _ _))) = True
-    isSupportedPositiveViolation (Not (Ato (Less _ _))) = True
-    isSupportedPositiveViolation _ = False
 
-    containsAction =
-      foldFormula
-        (\case Action _ _ -> True; _ -> False)
-        (const False)
-        id
-        (\_ left right -> left || right)
-        (\_ _ body -> body)
 
     splitOneAttackerDisjunction body =
       case
@@ -1636,12 +1625,8 @@ rewriteCompoundAllTraceFormula fm =
         [splitBodies] -> Just splitBodies
         _ -> Nothing
       where
-        conjuncts = flattenConjunction body
+        conjuncts = flattenConjuncts body
 
-    isExistentialKAction formula =
-      case collectPrefix Ex formula of
-        (_ : _, Ato (Action _ fact)) -> isKLogFact fact
-        _ -> False
 
 -- | Normalize a tree of guarded all-trace correspondences without reference
 -- to protocol or fact names.  The transformation composes three general
@@ -1676,7 +1661,7 @@ rewriteGuardedAllTraceFormula fm = do
 
     extractOuterEscapes (Conn Imp outerGuard propertyTree)
       | looksLikePropertyTree propertyTree,
-        let guardParts = flattenConjunction outerGuard,
+        let guardParts = flattenConjuncts outerGuard,
         not (null guardParts),
         Just escapes <- traverse positiveNegatedExistential guardParts =
           Just (escapes, propertyTree)
@@ -1689,10 +1674,10 @@ rewriteGuardedAllTraceFormula fm = do
     looksLikePropertyTree _ = False
 
     normalizeCorrespondence outerEscapes formula =
-      let (prefix, body) = collectPrefix All formula
+      let (prefix, body) = collectQuantifierPrefix All formula
        in case (prefix, body) of
             (_ : _, Conn Imp premise conclusion) -> do
-              let premiseParts = flattenConjunction premise
+              let premiseParts = flattenConjuncts premise
                   localEscapes =
                     mapMaybe positiveNegatedExistential premiseParts
                   safetyViolations =
@@ -1734,7 +1719,7 @@ rewriteGuardedAllTraceFormula fm = do
     positiveNegatedExistential _ = Nothing
 
     negateUniversalSafetyGuard safety =
-      case collectPrefix All safety of
+      case collectQuantifierPrefix All safety of
         (_ : _, Conn Imp premise _) ->
           let violation = simplifyFormula (nnf (Not safety))
            in if isSupportedPositivePremise premise
@@ -1745,15 +1730,7 @@ rewriteGuardedAllTraceFormula fm = do
                 else Nothing
         _ -> Nothing
 
-    collectPrefix q (Qua q' v body)
-      | q == q' =
-          let (rest, inner) = collectPrefix q body
-           in (v : rest, inner)
-    collectPrefix _ body = ([], body)
 
-    flattenConjunction (Conn And left right) =
-      flattenConjunction left ++ flattenConjunction right
-    flattenConjunction formula = [formula]
 
     splitConclusion (Conn And left right) =
       splitConclusion left ++ splitConclusion right
@@ -1775,10 +1752,6 @@ rewriteGuardedAllTraceFormula fm = do
       isSupportedPositiveConclusion positive && formulaContainsAction positive
     isNegatedSupportedExistential _ = False
 
-    isExistentialKAction formula =
-      case collectPrefix Ex formula of
-        (_ : _, Ato (Action _ fact)) -> isKLogFact fact
-        _ -> False
 
 -- | Shared all-trace normalization entry point.  Existing compound
 -- correspondence rewrites retain priority for output stability; the

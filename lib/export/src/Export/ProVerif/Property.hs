@@ -277,12 +277,7 @@ prepareRestrictionProperty _typeEnvironment restriction
         . eliminateTemporalEqualities
         . simplifyFormula
         $ restriction._rstrFormula
-    (normalized, approximation) = case pullNegationsToTop beforePull of
-      Left partiallyNormalized ->
-        ( partiallyNormalized,
-          Just "negations could only be partially normalized; the emitted restriction is an approximation"
-        )
-      Right fullyNormalized -> (fullyNormalized, Nothing)
+    (normalized, approximation) = pullNegationsWithDiagnostic "restriction" beforePull
     needsRuleId = formulaHasSharedTimepoints normalized
     (formulaWithDistinctTimepoints, splitTimeOrigins)
       | needsRuleId = makeTimeVarsDistinctWithOrigins normalized
@@ -348,7 +343,7 @@ prepareRestrictionProperty _typeEnvironment restriction
         if branchCount <= limit
           then
             Just
-              [ buildConjunction (flattenConjunction leftBranch ++ flattenConjunction rightBranch)
+              [ buildConjunction (flattenConjuncts leftBranch ++ flattenConjuncts rightBranch)
               | leftBranch <- leftBranches,
                 rightBranch <- rightBranches
               ]
@@ -357,10 +352,6 @@ prepareRestrictionProperty _typeEnvironment restriction
         | limit >= 1,
           isQuantifierFree formula -> Just [formula]
         | otherwise -> Nothing
-
-    flattenConjunction (Conn And left right) =
-      flattenConjunction left ++ flattenConjunction right
-    flattenConjunction formula = [formula]
 
     tryRewriteNegatedRestriction (Not formula) = tryRewriteNegatedBody formula
     tryRewriteNegatedRestriction _ = Nothing
@@ -518,12 +509,7 @@ supportsQueryFormula formula =
   where
     go frm
       | formulaContainsKUFact frm = pure False
-    go (Not fm@(Qua Ex _ _)) = do
-      (_, _, body) <- openFormulaPrefix fm
-      pure (isQuantifierFree body)
-    go (Not fm@(Qua All _ _)) = do
-      (_, _, body) <- openFormulaPrefix fm
-      supportsUniversalFormula True body
+    go (Not fm@(Qua {})) = go fm
     go fm@(Qua Ex _ _) = do
       (_, _, body) <- openFormulaPrefix fm
       pure (isQuantifierFree body)

@@ -254,12 +254,6 @@ ppTimeTypeVar te lvar =
     Nothing -> ppLVar lvar <> text ":bitstring"
     Just t -> ppLVar lvar <> text ":" <> text (ppType t)
 
-collectBinderHints :: LNFormula -> [(String, LSort)]
-collectBinderHints (Qua _ binderHint body) = binderHint : collectBinderHints body
-collectBinderHints (Not body) = collectBinderHints body
-collectBinderHints (Conn _ left right) = collectBinderHints left ++ collectBinderHints right
-collectBinderHints _ = []
-
 -- | Rename timepoint variables whose name collides with a term variable.
 -- Tamarin keeps term variables ('t') and timepoint variables ('#t') in
 -- separate namespaces, but a ProVerif query has a single namespace. The term
