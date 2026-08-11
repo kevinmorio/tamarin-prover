@@ -37,12 +37,26 @@ data PVElement
   | RSL
   deriving (Eq, Ord, Show)
 
+-- | Context threaded through the formula and atom printers.
+data FormulaRenderContext = FormulaRenderContext
+  { renderTimeMode :: EventTimeMode,
+    renderRidNames :: M.Map String String,
+    renderRuleIdEvents :: S.Set String,
+    renderTypingEnv :: TypingEnvironment
+  }
+
+-- | Whether an atom is rendered under a negation.
+data AtomPolarity = PositiveAtom | NegatedAtom
+  deriving (Eq, Ord, Show)
+
 renderSapicFormula :: LNFormula -> Doc
 renderSapicFormula formula =
   fst . snd $
     Precise.evalFresh
-      (ppLFormula emptyTypeEnv (ppNAtom RenderEventTime M.empty S.empty) formula)
+      (ppLFormula plainContext (ppNAtom plainContext) formula)
       (avoidPrecise formula)
+  where
+    plainContext = FormulaRenderContext RenderEventTime M.empty S.empty emptyTypeEnv
 
 mergeType :: (Eq a) => Maybe a -> Maybe a -> Maybe a
 mergeType t Nothing = t
@@ -65,19 +79,22 @@ typeVarsEvent TypingEnvironment {events = ev} tag ts =
         (zip ts t)
     Nothing -> M.empty
 
+-- | The per-occurrence rule-id variable of a timepoint variable, if any.
+ridOfTerm :: FormulaRenderContext -> LNTerm -> Maybe Doc
+ridOfTerm context t
+  | renderTimeMode context == OmitEventTime = Nothing
+  | otherwise = case viewTerm t of
+      Lit (Var (LVar n LSortNode _)) -> text <$> M.lookup n (renderRidNames context)
+      _ -> Nothing
+
 ppProtoAtom ::
-  (HighlightDocument d, Ord k, Show k, Show c) =>
-  EventTimeMode ->
-  d -> -- shared rule-ID variable
-  (Term (Lit c k) -> Maybe d) -> -- per-occurrence rule-id variable of a timepoint variable, if any
-  S.Set String -> -- events requiring rule identifiers
-  TypingEnvironment ->
-  Bool ->
-  (s (Term (Lit c k)) -> d) ->
-  (Term (Lit c k) -> d) ->
-  ProtoAtom s (Term (Lit c k)) ->
-  (d, M.Map k SapicType)
-ppProtoAtom eventTimeMode sharedRuleId ridOf ruleIdEvents te _ _ ppT (Action v f@(Fact tag _ ts))
+  FormulaRenderContext ->
+  AtomPolarity ->
+  (s LNTerm -> Doc) ->
+  (LNTerm -> Doc) ->
+  ProtoAtom s LNTerm ->
+  (Doc, M.Map LVar SapicType)
+ppProtoAtom context _ _ ppT (Action v f@(Fact tag _ ts))
   | factTagArity tag /= length ts = translationFail $ "MALFORMED function" ++ show tag
   | tag == KUFact = translationFail "KU facts are outside the supported formula translation"
   | isKLogFact f =
@@ -88,51 +105,39 @@ ppProtoAtom eventTimeMode sharedRuleId ridOf ruleIdEvents te _ _ ppT (Action v f
               <> eventArgs ('e' : factTagName tag) ts
               <> text ")"
           ),
-        typeVarsEvent te tag ts
+        typeVarsEvent (renderTypingEnv context) tag ts
       )
   where
     factName = factTagName tag
-    useRuleId = factName `S.member` ruleIdEvents
+    useRuleId = factName `S.member` renderRuleIdEvents context
     ppFactL n t = nestShort' (n ++ "(") ")" . fsep . punctuate comma $ map ppT t
     eventArgs n t
       | useRuleId = nestShort' (n ++ "(") ")" . fsep . punctuate comma $ (ridDoc : map ppT t)
       | otherwise = ppFactL n t
-    ridDoc = fromMaybe sharedRuleId (ridOf v)
+    ridDoc = fromMaybe (text "rid") (ridOfTerm context v)
     withEventTime document =
-      case eventTimeMode of
+      case renderTimeMode context of
         RenderEventTime -> document <> opAction <> ppT v
         OmitEventTime -> document
-ppProtoAtom _ _ _ _ _ _ ppS _ (Syntactic s) = (ppS s, M.empty)
+ppProtoAtom _ _ ppS _ (Syntactic s) = (ppS s, M.empty)
 -- A temporal equality between rule-id instrumented events is translated as an
 -- equality of their rule-id variables: distinct ProVerif events never share a
 -- timepoint, while in Tamarin equal timepoints mean "same rule instance".
-ppProtoAtom _ _ ridOf _ _ False _ ppT (EqE l r) =
-  case (ridOf l, ridOf r) of
-    (Just dl, Just dr) -> (sep [dl <-> opEqual, dr], M.empty)
-    _ -> (sep [ppT l <-> opEqual, ppT r], M.empty)
-ppProtoAtom _ _ ridOf _ _ True _ ppT (EqE l r) =
-  case (ridOf l, ridOf r) of
-    (Just dl, Just dr) -> (sep [dl <-> text "<>", dr], M.empty)
-    _ -> (sep [ppT l <-> text "<>", ppT r], M.empty)
-ppProtoAtom _ _ _ _ _ _ _ ppT (Less u v) = (ppT u <-> opLess <-> ppT v, M.empty)
-ppProtoAtom _ _ _ _ _ _ _ ppT (Subterm u v) = (text "subterm(" <> ppT u <> comma <> ppT v <> text ")", M.empty)
-ppProtoAtom _ _ _ _ _ _ _ _ (Last i) = (operator_ "last" <> parens (text (show i)), M.empty)
-
-ppAtom :: EventTimeMode -> M.Map String String -> S.Set String -> TypingEnvironment -> Bool -> (LNTerm -> Doc) -> ProtoAtom s LNTerm -> (Doc, M.Map LVar SapicType)
-ppAtom eventTimeMode ridNames ruleIdEvents te b =
-  ppProtoAtom eventTimeMode (text "rid") ridOf ruleIdEvents te b (const emptyDoc)
+ppProtoAtom context polarity _ ppT (EqE l r) =
+  case (ridOfTerm context l, ridOfTerm context r) of
+    (Just dl, Just dr) -> (sep [dl <-> comparisonOp, dr], M.empty)
+    _ -> (sep [ppT l <-> comparisonOp, ppT r], M.empty)
   where
-    ridOf t
-      | eventTimeMode == OmitEventTime = Nothing
-      | otherwise = case viewTerm t of
-          Lit (Var (LVar n LSortNode _)) -> text <$> M.lookup n ridNames
-          _ -> Nothing
+    comparisonOp = case polarity of
+      PositiveAtom -> opEqual
+      NegatedAtom -> text "<>"
+ppProtoAtom _ _ _ ppT (Less u v) = (ppT u <-> opLess <-> ppT v, M.empty)
+ppProtoAtom _ _ _ ppT (Subterm u v) = (text "subterm(" <> ppT u <> comma <> ppT v <> text ")", M.empty)
+ppProtoAtom _ _ _ _ (Last i) = (operator_ "last" <> parens (text (show i)), M.empty)
 
--- only used for ProVerif queries display
--- the Bool is set to False when we must negate the atom
-ppNAtom :: EventTimeMode -> M.Map String String -> S.Set String -> TypingEnvironment -> Bool -> ProtoAtom s LNTerm -> (Doc, M.Map LVar SapicType)
-ppNAtom eventTimeMode ridNames ruleIdEvents te b =
-  ppAtom eventTimeMode ridNames ruleIdEvents te b (fst . ppLNTerm emptyTC)
+ppNAtom :: FormulaRenderContext -> AtomPolarity -> ProtoAtom s LNTerm -> (Doc, M.Map LVar SapicType)
+ppNAtom context polarity =
+  ppProtoAtom context polarity (const emptyDoc) (fst . ppLNTerm emptyTC)
 
 extractFree :: BVar p -> p
 extractFree (Free v) = v
@@ -142,27 +147,19 @@ toLAt :: (Ord (f1 b), Ord (f1 (BVar b)), Functor f2, Functor f1) => f2 (Term (f1
 toLAt = fmap (mapLits (fmap extractFree))
 
 ppLFormula ::
-  (MonadFresh m, Ord c, HighlightDocument b, Functor syn) =>
-  TypingEnvironment ->
-  (TypingEnvironment -> Bool -> ProtoAtom syn (Term (Lit c LVar)) -> (b, M.Map LVar SapicType)) ->
-  ProtoFormula syn (String, LSort) c LVar ->
-  m ([LVar], (b, M.Map LVar SapicType))
-ppLFormula = ppLFormulaWithTimeVars True
-
-ppLFormulaWithTimeVars ::
-  (MonadFresh m, Ord c, HighlightDocument b, Functor syn) =>
-  Bool ->
-  TypingEnvironment ->
-  (TypingEnvironment -> Bool -> ProtoAtom syn (Term (Lit c LVar)) -> (b, M.Map LVar SapicType)) ->
-  ProtoFormula syn (String, LSort) c LVar ->
-  m ([LVar], (b, M.Map LVar SapicType))
-ppLFormulaWithTimeVars keepTimeVars te ppAt =
+  (MonadFresh m, Functor syn) =>
+  FormulaRenderContext ->
+  (AtomPolarity -> ProtoAtom syn LNTerm -> (Doc, M.Map LVar SapicType)) ->
+  ProtoFormula syn (String, LSort) Name LVar ->
+  m ([LVar], (Doc, M.Map LVar SapicType))
+ppLFormula context ppAt =
   printFormula
   where
-    printFormula (Ato a) = pure ([], ppAt te False (toLAt a))
+    keepTimeVars = renderTimeMode context == RenderEventTime
+    printFormula (Ato a) = pure ([], ppAt PositiveAtom (toLAt a))
     printFormula (TF True) = pure ([], (operator_ "true", M.empty)) -- "T"
     printFormula (TF False) = pure ([], (operator_ "false", M.empty)) -- "F"
-    printFormula (Not (Ato a@(EqE _ _))) = pure ([], ppAt te True (toLAt a))
+    printFormula (Not (Ato a@(EqE _ _))) = pure ([], ppAt NegatedAtom (toLAt a))
     printFormula (Not p) = do
       (vs, (p', envp)) <- printFormula p
       pure (vs, (operator_ "not" <> opParens p', envp))
@@ -183,19 +180,17 @@ ppLFormulaWithTimeVars keepTimeVars te ppAt =
 
 data DeclarationMode
   = QueryDeclaration
-  | AssumptionDeclaration PVElement Bool
+  | AssumptionDeclaration PVElement EventTimeMode
 
 ppFormulaDeclaration ::
   MonadFresh m =>
   DeclarationMode ->
-  M.Map String String ->
-  S.Set String ->
-  TypingEnvironment ->
+  FormulaRenderContext ->
   LNFormula ->
   [LVar] ->
   String ->
   m Doc
-ppFormulaDeclaration mode originalRuleIdNames ruleIdEvents typeEnvironment formula extraVariables attributes = do
+ppFormulaDeclaration mode context formula extraVariables attributes = do
   (variables, (body, variableTypes)) <- renderBody formula
   let needsSharedRuleId
         | M.null ruleIdNames = formulaUsesRuleIdEvents ruleIdEvents formula
@@ -223,20 +218,20 @@ ppFormulaDeclaration mode originalRuleIdNames ruleIdEvents typeEnvironment formu
           text "."
         ]
   where
-    keepTimeVariables = case mode of
-      QueryDeclaration -> True
-      AssumptionDeclaration _ keep -> keep
+    ruleIdEvents = renderRuleIdEvents context
+    eventTimeMode = case mode of
+      QueryDeclaration -> RenderEventTime
+      AssumptionDeclaration _ timeMode -> timeMode
     ruleIdNames
-      | keepTimeVariables = originalRuleIdNames
+      | eventTimeMode == RenderEventTime = renderRidNames context
       | otherwise = M.empty
-    eventTimeMode
-      | keepTimeVariables = RenderEventTime
-      | otherwise = OmitEventTime
-    atomRenderer = ppNAtom eventTimeMode ruleIdNames ruleIdEvents
+    atomContext =
+      context {renderTimeMode = eventTimeMode, renderRidNames = ruleIdNames}
+    atomRenderer = ppNAtom atomContext
     renderBody (Conn Imp (TF True) conclusion)
       | QueryDeclaration <- mode = do
           (variables, (conclusionDoc, variableTypes)) <-
-            ppLFormula typeEnvironment atomRenderer conclusion
+            ppLFormula atomContext atomRenderer conclusion
           pure
             ( variables,
               ( sep [opParens (text "attacker(())") <-> text "==>", opParens conclusionDoc],
@@ -244,7 +239,7 @@ ppFormulaDeclaration mode originalRuleIdNames ruleIdEvents typeEnvironment formu
               )
             )
     renderBody body =
-      ppLFormulaWithTimeVars keepTimeVariables typeEnvironment atomRenderer body
+      ppLFormula atomContext atomRenderer body
     declarationWord R = "restriction "
     declarationWord RSL = "axiom "
 ppTimeTypeVar :: M.Map LVar SapicType -> LVar -> Doc
@@ -368,30 +363,25 @@ renameConjunctiveDuplicateBinders fm extravs = snd (go True M.empty st0 fm)
     -- already handled (nested duplicates).
     freshName name used = freshNameAvoiding "_" used name
 
-ppFormulaEx :: DeclarationMode -> M.Map String String -> S.Set String -> TypingEnvironment -> LNFormula -> [LVar] -> String -> Doc
-ppFormulaEx mode originalRuleIdNames ruleIdEvents typeEnvironment originalFormula originalVariables attributes =
+ppFormulaEx :: DeclarationMode -> FormulaRenderContext -> LNFormula -> [LVar] -> String -> Doc
+ppFormulaEx mode context originalFormula originalVariables attributes =
   Precise.evalFresh
-    (ppFormulaDeclaration mode ruleIdNames ruleIdEvents typeEnvironment formula variables attributes)
+    (ppFormulaDeclaration mode context {renderRidNames = ruleIdNames} formula variables attributes)
     (avoidPrecise formula)
   where
     (renaming, renamedFormula, variables) =
       renameCollidingTimepoints originalFormula originalVariables
     formula = renameConjunctiveDuplicateBinders renamedFormula variables
-    ruleIdNames = M.mapKeys (\key -> M.findWithDefault key key renaming) originalRuleIdNames
+    ruleIdNames =
+      M.mapKeys (\key -> M.findWithDefault key key renaming) (renderRidNames context)
 
-renderPreparedQuery ::
-  M.Map String String ->
-  S.Set String ->
-  TypingEnvironment ->
-  PreparedFormula ->
-  String ->
-  Doc
-renderPreparedQuery ridNames ruleIdEvents typeEnvironment prepared attributes =
+renderPreparedQuery :: FormulaRenderContext -> PreparedFormula -> String -> Doc
+renderPreparedQuery context prepared attributes =
   Precise.evalFresh (go formula) (avoidPrecise formula)
   where
     formula = prepared.preparedFormula
     renderFormula body variables =
-      ppFormulaEx QueryDeclaration ridNames ruleIdEvents typeEnvironment body variables attributes
+      ppFormulaEx QueryDeclaration context body variables attributes
     openAndRender quantified = do
       (variables, _, body) <- openFormulaPrefix quantified
       pure (renderFormula body variables)
@@ -434,9 +424,12 @@ ppLemma ruleIdEvents te p (PropertyEmitted prepared) =
           | otherwise = Nothing
         queryDoc =
           renderPreparedQuery
-            preparedFormulaPlan.preparedRuleIdNames
-            ruleIdEvents
-            te
+            ( FormulaRenderContext
+                RenderEventTime
+                preparedFormulaPlan.preparedRuleIdNames
+                ruleIdEvents
+                te
+            )
             preparedFormulaPlan
             useInduction
     reconstructionComment = case prepared.preparedQueryRecombination of
@@ -457,12 +450,18 @@ renderPreparedAssumption element ruleIdEvents typeEnvironment prepared attribute
   Precise.evalFresh (go formula) (avoidPrecise formula)
   where
     formula = prepared.preparedFormula
+    timeMode
+      | prepared.preparedKeepTimeVariables = RenderEventTime
+      | otherwise = OmitEventTime
     renderFormula body variables =
       ppFormulaEx
-        (AssumptionDeclaration element prepared.preparedKeepTimeVariables)
-        prepared.preparedRuleIdNames
-        ruleIdEvents
-        typeEnvironment
+        (AssumptionDeclaration element timeMode)
+        ( FormulaRenderContext
+            timeMode
+            prepared.preparedRuleIdNames
+            ruleIdEvents
+            typeEnvironment
+        )
         body
         variables
         attributes
