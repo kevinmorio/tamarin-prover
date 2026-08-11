@@ -422,16 +422,6 @@ applyRewriteForShape shape fm = case shape of
     collectNegatedAtoms (Not p) = [p]
     collectNegatedAtoms _ = []
 
--- | Eliminate temporal equality constraints by unifying the equated timepoint
--- variables (one-point rule). In Tamarin, @Ex #j. B()\@j & #i = #j@ is
--- equivalent to @B()\@i@; rewriting the explicit-equality form into the
--- shared-variable form lets the shared-timepoint splitting (rule-id
--- instrumentation) apply, instead of leaving behind an equality between two
--- distinct ProVerif timepoints, which is never satisfiable there (every
--- ProVerif event has a unique timepoint).
--- Dually for universals: @All #j. (A()\@j & #i = #j) ==> C@ becomes
--- @A()\@i ==> C@. Both rewrites are equivalences, so they are sound at any
--- polarity.
 -- | Split a conditional safety property by whether a witness exists.  The
 -- source formula is a negated existential attack whose safety conditions
 -- contain:
@@ -685,6 +675,16 @@ rewriteInjectiveAgreement fm0@(Qua All _ _) =
     zip0 = zip [0 :: Int ..]
 rewriteInjectiveAgreement fm0 = fm0
 
+-- | Eliminate temporal equality constraints by unifying the equated timepoint
+-- variables (one-point rule). In Tamarin, @Ex #j. B()\@j & #i = #j@ is
+-- equivalent to @B()\@i@; rewriting the explicit-equality form into the
+-- shared-variable form lets the shared-timepoint splitting (rule-id
+-- instrumentation) apply, instead of leaving behind an equality between two
+-- distinct ProVerif timepoints, which is never satisfiable there (every
+-- ProVerif event has a unique timepoint).
+-- Dually for universals: @All #j. (A()\@j & #i = #j) ==> C@ becomes
+-- @A()\@i ==> C@. Both rewrites are equivalences, so they are sound at any
+-- polarity.
 eliminateTemporalEqualities :: LNFormula -> LNFormula
 eliminateTemporalEqualities fm0 =
   let fm' = go fm0
@@ -1208,10 +1208,7 @@ data TimeVarKey
   | BoundTimeVar Int
   deriving (Show, Eq, Ord)
 
-data BinderInfo = BinderInfo
-  { _binderId :: Int,
-    _binderSort :: LSort
-  }
+data BinderInfo = BinderInfo Int LSort
 
 pullNegationsToTop :: LNFormula -> Either LNFormula LNFormula
 pullNegationsToTop fm =
@@ -1801,7 +1798,7 @@ isNegatedExistsWithConjunction (Not (Qua Ex _ body)) =
     hasNegatedExistential _ = False
 isNegatedExistsWithConjunction _ = False
 
--- | -- | Check if a formula is of the form Ex x1 ... xn. F where F contains only negative existential quantifiers and conjunctions.
+-- | Check if a formula is of the form Ex x1 ... xn. F where F contains only negative existential quantifiers and conjunctions.
 -- This pattern requires at least one negated existential to be useful for transformation.
 isExistsWithNegatedExistentials :: LNFormula -> Bool
 isExistsWithNegatedExistentials (Qua Ex _ body) = isExistsWithNegatedExistentials body

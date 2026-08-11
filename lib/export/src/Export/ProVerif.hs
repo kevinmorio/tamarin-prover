@@ -198,7 +198,7 @@ prettyProVerifTheory m options lemSel (thy', typEnv) =
         else loadRestrictions sharedEventTags typEnv preparedRestrictionPlans thy
     queries = loadQueries thy
     (axioms, lemmas, lemmaHeaders) =
-      loadLemmas completionEvent preparedQueryPlans preparedAxiomPlans propertyEventTags hasSpecificLemmas lemSel tc typEnv thy
+      loadLemmas preparedQueryPlans preparedAxiomPlans propertyEventTags hasSpecificLemmas lemSel tc typEnv thy
     (ruleproc, ruleComb, ruleHeaders) =
       loadRules
         instrumentationPlan.instrumentationCompletionEvent
@@ -238,7 +238,6 @@ collectProVerifDiagnostics hasSpecificLemmas lemSel tc preparedQueryPlans prepar
         Just (PropertyOmitted reason) ->
           [ ExportDiagnostic
               "PV-GOAL-OMITTED"
-              DiagnosticWarning
               UntranslatedGoal
               (LemmaSubject lemma._lName)
               ("produced no ProVerif query: " ++ reason)
@@ -252,7 +251,6 @@ collectProVerifDiagnostics hasSpecificLemmas lemSel tc preparedQueryPlans prepar
           Just _ ->
             [ ExportDiagnostic
                 "PV-GOAL-SPLIT"
-                DiagnosticNotice
                 Informational
                 (LemmaSubject lemma._lName)
                 ( "was emitted as "
@@ -264,7 +262,6 @@ collectProVerifDiagnostics hasSpecificLemmas lemSel tc preparedQueryPlans prepar
           | any ((== InvertResult) . preparedQueryPolarity) prepared.preparedQueryFormulas =
               [ ExportDiagnostic
                   "PV-GOAL-INVERTED"
-                  DiagnosticNotice
                   Informational
                   (LemmaSubject lemma._lName)
                   "contains an inverted query result; follow the adjacent interpretation instruction"
@@ -275,7 +272,6 @@ collectProVerifDiagnostics hasSpecificLemmas lemSel tc preparedQueryPlans prepar
         Just (PropertyOmitted reason) ->
           [ ExportDiagnostic
               "PV-AXIOM-OMITTED"
-              DiagnosticWarning
               ChangedAssumptions
               (AxiomSubject lemma._lName)
               ("was not emitted: " ++ reason)
@@ -286,7 +282,6 @@ collectProVerifDiagnostics hasSpecificLemmas lemSel tc preparedQueryPlans prepar
             Just reason ->
               [ ExportDiagnostic
                   "PV-AXIOM-APPROXIMATED"
-                  DiagnosticWarning
                   ChangedAssumptions
                   (AxiomSubject lemma._lName)
                   reason
@@ -302,7 +297,6 @@ collectProVerifDiagnostics hasSpecificLemmas lemSel tc preparedQueryPlans prepar
           Just
             ( ExportDiagnostic
                 "PV-RESTRICTION-OMITTED"
-                DiagnosticWarning
                 ChangedAssumptions
                 (RestrictionSubject restriction._rstrName)
                 ("was not emitted: " ++ reason)
@@ -310,7 +304,6 @@ collectProVerifDiagnostics hasSpecificLemmas lemSel tc preparedQueryPlans prepar
         Just (PropertyEmitted prepared) ->
           ExportDiagnostic
             "PV-RESTRICTION-APPROXIMATED"
-            DiagnosticWarning
             ChangedAssumptions
             (RestrictionSubject restriction._rstrName)
             <$> prepared.preparedRestrictionApproximation
@@ -360,11 +353,8 @@ loadQueries :: Theory sig c b p TranslationElement -> [Doc]
 loadQueries thy =
   map (text . (._eText)) (lookupExportInfo "queries" thy)
 
--- Pretty print an Action, collecting the constant and events that need to be declared.
--- It also returns a boolean, specifying if the printout can serve as the end of a process or not.
--- variable: bound (resolved through the given quantifier context) or free.
+-- | Render the prepared axiom and query plans and collect their headers.
 loadLemmas ::
-  String ->  -- completionEvent: allocated internal completion event
   [(String, PropertyOutcome PreparedQueryProperty)] ->
   [(String, PropertyOutcome PreparedAxiomProperty)] ->
   S.Set String ->  -- sharedEventTags: events that need rule IDs
@@ -374,7 +364,7 @@ loadLemmas ::
   TypingEnvironment ->
   OpenTheory ->
   ([Doc], [Doc], S.Set ProVerifHeader)  -- (axioms, queries, headers)
-loadLemmas completionEvent preparedQueryPlans preparedAxiomPlans sharedEventTags hasSpecificLemmas lemSel tc te thy = (axiomDocs, queryDocs, headers)
+loadLemmas preparedQueryPlans preparedAxiomPlans sharedEventTags hasSpecificLemmas lemSel tc te thy = (axiomDocs, queryDocs, headers)
   where
     thyLemmas = theoryLemmas thy
 
@@ -388,7 +378,6 @@ loadLemmas completionEvent preparedQueryPlans preparedAxiomPlans sharedEventTags
     -- Translate axioms using ppAxiomLemma
     axiomDocs =
       [ ppAxiomLemma
-          completionEvent
           sharedEventTags
           te
           lemma
@@ -399,7 +388,6 @@ loadLemmas completionEvent preparedQueryPlans preparedAxiomPlans sharedEventTags
     -- Render exactly the query plans used during instrumentation analysis.
     queryDocs =
       [ ppLemma
-          completionEvent
           sharedEventTags
           te
           lemma
@@ -456,9 +444,6 @@ classifyLemma hasSpecificLemmas tc lemSel lem
         else AsAxiom
 
   -- If NO specific lemmas targeted and lemma is NOT reuse/source
-  | not hasSpecificLemmas && not (isReuseOrSource lem) = AsQuery
-
-  -- Default fallback
   | otherwise = AsQuery
   where
     shouldSkipHelperLemma l =
@@ -472,11 +457,6 @@ classifyLemma hasSpecificLemmas tc lemSel lem
       let modules = concat [ls | LemmaModule ls <- l._lAttributes]
        in null modules || exportModule (trans tc) `elem` modules
 
-------------------------------------------------------------------------------
--- Header Generation
-------------------------------------------------------------------------------
-
--- - Not (Qua All _ body) where body contains actions - renders as not(event(...))
 loadRestrictions ::
   S.Set String ->
   TypingEnvironment ->

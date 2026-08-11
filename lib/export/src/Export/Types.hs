@@ -1,8 +1,7 @@
 -- |
 -- Shared result and diagnostic types for exporter backends.
 module Export.Types
-  ( DiagnosticSeverity (..),
-    DiagnosticImpact (..),
+  ( DiagnosticImpact (..),
     DiagnosticSubject (..),
     ExportDiagnostic (..),
     ExportError (..),
@@ -20,7 +19,6 @@ module Export.Types
 where
 
 import Control.Exception qualified as Exception
-import Data.Data (Data, Typeable)
 import Data.Map.Strict qualified as Map
 import Data.Sequence (Seq)
 import Data.Sequence qualified as Seq
@@ -28,12 +26,6 @@ import Sapic.Typing
 import Text.PrettyPrint.Class (Doc, render)
 import Theory (LVar, Predicate)
 import Theory.Module (ModuleType (..))
-
-data DiagnosticSeverity
-  = DiagnosticNotice
-  | DiagnosticWarning
-  | DiagnosticFatal
-  deriving (Eq, Ord, Show)
 
 data DiagnosticImpact
   = Informational
@@ -52,7 +44,6 @@ data DiagnosticSubject
 
 data ExportDiagnostic = ExportDiagnostic
   { diagnosticCode :: String,
-    diagnosticSeverity :: DiagnosticSeverity,
     diagnosticImpact :: DiagnosticImpact,
     diagnosticSubject :: DiagnosticSubject,
     diagnosticMessage :: String
@@ -86,7 +77,7 @@ translationInvariantFail = Exception.throw . ExportInvariantException
 data Translation
   = ProVerif
   | DeepSec
-  deriving (Ord, Eq, Typeable, Data)
+  deriving (Ord, Eq)
 
 exportModule :: Translation -> ModuleType
 exportModule ProVerif = ModuleProVerif

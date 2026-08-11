@@ -138,7 +138,6 @@ prettyProVerifHeader = \case
   Sym symbolKind name symbolType [] -> text symbolKind <> text " " <> text name <> text symbolType <> text "."
   Sym symbolKind name symbolType attributes ->
     text symbolKind <> text " " <> text name <> text symbolType <> renderAttributes attributes <> text "."
-  Fun "" _ _ _ _ -> emptyDoc
   Fun functionKind name _ symbolType [] -> text functionKind <> text " " <> text name <> text symbolType <> text "."
   Fun functionKind name _ symbolType attributes ->
     text functionKind <> text " " <> text name <> text symbolType <> renderAttributes attributes <> text "."
@@ -153,7 +152,6 @@ prettyDeepSecHeader = \case
   Table _ _ -> emptyDoc
   Sym symbolKind name _ attributes ->
     text symbolKind <> text " " <> text name <> privateAttribute attributes <> text "."
-  Fun "" _ _ _ _ -> emptyDoc
   Fun functionKind name arity _ attributes ->
     text functionKind
       <> text " "

@@ -5,7 +5,6 @@ module Export
     ProVerifOptions (..),
     prettyProVerifEquivTheory,
     prettyDeepSecTheory,
-    ExportDiagnostic (..),
     ExportError (..),
     ExportResult (..),
     diagnosticsToWfReport,

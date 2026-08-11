@@ -40,7 +40,6 @@ renderSapicFormula formula =
 
 mergeType :: (Eq a) => Maybe a -> Maybe a -> Maybe a
 mergeType t Nothing = t
-mergeType Nothing t = t
 mergeType _ t = t
 
 mergeEnv :: M.Map LVar SapicType -> M.Map LVar SapicType -> M.Map LVar SapicType
@@ -109,7 +108,6 @@ ppProtoAtom _ _ ridOf _ _ True _ ppT (EqE l r) =
   case (ridOf l, ridOf r) of
     (Just dl, Just dr) -> (sep [dl <-> text "<>", dr], M.empty)
     _ -> (sep [ppT l <-> text "<>", ppT r], M.empty)
--- sep [ppNTerm l <-> text "≈", ppNTerm r]
 ppProtoAtom _ _ _ _ _ _ _ ppT (Less u v) = (ppT u <-> opLess <-> ppT v, M.empty)
 ppProtoAtom _ _ _ _ _ _ _ ppT (Subterm u v) = (text "subterm(" <> ppT u <> comma <> ppT v <> text ")", M.empty)
 ppProtoAtom _ _ _ _ _ _ _ _ (Last i) = (operator_ "last" <> parens (text (show i)), M.empty)
@@ -161,8 +159,7 @@ ppLFormulaWithTimeVars keepTimeVars te ppAt =
     printFormula (Not (Ato a@(EqE _ _))) = pure ([], ppAt te True (toLAt a))
     printFormula (Not p) = do
       (vs, (p', envp)) <- printFormula p
-      pure (vs, (operator_ "not" <> opParens p', envp)) -- text "¬" <> parens (printFormula a)
-      -- pure $ operator_ "not" <> opParens p' -- text "¬" <> parens (printFormula a)
+      pure (vs, (operator_ "not" <> opParens p', envp))
     printFormula (Conn op p q) = do
       (vsp, (p', envp)) <- printFormula p
       (vsq, (q', envq)) <- printFormula q
@@ -178,7 +175,6 @@ ppLFormulaWithTimeVars keepTimeVars te ppAt =
         (vsp, d') <- printFormula fm'
         pure (filter (\v -> keepTimeVars || lvarSort v /= LSortNode) (vs ++ vsp), d')
 
--- | Check if a formula is quantifier-free.
 data DeclarationMode
   = QueryDeclaration
   | AssumptionDeclaration PVElement Bool
@@ -405,14 +401,14 @@ renderPreparedQuery ridNames ruleIdEvents typeEnvironment prepared attributes =
     go quantified@(Qua All _ _) = pure (renderFormula quantified [])
     go _ = translationInvariantFail "prepared query violated the supported-fragment invariant"
 
-ppLemma :: String -> S.Set String -> TypingEnvironment -> Lemma ProofSkeleton -> PropertyOutcome PreparedQueryProperty -> Doc
-ppLemma _completionEvent _ruleIdEvents _te p (PropertyOmitted reason) =
+ppLemma :: S.Set String -> TypingEnvironment -> Lemma ProofSkeleton -> PropertyOutcome PreparedQueryProperty -> Doc
+ppLemma _ruleIdEvents _te p (PropertyOmitted reason) =
       text "(*" <> text p._lName <> text "*)"
         $$ text ("(* Lemma translation failed: " ++ reason ++ ". *)")
         $$ text "(*" <> prettyLNFormula p._lFormula <> text "*)"
         $$ text ""
-ppLemma _ _ _ _ PropertyExcluded = emptyDoc
-ppLemma _completionEvent ruleIdEvents te p (PropertyEmitted prepared) =
+ppLemma _ _ _ PropertyExcluded = emptyDoc
+ppLemma ruleIdEvents te p (PropertyEmitted prepared) =
   vcat (intersperse (text "") (map renderSubformula (NE.toList prepared.preparedQueryFormulas)))
     $$ reconstructionComment
   where
@@ -475,8 +471,8 @@ renderPreparedAssumption element ruleIdEvents typeEnvironment prepared attribute
       pure (renderFormula body variables)
     go quantified@(Qua All _ _) = pure (renderFormula quantified [])
     go _ = translationInvariantFail "prepared assumption violated the supported-fragment invariant"
-ppAxiomLemma :: String -> S.Set String -> TypingEnvironment -> Lemma ProofSkeleton -> PropertyOutcome PreparedAxiomProperty -> Doc
-ppAxiomLemma _completionEvent _ruleIdEvents _te l (PropertyOmitted reason) =
+ppAxiomLemma :: S.Set String -> TypingEnvironment -> Lemma ProofSkeleton -> PropertyOutcome PreparedAxiomProperty -> Doc
+ppAxiomLemma _ruleIdEvents _te l (PropertyOmitted reason) =
       text "(*"
         <> text l._lName
         <> text " [reuse/source lemma not translated as axiom]"
@@ -484,8 +480,8 @@ ppAxiomLemma _completionEvent _ruleIdEvents _te l (PropertyOmitted reason) =
         $$ text ("(* Axiom translation failed: " ++ reason ++ ". *)")
         $$ text "(*" <> prettyLNFormula l._lFormula <> text "*)"
         $$ text ""
-ppAxiomLemma _ _ _ _ PropertyExcluded = emptyDoc
-ppAxiomLemma _completionEvent ruleIdEvents te l (PropertyEmitted prepared) =
+ppAxiomLemma _ _ _ PropertyExcluded = emptyDoc
+ppAxiomLemma ruleIdEvents te l (PropertyEmitted prepared) =
   timepointComment
     $$ text "(*"
     <> text l._lName

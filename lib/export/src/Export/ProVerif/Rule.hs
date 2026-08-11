@@ -13,8 +13,6 @@ module Export.ProVerif.Rule
     replaceTrueFalse,
     makeEventHeaders,
     multisetTheory
-    -- , hasOnlyOnceFact
-    -- , isOnlyOnceFact
   )
 where
 
@@ -76,7 +74,6 @@ loadRules completionEvent ruleIdEvents completionTriggerEvents thy m = case theo
             LVar name _ _ <- frees fact
           ]
       ruleComb = text ("( " ++ intercalate " | " (map ((++ ")") . ("!(" ++)) ruleNames) ++ " )")
-      -- want to export restrictions and reuse/src lemmas => need to introduce fresh stamps (as there no timepoints in such formulas)
       rulesMod = map (\(OpenProtoRule ruE rusAC) -> OpenProtoRule (applyMacroInRule (theoryMacros thy) ruE) rusAC) $ case m of
         ModuleProVerif -> rules
         _ -> translationInvariantFail "Rule translation was invoked for an incompatible output module."
@@ -604,41 +601,17 @@ translateNonPatternsWithRuleId ruleIdEvents ruleIdName facts factType filterFunc
         idExp = vcat . map (\a -> text "in(publicChannel, " <> text (showAtom True a) <> text ": bitstring);") . filter (startsWith '$')
 
 translateNonPatterns :: (HighlightDocument d) => [LNFact] -> FactType -> (LNFact -> Bool) -> S.Set String -> ([d], S.Set String)
-translateNonPatterns facts factType filterFunction vars =
-  foldl' (\acc@(_, currVars) f -> acc `accumulateResult` translate f currVars) ([], vars) nonPatternFacts
-  where
-    nonPatternFacts = filter filterFunction facts
-    translate prem@(Fact _ _ ts) vs = (factDoc, atoms)
-      where
-        factDoc =
-          if factType `elem` [OUT, INSERT, EVENT] && checkForNewIDs
-            then idConstructor $-$ translateFact prem factType vs
-            else translateFact prem factType vs
-        atoms = S.fromList $ foldMap (map show . lits) ts
-        checkForNewIDs = not (atoms `S.isSubsetOf` vs) && any (startsWith '$') (atoms `S.difference` vs)
-        idConstructor = idExp . S.toList $ atoms `S.difference` vs
-        idExp = vcat . map (\a -> text "in(publicChannel, " <> text (showAtom True a) <> text ": bitstring);") . filter (startsWith '$')
+translateNonPatterns = translateNonPatternsWithRuleId S.empty ""
 
--- | Like translateFact but includes rule ID as first argument for EVENT facts
+-- | Like translateFact but prepends the rule ID to EVENT fact arguments. Only
+-- EVENT facts carry a rule ID; other fact types render as in 'translateFact'.
 translateFactWithRuleId :: (Document d) => LNFact -> FactType -> S.Set String -> String -> d
-translateFactWithRuleId (Fact tag _ ts) factType vars ruleIdName = case factType of
-  GET -> text "get" <-> text (showFactName tag) <> translateTerms vars True <> text " in"
-  IN ->
-    text "in(publicChannel," <-> translateTerm vars True firstTerm
-      <> text (if startsWith '=' (printTerm True vars True firstTerm) then ")" else ": bitstring)")
-  NEW -> text "new" <-> translateTerm S.empty False firstTerm <> text ": bitstring"
-  INSERT -> text "insert" <-> text (showFactName tag) <> translateTerms S.empty False
-  OUT -> text "out(publicChannel," <-> translateTerm S.empty False firstTerm <> text ")"
-  EVENT -> text "event" <-> text (showEventName tag) <> translateTermsWithRuleId S.empty False ruleIdName
+translateFactWithRuleId fact@(Fact tag _ ts) factType vars ruleIdName = case factType of
+  EVENT -> text "event" <-> text (showEventName tag) <> termsWithRuleId
+  _ -> translateFact fact factType vars
   where
-    translateTerms varSet checkEq =
-      text "(" <> (fsep . punctuate comma $ map (translateTerm varSet checkEq) ts) <> text ")"
-    -- For events, prepend the rule ID to the term list
-    translateTermsWithRuleId varSet checkEq rid =
-      text "(" <> text rid <> (if null ts then text "" else comma <-> (fsep . punctuate comma $ map (translateTerm varSet checkEq) ts)) <> text ")"
-    firstTerm = case ts of
-      term : _ -> term
-      [] -> translationFail "Input, output, and fresh facts require one term."
+    termsWithRuleId =
+      text "(" <> text ruleIdName <> (if null ts then text "" else comma <-> (fsep . punctuate comma $ map (translateTerm S.empty False) ts)) <> text ")"
 
 translateFact :: (Document d) => LNFact -> FactType -> S.Set String -> d
 translateFact (Fact tag _ ts) factType vars = case factType of

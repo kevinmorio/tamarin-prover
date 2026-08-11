@@ -137,19 +137,14 @@ ppSapicTerm :: TranslationContext -> SapicTerm -> (Doc, S.Set ProVerifHeader)
 ppSapicTerm tc = renderSapicTermWithPattern tc S.empty False
 
 -- | Render an LNTerm, collecting the constants that need to be declared.
--- The boolean parameter enables type annotations in the output.
-renderLNTermTyped :: TranslationContext -> Bool -> LNTerm -> (Doc, S.Set ProVerifHeader)
-renderLNTermTyped _ includeTypes = renderTermWithHeaders ppLit
+ppLNTerm :: TranslationContext -> LNTerm -> (Doc, S.Set ProVerifHeader)
+ppLNTerm _ = renderTermWithHeaders ppLit
   where
     ppLit v = case v of
       Con (Name FreshName n) -> text . sanitizeSymbol 'a' $ show n
       Con (Name PubName n) -> ppPubName n
-      tm2 | includeTypes -> text $ sanitizeSymbol 'a' (show tm2) <> ":bitstring"
       Var lvar -> ppLVar lvar
       tm2 -> text . sanitizeSymbol 'a' $ show tm2
-
-ppLNTerm :: TranslationContext -> LNTerm -> (Doc, S.Set ProVerifHeader)
-ppLNTerm tc = renderLNTermTyped tc False
 
 -- | Render a Fact, collecting the constants that need to be declared.
 ppFact :: TranslationContext -> Fact SapicTerm -> (Doc, S.Set ProVerifHeader)
@@ -691,8 +686,6 @@ loadEquivProcs renderFormula tc thy ((p1, p2) : q) =
       Just _ -> (tc, S.empty)
     tc3 = tc2 {hasBoundStates = hasBoundSt, hasUnboundStates = snd hasStates1 || snd hasStates2}
 
--- | Smaller-or-equal / More-or-equally-specific relation on types.
-
 headersOfType :: [SapicType] -> S.Set ProVerifHeader
 headersOfType types =
   S.fromList $
@@ -859,9 +852,3 @@ makeAnnotations thy p = res
       if isNothing (List.find (== "locations-report") (theoryBuiltins thy))
         then pr
         else translateTermsReport pr
-
--- | Pull out nots in formula
-
-------------------------------------------------------------------------------
--- Printers for Restrictions and ProVerif Lemmas
-------------------------------------------------------------------------------

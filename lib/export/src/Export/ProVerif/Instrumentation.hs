@@ -298,7 +298,7 @@ formulaVariableAllocator formula =
 
 -- | Event tags linked by temporal equalities that survive rewriting; these
 -- need rule-id instrumentation so the equality can be translated as a
--- rule-id equality (see 'ridEqualityNames').
+-- rule-id equality (see 'ridOccurrenceNames').
 temporalEqualityLinkedEvents :: LNFormula -> S.Set String
 temporalEqualityLinkedEvents fm =
   S.fromList $

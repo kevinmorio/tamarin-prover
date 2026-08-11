@@ -80,8 +80,6 @@ prepareProperty completionEvent typeEnvironment = \case
   AxiomProperty lemma -> prepareAxiomProperty completionEvent typeEnvironment lemma
   RestrictionProperty restriction -> prepareRestrictionProperty typeEnvironment restriction
 
--- ===========================================================================
-
 -- | Translate a lemma formula for ProVerif output.
 -- This function translates ONLY lemmas in the "classical way" with timepoints.
 -- The resulting translations are suitable only as ProVerif queries (not lemmas/axioms/restrictions).

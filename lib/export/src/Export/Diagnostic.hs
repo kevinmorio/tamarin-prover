@@ -78,7 +78,6 @@ collectBuiltinDiagnostics thy =
   Seq.fromList
     [ ExportDiagnostic
         "PV-BUILTIN-APPROXIMATED"
-        DiagnosticWarning
         ChangedProcessSemantics
         (BuiltinSubject name)
         "uses a best-effort target encoding"
@@ -91,7 +90,6 @@ collectTypingDiagnostics typeEnvironment =
   Seq.fromList
     [ ExportDiagnostic
         "PV-SORT-COERCED"
-        DiagnosticWarning
         ChangedProcessSemantics
         ProcessSubject
         ( "variable `"

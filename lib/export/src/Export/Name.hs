@@ -26,7 +26,7 @@ data TargetNamespace
 newtype TargetEvent = TargetEvent {targetEventText :: String}
   deriving (Eq, Ord, Show)
 
-newtype TargetVariable = TargetVariable {targetVariableText :: String}
+newtype TargetVariable = TargetVariable String
   deriving (Eq, Ord, Show)
 
 newtype NameAllocator = NameAllocator (Map.Map TargetNamespace (Set.Set String))
