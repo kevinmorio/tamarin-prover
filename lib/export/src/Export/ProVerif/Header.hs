@@ -172,20 +172,34 @@ privateAttribute attributes
   | otherwise = emptyDoc
 
 attribHeaders :: TranslationContext -> [ProVerifHeader] -> [Doc]
-attribHeaders context headers = symbols ++ functions ++ equations
+attribHeaders context headers = case context.trans of
+  ProVerif ->
+    intercalate
+      [text ""]
+      ( filter
+          (not . null)
+          [ titledBlock "Types" [prettyProVerifHeader h | h@(Type {}) <- headers],
+            titledBlock "Free names" [prettyProVerifHeader h | h@(Sym {}) <- headers],
+            titledBlock "Functions" [prettyProVerifHeader h | h@(Fun {}) <- headers],
+            titledBlock "Equations" [prettyProVerifHeader h | h@(Eq {}) <- headers],
+            titledBlock "Events" [prettyProVerifHeader h | h@(HEvent {}) <- headers],
+            titledBlock "Tables" [prettyProVerifHeader h | h@(Table {}) <- headers]
+          ]
+      )
+  DeepSec -> symbols ++ functions ++ equations
   where
+    titledBlock title docs
+      | null docs = []
+      | otherwise = text ("(* " ++ title ++ " *)") : docs
     (equations, functions, symbols) = splitHeaders headers
-    renderHeader = case context.trans of
-      ProVerif -> prettyProVerifHeader
-      DeepSec -> prettyDeepSecHeader
     splitHeaders [] = ([], [], [])
     splitHeaders (header : rest)
-      | Sym {} <- header = (equationDocs, functionDocs, renderHeader header : symbolDocs)
-      | Fun {} <- header = (equationDocs, renderHeader header : functionDocs, symbolDocs)
-      | Eq {} <- header = (renderHeader header : equationDocs, functionDocs, symbolDocs)
-      | HEvent {} <- header = (renderHeader header : equationDocs, functionDocs, symbolDocs)
-      | Table {} <- header = (renderHeader header : equationDocs, functionDocs, symbolDocs)
-      | Type {} <- header = (equationDocs, functionDocs, renderHeader header : symbolDocs)
+      | Sym {} <- header = (equationDocs, functionDocs, prettyDeepSecHeader header : symbolDocs)
+      | Fun {} <- header = (equationDocs, prettyDeepSecHeader header : functionDocs, symbolDocs)
+      | Eq {} <- header = (prettyDeepSecHeader header : equationDocs, functionDocs, symbolDocs)
+      | HEvent {} <- header = (prettyDeepSecHeader header : equationDocs, functionDocs, symbolDocs)
+      | Table {} <- header = (prettyDeepSecHeader header : equationDocs, functionDocs, symbolDocs)
+      | Type {} <- header = (equationDocs, functionDocs, prettyDeepSecHeader header : symbolDocs)
       where
         (equationDocs, functionDocs, symbolDocs) = splitHeaders rest
 

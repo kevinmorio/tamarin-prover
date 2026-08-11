@@ -805,12 +805,7 @@ headersOfRule tc typeEnv r | (lhs `RRule` rhs) <- ctxtStRuleToRRule r = do
                   ++ render (fsep (punctuate comma xs))
                   ++ ";"
           )
-          ( render $
-              sep
-                [ nest 2 plhs,
-                  text "=" <-> prhs
-                ]
-          )
+          (render (plhs <-> text "=" <-> prhs))
           suffix
 
   pure $ S.unions [S.singleton hrule, lsh, rsh]

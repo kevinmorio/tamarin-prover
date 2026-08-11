@@ -13,6 +13,7 @@ module Export.ProVerif
   )
 where
 
+import Data.Char (isSpace)
 import Data.List as List
 import Data.List.NonEmpty qualified as NE
 import Data.Map qualified as M
@@ -68,21 +69,27 @@ data ProVerifDocument = ProVerifDocument
 
 proverifTemplate :: ProVerifDocument -> Doc
 proverifTemplate document =
-  (if document.documentSkipPreciseActions then text "" else text "set preciseActions = true.")
+  (if document.documentSkipPreciseActions then emptyDoc else text "set preciseActions = true." $$ text "")
     $$ vcat document.documentHeaders
     $$ vcat document.documentQueries
     $$ section "(* Restrictions *)" document.documentRestrictions
     $$ section "(* Axioms from reuse/source lemmas *)" document.documentAxioms
-    $$ section "(* Lemmas (queries) *)" document.documentLemmas
-    $$ vcat document.documentMacroProcesses
-    $$ vcat document.documentRuleProcesses
-    $$ text "" $$ text "(* Process *)" $$ text ""
+    $$ section "(* Queries *)" document.documentLemmas
+    $$ section
+      "(* Processes *)"
+      (document.documentMacroProcesses ++ document.documentRuleProcesses)
+    $$ text ""
     $$ text "process"
     $$ nest 4 document.documentMainProcess
     $--$ vcat (intersperse (text "") document.documentComments)
   where
-    section _ [] = text ""
-    section title docs = text "" $$ text title $$ text "" $$ vcat docs
+    section title docs = case filter (not . all isSpace . render) docs of
+      [] -> emptyDoc
+      nonBlank ->
+        text ""
+          $$ text title
+          $$ text ""
+          $$ vcat (intersperse (text "") nonBlank)
 
 prettyProVerifTheory ::
   ModuleType ->

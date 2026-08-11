@@ -10,6 +10,8 @@ module Export.Diagnostic
 where
 
 import Data.Foldable (toList)
+import Data.List (intersperse)
+import Data.Maybe (mapMaybe)
 import Data.Map qualified as M
 import Data.Sequence (Seq)
 import Data.Sequence qualified as Seq
@@ -38,24 +40,31 @@ diagnosticsToWfReport =
 renderExportDiagnostics :: Seq ExportDiagnostic -> Doc
 renderExportDiagnostics diagnostics
   | null entries = emptyDoc
-  | null proofRelevant = renderSection "Export notes" Informational
-  | otherwise =
-      text "WARNING: export omitted or approximated proof-relevant input."
-        $$ renderSection "Changed assumptions" ChangedAssumptions
-        $$ renderSection "Untranslated goals" UntranslatedGoal
-        $$ renderSection "Changed process semantics" ChangedProcessSemantics
-        $$ renderSection "Export notes" Informational
+  | otherwise = vcat (intersperse (text "") (banner ++ sections))
   where
     entries = toList diagnostics
     proofRelevant = filter diagnosticIsProofRelevant entries
+    banner =
+      [ text "WARNING: export omitted or approximated proof-relevant input."
+      | not (null proofRelevant)
+      ]
+    sections =
+      mapMaybe
+        (uncurry renderSection)
+        [ ("Changed assumptions", ChangedAssumptions),
+          ("Untranslated goals", UntranslatedGoal),
+          ("Changed process semantics", ChangedProcessSemantics),
+          ("Export notes", Informational)
+        ]
     renderSection heading impact =
       case filter ((== impact) . (.diagnosticImpact)) entries of
-        [] -> emptyDoc
+        [] -> Nothing
         matching ->
-          text ""
-            $$ text heading
-            $$ text (replicate (length heading) '=')
-            $$ vcat (map ((text "- " <>) . diagnosticDoc) matching)
+          Just
+            ( text heading
+                $$ text (replicate (length heading) '=')
+                $$ vcat (map ((text "- " <>) . diagnosticDoc) matching)
+            )
 
 diagnosticDoc :: ExportDiagnostic -> Doc
 diagnosticDoc diagnostic =

@@ -153,30 +153,83 @@ ppLFormula ::
   ProtoFormula syn (String, LSort) Name LVar ->
   m ([LVar], (Doc, M.Map LVar SapicType))
 ppLFormula context ppAt =
-  printFormula
+  printBare
   where
     keepTimeVars = renderTimeMode context == RenderEventTime
-    printFormula (Ato a) = pure ([], ppAt PositiveAtom (toLAt a))
-    printFormula (TF True) = pure ([], (operator_ "true", M.empty)) -- "T"
-    printFormula (TF False) = pure ([], (operator_ "false", M.empty)) -- "F"
-    printFormula (Not (Ato a@(EqE _ _))) = pure ([], ppAt NegatedAtom (toLAt a))
-    printFormula (Not p) = do
-      (vs, (p', envp)) <- printFormula p
-      pure (vs, (operator_ "not" <> opParens p', envp))
-    printFormula (Conn op p q) = do
-      (vsp, (p', envp)) <- printFormula p
-      (vsq, (q', envq)) <- printFormula q
-      pure (vsp ++ vsq, (sep [opParens p' <-> ppOp op, opParens q'], mergeEnv envp envq))
-      where
-        ppOp And = text "&&"
-        ppOp Or = text "||"
-        ppOp Imp = text "==>"
-        ppOp Iff = opIff
-    printFormula fm@(Qua {}) =
-      scopeFreshness $ do
-        (vs, _, fm') <- openFormulaPrefix fm
-        (vsp, d') <- printFormula fm'
-        pure (filter (\v -> keepTimeVars || lvarSort v /= LSortNode) (vs ++ vsp), d')
+
+    -- Bare positions (top level, implication premise and conclusion):
+    -- connective chains are rendered without enclosing parentheses, with
+    -- the operator leading each continuation line.
+    printBare fm = case fm of
+      Conn Imp premise conclusion -> printArrow "==> " premise conclusion
+      Conn Iff premise conclusion -> printArrow (render opIff ++ " ") premise conclusion
+      Conn And _ _ -> printChain And "&& " fm
+      Conn Or _ _ -> printChain Or "|| " fm
+      _ -> printLeaf fm
+
+    printArrow arrow premise conclusion = do
+      (vsPremise, (premiseDoc, envPremise)) <- printPremise premise
+      (vsConclusion, (conclusionDoc, envConclusion)) <- printBare conclusion
+      pure
+        ( vsPremise ++ vsConclusion,
+          ( sep [premiseDoc, text arrow <> conclusionDoc],
+            mergeEnv envPremise envConclusion
+          )
+        )
+
+    -- A nested implication in premise position keeps its parentheses.
+    printPremise fm@(Conn Imp _ _) = printParenthesized fm
+    printPremise fm@(Conn Iff _ _) = printParenthesized fm
+    printPremise fm = printBare fm
+
+    printChain connective operatorText fm = do
+      rendered <- mapM printOperand (flattenSame connective fm)
+      let chainDoc = case map (fst . snd) rendered of
+            [] -> emptyDoc
+            (firstDoc : restDocs) ->
+              sep (firstDoc : map (text operatorText <>) restDocs)
+      pure
+        ( concatMap fst rendered,
+          (chainDoc, foldr (mergeEnv . snd . snd) M.empty rendered)
+        )
+
+    flattenSame connective (Conn connective' p q)
+      | connective == connective' =
+          flattenSame connective p ++ flattenSame connective q
+    flattenSame _ fm = [fm]
+
+    -- Composite operands of a conjunction or disjunction are parenthesized
+    -- for readability; atoms stay bare. A quantified operand whose opened
+    -- body is composite is parenthesized as well.
+    printOperand fm@(Conn {}) = printParenthesized fm
+    printOperand fm@(Qua {})
+      | quantifiedConnBody fm = withParens (printLeaf fm)
+    printOperand fm = printLeaf fm
+
+    quantifiedConnBody (Qua _ _ body) = quantifiedConnBody body
+    quantifiedConnBody (Conn {}) = True
+    quantifiedConnBody _ = False
+
+    printParenthesized fm = withParens (printBare fm)
+
+    withParens rendered = do
+      (vs, (doc, env)) <- rendered
+      pure (vs, (parens doc, env))
+
+    printLeaf fm = case fm of
+      Ato a -> pure ([], ppAt PositiveAtom (toLAt a))
+      TF True -> pure ([], (operator_ "true", M.empty))
+      TF False -> pure ([], (operator_ "false", M.empty))
+      Not (Ato a@(EqE _ _)) -> pure ([], ppAt NegatedAtom (toLAt a))
+      Not p -> do
+        (vs, (p', envp)) <- printBare p
+        pure (vs, (operator_ "not" <> opParens p', envp))
+      Qua {} ->
+        scopeFreshness $ do
+          (vs, _, fm') <- openFormulaPrefix fm
+          (vsp, d') <- printBare fm'
+          pure (filter (\v -> keepTimeVars || lvarSort v /= LSortNode) (vs ++ vsp), d')
+      _ -> printBare fm
 
 data DeclarationMode
   = QueryDeclaration
@@ -208,14 +261,12 @@ ppFormulaDeclaration mode context formula extraVariables attributes = do
         [ if null declaredVariables
             then text "query;"
             else text "query " <> fsep (punctuate comma declaredVariables) <> text ";",
-          nest 1 body <> text attributes <> text "."
+          nest 2 body <> text attributes <> text "."
         ]
     AssumptionDeclaration element _ ->
       sep
         [ text (declarationWord element) <> fsep (punctuate comma declaredVariables) <> text ";",
-          nest 1 body,
-          text attributes,
-          text "."
+          nest 2 body <> text attributes <> text "."
         ]
   where
     ruleIdEvents = renderRuleIdEvents context
@@ -234,7 +285,7 @@ ppFormulaDeclaration mode context formula extraVariables attributes = do
             ppLFormula atomContext atomRenderer conclusion
           pure
             ( variables,
-              ( sep [opParens (text "attacker(())") <-> text "==>", opParens conclusionDoc],
+              ( sep [text "attacker(())", text "==> " <> conclusionDoc],
                 variableTypes
               )
             )
@@ -402,20 +453,24 @@ ppOmittedProperty nameDoc kind formula reason =
 
 ppLemma :: S.Set String -> TypingEnvironment -> Lemma ProofSkeleton -> PropertyOutcome PreparedQueryProperty -> Doc
 ppLemma _ruleIdEvents _te p (PropertyOmitted reason) =
-  ppOmittedProperty (text "(*" <> text p._lName <> text "*)") "Lemma" p._lFormula reason
+  ppOmittedProperty (text ("(* " ++ p._lName ++ " *)")) "Lemma" p._lFormula reason
 ppLemma _ _ _ PropertyExcluded = emptyDoc
 ppLemma ruleIdEvents te p (PropertyEmitted prepared) =
-  vcat (intersperse (text "") (map renderSubformula (NE.toList prepared.preparedQueryFormulas)))
-    $$ reconstructionComment
+  vcat
+    ( intersperse
+        (text "")
+        ( vcat (lemmaNameComment : reconstructionComment)
+            : map renderSubformula (NE.toList prepared.preparedQueryFormulas)
+        )
+    )
   where
-    lemmaNameComment = text "(*" <> text p._lName <> text "*)"
+    lemmaNameComment = text ("(* " ++ p._lName ++ " *)")
     useInduction
       | InvariantLemma `elem` p._lAttributes = "[induction]"
       | otherwise = ""
     renderSubformula queryFormula =
       vcat
-        ( [lemmaNameComment]
-            ++ catMaybes [timepointComment, negationWarning]
+        ( catMaybes [timepointComment, negationWarning]
             ++ [queryDoc]
         )
       where
@@ -439,11 +494,11 @@ ppLemma ruleIdEvents te p (PropertyEmitted prepared) =
             preparedFormulaPlan
             useInduction
     reconstructionComment = case prepared.preparedQueryRecombination of
-      Nothing -> text ""
+      Nothing -> []
       Just ConjoinQueryResults ->
-        text "(* To reconstruct lemma " <> text p._lName <> text ", combine the query results with ∧. *)"
+        [text ("(* To reconstruct lemma " ++ p._lName ++ ", combine the query results with ∧. *)")]
       Just DisjoinQueryResults ->
-        text "(* To reconstruct lemma " <> text p._lName <> text ", combine the query results with ∨. *)"
+        [text ("(* To reconstruct lemma " ++ p._lName ++ ", combine the query results with ∨. *)")]
 
 renderPreparedAssumption ::
   PVElement ->
@@ -479,47 +534,54 @@ renderPreparedAssumption element ruleIdEvents typeEnvironment prepared attribute
 ppAxiomLemma :: S.Set String -> TypingEnvironment -> Lemma ProofSkeleton -> PropertyOutcome PreparedAxiomProperty -> Doc
 ppAxiomLemma _ruleIdEvents _te l (PropertyOmitted reason) =
   ppOmittedProperty
-    (text "(*" <> text l._lName <> text " [reuse/source lemma not translated as axiom]" <> text "*)")
+    (text ("(* " ++ l._lName ++ " [reuse/source lemma not translated as axiom] *)"))
     "Axiom"
     l._lFormula
     reason
 ppAxiomLemma _ _ _ PropertyExcluded = emptyDoc
 ppAxiomLemma ruleIdEvents te l (PropertyEmitted prepared) =
-  timepointComment
-    $$ text "(*"
-    <> text l._lName
-    <> text " [reuse/source lemma translated as axiom]"
-    <> text "*)"
-    $$ vcat (intersperse (text "") (map renderAxiom (NE.toList prepared.preparedAxiomFormulas)))
+  vcat
+    ( intersperse
+        (text "")
+        ( vcat (nameComment : timepointComment)
+            : map renderAxiom (NE.toList prepared.preparedAxiomFormulas)
+        )
+    )
   where
+    nameComment =
+      text ("(* " ++ l._lName ++ " [reuse/source lemma translated as axiom] *)")
+    timepointComment =
+      [ text "(* Timepoints in lemma have been split *)"
+      | any preparedHadTimepointSplit prepared.preparedAxiomFormulas
+      ]
     renderAxiom preparedFormulaPlan =
       renderPreparedAssumption RSL ruleIdEvents te preparedFormulaPlan ""
-
-    timepointComment = if any preparedHadTimepointSplit prepared.preparedAxiomFormulas
-                       then text "(* Timepoints in lemma have been split *)\n"
-                       else text ""
 
 ppRestr :: S.Set String -> TypingEnvironment -> Restriction -> PropertyOutcome PreparedRestrictionProperty -> Doc
 ppRestr _ _ restriction (PropertyOmitted reason) =
   ppOmittedProperty
-    (text "(*" <> text restriction._rstrName <> text "*)")
+    (text ("(* " ++ restriction._rstrName ++ " *)"))
     "Restriction"
     restriction._rstrFormula
     reason
 ppRestr _ _ _ PropertyExcluded = emptyDoc
 ppRestr ruleIdEvents typeEnvironment restriction (PropertyEmitted prepared) =
-  timepointComment
-    $$ text "(*" <> text restriction._rstrName <> text "*)"
-    $$ originalComment
-    $$ vcat (intersperse (text "") (map renderFormula (NE.toList prepared.preparedRestrictionFormulas)))
+  vcat
+    ( intersperse
+        (text "")
+        ( vcat (nameComment : timepointComment ++ originalComment)
+            : map renderFormula (NE.toList prepared.preparedRestrictionFormulas)
+        )
+    )
   where
-    timepointComment
-      | any preparedHadTimepointSplit prepared.preparedRestrictionFormulas =
-          text "(* Timepoints in restriction have been split *)"
-      | otherwise = emptyDoc
-    originalComment
-      | prepared.preparedRestrictionWasRewritten =
-          text "(* Original: " <> prettyLNFormula restriction._rstrFormula <> text " *)"
-      | otherwise = emptyDoc
+    nameComment = text ("(* " ++ restriction._rstrName ++ " *)")
+    timepointComment =
+      [ text "(* Timepoints in restriction have been split *)"
+      | any preparedHadTimepointSplit prepared.preparedRestrictionFormulas
+      ]
+    originalComment =
+      [ text "(* Original: " <> prettyLNFormula restriction._rstrFormula <> text " *)"
+      | prepared.preparedRestrictionWasRewritten
+      ]
     renderFormula preparedFormulaPlan =
       renderPreparedAssumption R ruleIdEvents typeEnvironment preparedFormulaPlan ""

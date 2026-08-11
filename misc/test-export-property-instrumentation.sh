@@ -50,7 +50,7 @@ temporal="$tmp_dir/temporal.pv"
 export_lemma temporal_equality_uses_rule_ids "$temporal"
 require_pattern '^event eFirst\(bitstring, bitstring\)\.$' "$temporal"
 require_pattern '^event eSecond\(bitstring, bitstring\)\.$' "$temporal"
-require_pattern '\(rid_[[:alnum:]_]+ = rid_[[:alnum:]_]+\)' "$temporal"
+require_pattern 'rid_[[:alnum:]_]+ = rid_[[:alnum:]_]+' "$temporal"
 
 split_notice="$tmp_dir/split-notice.pv"
 if ! "$tamarin" -d=0 -m=proverif --quit-on-warning --lemma=split_queries_notice \
@@ -67,7 +67,7 @@ fi
 
 restriction="$tmp_dir/restriction.pv"
 "$tamarin" -d=0 -m=proverif --lemma=no_link_chain "-o=$restriction" "$restriction_model" >/dev/null
-if [ "$(grep -c '==> (false)' "$restriction")" -ne 2 ]; then
+if [ "$(grep -c '==> false\.' "$restriction")" -ne 2 ]; then
   echo "forbidden disjunction did not produce two false-conclusion restrictions" >&2
   exit 1
 fi
@@ -135,7 +135,8 @@ export_model_lemma "$refactoring_model" generated_rule_id_avoids_source_variable
 require_pattern 'event\(eBranchB\( rid, x \)\)' "$refactoring_collision"
 require_pattern 'event\(eBranchC\( rid, x \)\)' "$refactoring_collision"
 require_pattern '^event eAxiomA\(bitstring, bitstring\)\.$' "$refactoring_collision"
-require_pattern 'event\(eAxiomA\( rid, x \)\).*event\(eAxiomB\( rid, x \)\)' "$refactoring_collision"
+require_pattern 'event\(eAxiomA\( rid, x \)\)' "$refactoring_collision"
+require_pattern 'event\(eAxiomB\( rid, x \)\)' "$refactoring_collision"
 require_pattern 'event\(eRuleCompleted_1\( rid \)\)' "$refactoring_collision"
 require_pattern 'event\(eAxiomC\( rid, x \)\)' "$refactoring_collision"
 require_pattern 'event eRuleCompleted_1\(rid_rEmitAxiomEvents\)\.' "$refactoring_collision"
