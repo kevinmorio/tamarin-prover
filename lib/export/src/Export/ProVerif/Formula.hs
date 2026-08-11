@@ -4,7 +4,6 @@ module Export.ProVerif.Formula
   ( allImplExLessWoTmps,
     applyRewriteForShape,
     assumptionKnowledgeFragmentFailure,
-    buildConjunction,
     classifyFormulaShape,
     collectActionsWithTimepoints,
     collectBinderHintNames,
@@ -33,14 +32,12 @@ module Export.ProVerif.Formula
     isSimpleNegatedAction,
     isSupportedPositivePremise,
     makeBinderHintsGloballyUnique,
-    mapLits,
     mapTopLevelConjunctsFormula,
     moveConstraintsToConclusion,
     moveNegatedActionsToConclusion,
     normalizeAllTraceFormula,
     pullNegationsWithDiagnostic,
     queryKnowledgeFragmentFailure,
-    rewrapBoundPrefix,
     rewriteEventFreeExistsTrace,
     rewriteFormulaForAxiomWithDiagnostic,
     rewriteFormulaForQuery,
@@ -58,17 +55,8 @@ import Data.Maybe
 import Data.Set qualified as S
 import Export.Name (freshNameAvoiding)
 import Theory
+import Utils.Misc (fixpoint)
 import Theory.Tools.Wellformedness (formulaFacts)
-
-buildConjunction :: [LNFormula] -> LNFormula
-buildConjunction [] = TF True
-buildConjunction [formula] = formula
-buildConjunction formulas = foldr1 (.&&.) formulas
-
-buildDisjunction :: [LNFormula] -> LNFormula
-buildDisjunction [] = TF False
-buildDisjunction [formula] = formula
-buildDisjunction formulas = foldr1 (.||.) formulas
 
 -- | Flatten nested conjunctions into the list of their conjuncts.
 flattenConjuncts :: LNFormula -> [LNFormula]
@@ -200,10 +188,6 @@ assumptionKnowledgeFragmentFailure formula
 -- directly: 'forAll' and 'exists' quantify free variables instead.
 -- Quantifiers are applied from outer to inner, so the first hint becomes the
 -- outermost quantifier.
-rewrapBoundPrefix :: Quantifier -> [(String, LSort)] -> LNFormula -> LNFormula
-rewrapBoundPrefix _ [] body = body
-rewrapBoundPrefix q (v:vs) body = Qua q v (rewrapBoundPrefix q vs body)
-
 -- | Apply the structural rewrites shared by query rendering and
 -- property-driven instrumentation analysis. Keeping this as one pipeline is
 -- important: completion demand must be computed from the correspondence that
@@ -1287,12 +1271,11 @@ data BinderInfo = BinderInfo Int LSort
 
 pullNegationsToTop :: LNFormula -> Either LNFormula LNFormula
 pullNegationsToTop fm =
-  let fm_partially_rewritten = fixedpoint applyPullNegationStep fm -- nots pulled out by applyPullNegationStep can enable new pull-out steps, so need to compute fixed point
+  let fm_partially_rewritten = fixpoint applyPullNegationStep fm -- nots pulled out by applyPullNegationStep can enable new pull-out steps, so need to compute fixed point
    in if onlyTopLevelNot fm_partially_rewritten
         then Right fm_partially_rewritten -- in this case, formula is fully rewritten, i.e. has only 1 top-level not or no nots at all
         else Left fm_partially_rewritten -- Error with partially rewritten formula
   where
-    fixedpoint f phi = if phi /= f phi then fixedpoint f (f phi) else phi
 
     applyPullNegationStep fm' = case fm' of
       Conn And (Not p) (Not q) -> Not $ p .||. q
@@ -2024,11 +2007,6 @@ splitTopLevel AllTraces (Conn And left right) =
 splitTopLevel ExistsTrace (Conn Or left right) =
   splitTopLevel ExistsTrace left ++ splitTopLevel ExistsTrace right
 splitTopLevel _ formula = [formula]
-mapLits :: (Ord a, Ord b) => (a -> b) -> Term a -> Term b
-mapLits f t = case viewTerm t of
-  Lit l -> lit . f $ l
-  FApp o as -> fApp o (map (mapLits f) as)
-
 timeVarKey ::
   [BinderInfo] ->
   VTerm Name (BVar LVar) ->

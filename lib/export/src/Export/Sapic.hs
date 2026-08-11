@@ -25,6 +25,7 @@ import Export.ProVerif.Header
 import Export.ProVerif.Rule
 import Export.Types
 import Sapic.Annotation
+import Sapic.Facts (stripNonAlphanumerical)
 import Sapic.Report
 import Sapic.States
 import Sapic.Typing
@@ -849,9 +850,6 @@ makeArgtypes :: [SapicType] -> String
 makeArgtypes [] = ""
 makeArgtypes [x] = ppType x
 makeArgtypes (x : t) = ppType x ++ "," ++ makeArgtypes t
-
-stripNonAlphanumerical :: [Char] -> [Char]
-stripNonAlphanumerical = filter isAlpha
 
 -- return the annotated process
 makeAnnotations :: OpenTheory -> PlainProcess -> LProcess (ProcessAnnotation LVar)
