@@ -391,12 +391,18 @@ renderPreparedQuery context prepared attributes =
     go quantified@(Qua All _ _) = pure (renderFormula quantified [])
     go _ = translationInvariantFail "prepared query violated the supported-fragment invariant"
 
+
+-- | Comment block for a property that could not be translated.
+ppOmittedProperty :: Doc -> String -> LNFormula -> String -> Doc
+ppOmittedProperty nameDoc kind formula reason =
+  nameDoc
+    $$ text ("(* " ++ kind ++ " translation failed: " ++ reason ++ ". *)")
+    $$ text "(*" <> prettyLNFormula formula <> text "*)"
+    $$ text ""
+
 ppLemma :: S.Set String -> TypingEnvironment -> Lemma ProofSkeleton -> PropertyOutcome PreparedQueryProperty -> Doc
 ppLemma _ruleIdEvents _te p (PropertyOmitted reason) =
-      text "(*" <> text p._lName <> text "*)"
-        $$ text ("(* Lemma translation failed: " ++ reason ++ ". *)")
-        $$ text "(*" <> prettyLNFormula p._lFormula <> text "*)"
-        $$ text ""
+  ppOmittedProperty (text "(*" <> text p._lName <> text "*)") "Lemma" p._lFormula reason
 ppLemma _ _ _ PropertyExcluded = emptyDoc
 ppLemma ruleIdEvents te p (PropertyEmitted prepared) =
   vcat (intersperse (text "") (map renderSubformula (NE.toList prepared.preparedQueryFormulas)))
@@ -472,13 +478,11 @@ renderPreparedAssumption element ruleIdEvents typeEnvironment prepared attribute
     go _ = translationInvariantFail "prepared assumption violated the supported-fragment invariant"
 ppAxiomLemma :: S.Set String -> TypingEnvironment -> Lemma ProofSkeleton -> PropertyOutcome PreparedAxiomProperty -> Doc
 ppAxiomLemma _ruleIdEvents _te l (PropertyOmitted reason) =
-      text "(*"
-        <> text l._lName
-        <> text " [reuse/source lemma not translated as axiom]"
-        <> text "*)"
-        $$ text ("(* Axiom translation failed: " ++ reason ++ ". *)")
-        $$ text "(*" <> prettyLNFormula l._lFormula <> text "*)"
-        $$ text ""
+  ppOmittedProperty
+    (text "(*" <> text l._lName <> text " [reuse/source lemma not translated as axiom]" <> text "*)")
+    "Axiom"
+    l._lFormula
+    reason
 ppAxiomLemma _ _ _ PropertyExcluded = emptyDoc
 ppAxiomLemma ruleIdEvents te l (PropertyEmitted prepared) =
   timepointComment
@@ -497,10 +501,11 @@ ppAxiomLemma ruleIdEvents te l (PropertyEmitted prepared) =
 
 ppRestr :: S.Set String -> TypingEnvironment -> Restriction -> PropertyOutcome PreparedRestrictionProperty -> Doc
 ppRestr _ _ restriction (PropertyOmitted reason) =
-  text "(*" <> text restriction._rstrName <> text "*)"
-    $$ text ("(* Restriction translation failed: " ++ reason ++ ". *)")
-    $$ text "(*" <> prettyLNFormula restriction._rstrFormula <> text "*)"
-    $$ text ""
+  ppOmittedProperty
+    (text "(*" <> text restriction._rstrName <> text "*)")
+    "Restriction"
+    restriction._rstrFormula
+    reason
 ppRestr _ _ _ PropertyExcluded = emptyDoc
 ppRestr ruleIdEvents typeEnvironment restriction (PropertyEmitted prepared) =
   timepointComment

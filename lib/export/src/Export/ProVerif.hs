@@ -52,20 +52,37 @@ data ProVerifOptions = ProVerifOptions
   }
   deriving (Eq, Ord, Show)
 
-proverifTemplate :: (Document d) => Bool -> [d] -> [d] -> d -> [d] -> [d] -> [d] -> [d] -> [d] -> [d] -> d
-proverifTemplate skipPrecise headers queries process macroproc ruleproc restrictions axioms lemmas comments =
-  (if skipPrecise then text "" else text "set preciseActions = true.")
-    $$ vcat headers
-    $$ vcat queries
-    $$ (if null restrictions then text "" else text "" $$ text "(* Restrictions *)" $$ text "" $$ vcat restrictions)
-    $$ (if null axioms then text "" else text "" $$ text "(* Axioms from reuse/source lemmas *)" $$ text "" $$ vcat axioms)
-    $$ (if null lemmas then text "" else text "" $$ text "(* Lemmas (queries) *)" $$ text "" $$ vcat lemmas)
-    $$ vcat macroproc
-    $$ vcat ruleproc
+-- | The assembled sections of a ProVerif trace-export document.
+data ProVerifDocument = ProVerifDocument
+  { documentSkipPreciseActions :: Bool,
+    documentHeaders :: [Doc],
+    documentQueries :: [Doc],
+    documentRestrictions :: [Doc],
+    documentAxioms :: [Doc],
+    documentLemmas :: [Doc],
+    documentMacroProcesses :: [Doc],
+    documentRuleProcesses :: [Doc],
+    documentMainProcess :: Doc,
+    documentComments :: [Doc]
+  }
+
+proverifTemplate :: ProVerifDocument -> Doc
+proverifTemplate document =
+  (if document.documentSkipPreciseActions then text "" else text "set preciseActions = true.")
+    $$ vcat document.documentHeaders
+    $$ vcat document.documentQueries
+    $$ section "(* Restrictions *)" document.documentRestrictions
+    $$ section "(* Axioms from reuse/source lemmas *)" document.documentAxioms
+    $$ section "(* Lemmas (queries) *)" document.documentLemmas
+    $$ vcat document.documentMacroProcesses
+    $$ vcat document.documentRuleProcesses
     $$ text "" $$ text "(* Process *)" $$ text ""
     $$ text "process"
-    $$ nest 4 process
-    $--$ vcat (intersperse (text "") comments)
+    $$ nest 4 document.documentMainProcess
+    $--$ vcat (intersperse (text "") document.documentComments)
+  where
+    section _ [] = text ""
+    section title docs = text "" $$ text title $$ text "" $$ vcat docs
 
 prettyProVerifTheory ::
   ModuleType ->
@@ -86,7 +103,20 @@ prettyProVerifTheory m options lemSel (thy', typEnv) =
           ]
     headers <- finalizeHeaders headersTheory headersTranslation
     let hd = attribHeaders tc headers
-    pure $ proverifTemplate (skipPrecise tc) hd queries proc' macroproc ruleproc restrictions axioms lemmas comments
+    pure $
+      proverifTemplate
+        ProVerifDocument
+          { documentSkipPreciseActions = skipPrecise tc,
+            documentHeaders = hd,
+            documentQueries = queries,
+            documentRestrictions = restrictions,
+            documentAxioms = axioms,
+            documentLemmas = lemmas,
+            documentMacroProcesses = macroproc,
+            documentRuleProcesses = ruleproc,
+            documentMainProcess = proc',
+            documentComments = comments
+          }
   where
     noReuseLemmas = options.omitReuseLemmas
     noSourceLemmas = options.omitSourceLemmas
@@ -199,13 +229,7 @@ prettyProVerifTheory m options lemSel (thy', typEnv) =
     queries = loadQueries thy
     (axioms, lemmas, lemmaHeaders) =
       loadLemmas preparedQueryPlans preparedAxiomPlans propertyEventTags hasSpecificLemmas lemSel tc typEnv thy
-    (ruleproc, ruleComb, ruleHeaders) =
-      loadRules
-        instrumentationPlan.instrumentationCompletionEvent
-        instrumentationPlan.instrumentationRuleIdEvents
-        instrumentationPlan.instrumentationCompletionTriggers
-        thy
-        m
+    (ruleproc, ruleComb, ruleHeaders) = loadRules instrumentationPlan thy m
     (macroproc, macroprochd) =
       -- if stateM is not empty, we have inlined the process calls, so we don't reoutput them
       if hasBoundState then ([text ""], S.empty) else loadMacroProc renderSapicFormula tc thy

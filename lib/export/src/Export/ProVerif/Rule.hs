@@ -25,6 +25,7 @@ import Data.Set qualified as S
 import Extension.Data.Label qualified as L
 import Export.Name
 import Export.ProVerif.Header
+import Export.ProVerif.Instrumentation (InstrumentationPlan (..))
 import Export.Types (translationFail, translationInvariantFail)
 import Sapic.Exceptions
 import Sapic.Facts
@@ -34,16 +35,31 @@ import Theory.Text.Parser
 import Theory.Text.Pretty
 import TheoryObject (theoryMacros)
 
-loadRules :: String -> S.Set String -> S.Set String -> OpenTheory -> ModuleType -> ([Doc], Doc, S.Set ProVerifHeader)
-loadRules completionEvent ruleIdEvents completionTriggerEvents thy m = case theoryRules thy of
+-- | Instrumentation carried into a single rule's translation: the theory
+-- plan plus the rule's allocated rule-id variable, if any.
+data RuleInstrumentation = RuleInstrumentation
+  { riPlan :: InstrumentationPlan,
+    riRuleIdName :: Maybe String
+  }
+
+-- | No instrumentation, for embedded rule actions.
+emptyRuleInstrumentation :: RuleInstrumentation
+emptyRuleInstrumentation =
+  RuleInstrumentation (InstrumentationPlan "" S.empty S.empty) Nothing
+
+loadRules :: InstrumentationPlan -> OpenTheory -> ModuleType -> ([Doc], Doc, S.Set ProVerifHeader)
+loadRules plan thy m = case theoryRules thy of
   [] -> ([text ""], text "", S.empty)
   rules -> (ruleDocs, ruleComb, headers)
     where
+      completionEvent = plan.instrumentationCompletionEvent
+      ruleIdEvents = plan.instrumentationRuleIdEvents
+      completionTriggerEvents = plan.instrumentationCompletionTriggers
       (ruleDocs, destructors) =
         foldl'
           (\acc@(_, destrs) r ->
              acc `accumulateResult`
-               translateOpenProtoRule completionEvent ruleIdNames ruleIdEvents completionTriggerEvents r thy destrs)
+               translateOpenProtoRule plan ruleIdNames r thy destrs)
           ([], M.empty)
           rulesMod
       headers =
@@ -89,7 +105,7 @@ translateEmbeddedRuleAction matchedVars rprems racts rconcls =
   (ruleDoc, headers, hasTailDocs)
   where
     (headDocs, tailDocs, destructors) =
-      translateRuleDocs "" S.empty S.empty Nothing matchedVars rprems racts rconcls M.empty
+      translateRuleDocs emptyRuleInstrumentation matchedVars rprems racts rconcls M.empty
     hasTailDocs = not (null tailDocs)
     ruleDoc =
       if hasTailDocs
@@ -310,16 +326,14 @@ showEventNameFromName tag = 'e' : tag
 
 translateOpenProtoRule ::
   (HighlightDocument d) =>
-  String ->
+  InstrumentationPlan ->
   M.Map String String ->
-  S.Set String ->
-  S.Set String ->
   OpenProtoRule ->
   OpenTheory ->
   M.Map (String, String) String ->
   (d, M.Map (String, String) String)
-translateOpenProtoRule completionEvent ruleIdNames ruleIdEvents completionTriggerEvents (OpenProtoRule ruE _) thy =
-  translateProtoRule completionEvent ruleIdNames ruleIdEvents completionTriggerEvents (checkTypes ruE thy)
+translateOpenProtoRule plan ruleIdNames (OpenProtoRule ruE _) thy =
+  translateProtoRule plan ruleIdNames (checkTypes ruE thy)
 
 -- Functions with user-defined types cannot be used in rewrite rules, they
 -- are currently written such that everything is treated as a bitstring
@@ -352,23 +366,22 @@ incorrectTermTypes thy t = case viewTerm t of
 
 translateProtoRule ::
   (HighlightDocument d) =>
-  String ->
+  InstrumentationPlan ->
   M.Map String String ->
-  S.Set String ->
-  S.Set String ->
   Rule ProtoRuleEInfo ->
   M.Map (String, String) String ->
   (d, M.Map (String,String) String)
-translateProtoRule completionEvent ruleIdNames ruleIdEvents completionTriggerEvents ru de =
+translateProtoRule plan ruleIdNames ru de =
   (ruleDoc, destructors)
   where
     rname = showRuleName ru._rInfo._preName
+    ruleIdName =
+      fromMaybe
+        (translationInvariantFail ("missing allocated rule-ID name for " ++ rname))
+        (M.lookup rname ruleIdNames)
     (factsDoc, destructors) =
       translateRule
-        completionEvent
-        ruleIdEvents
-        completionTriggerEvents
-        (fromMaybe (translationInvariantFail ("missing allocated rule-ID name for " ++ rname)) (M.lookup rname ruleIdNames))
+        (RuleInstrumentation plan (Just ruleIdName))
         ru._rPrems
         (notDiffRuleActs ru)
         ru._rConcs
@@ -381,49 +394,37 @@ showRuleName (StandRule s) = 'r' : s
 
 translateRule ::
   (HighlightDocument d) =>
-  String ->
-  S.Set String ->
-  S.Set String ->
-  String ->
+  RuleInstrumentation ->
   [LNFact] ->
   [LNFact] ->
   [LNFact] ->
   M.Map (String, String) String ->
   (d, M.Map (String, String) String)
-translateRule completionEvent ruleIdEvents completionTriggerEvents ruleIdName rprems racts rconcls destrs =
+translateRule instrumentation rprems racts rconcls destrs =
   let (headDocs, tailDocs, newDestrs) =
-        translateRuleDocs
-          completionEvent
-          ruleIdEvents
-          completionTriggerEvents
-          (Just ruleIdName)
-          S.empty
-          rprems
-          racts
-          rconcls
-          destrs
+        translateRuleDocs instrumentation S.empty rprems racts rconcls destrs
    in (combineRuleDocs headDocs tailDocs, newDestrs)
 
 translateRuleDocs ::
   (HighlightDocument d) =>
-  String ->
-  S.Set String ->
-  S.Set String ->
-  Maybe String ->
+  RuleInstrumentation ->
   S.Set String ->
   [LNFact] ->
   [LNFact] ->
   [LNFact] ->
   M.Map (String, String) String ->
   ([d], [d], M.Map (String, String) String)
-translateRuleDocs completionEvent ruleIdEvents completionTriggerEvents maybeRuleIdName initialVars rprems racts rconcls destrs =
+translateRuleDocs instrumentation initialVars rprems racts rconcls destrs =
   -- docsX contains the expression resulting from the given translation (as an instance of Doc)
   -- varsX is a set of all variables that have appeared in the rule translation until that point
   -- varsX' is a map where the keys are the patterns, which have appeared in the rule translation until that point,
   -- and the values are their helper variables
   -- destrX is a map where the keys are terms a and t, where a given destructor extracts a from t
   -- and the values are the given destructors (which have appeared in the rule translation until that point)
-  let ruleIdName = fromMaybe "" maybeRuleIdName
+  let completionEvent = instrumentation.riPlan.instrumentationCompletionEvent
+      ruleIdEvents = instrumentation.riPlan.instrumentationRuleIdEvents
+      completionTriggerEvents = instrumentation.riPlan.instrumentationCompletionTriggers
+      ruleIdName = fromMaybe "" instrumentation.riRuleIdName
       ruleNeedsCompletion =
         any
           (\fact -> factTagName (factTag fact) `S.member` completionTriggerEvents)

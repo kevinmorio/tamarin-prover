@@ -12,6 +12,7 @@ module Export.ProVerif.Property
     PropertyRole (..),
     QueryPolarity (..),
     QueryRecombination (..),
+    RuleIdStrategy (..),
     annotateAxiomProperty,
     annotateQueryProperty,
     annotateRestrictionProperty,
@@ -50,10 +51,16 @@ data QueryRecombination
   | DisjoinQueryResults
   deriving (Eq, Ord, Show)
 
+-- | How rule-id variables are allocated for a prepared formula's split
+-- timepoints: one name per origin, or the shared name when only one group
+-- remains in a subformula.
+data RuleIdStrategy = OriginRuleIds | SharedRuleIdWhenSingle
+  deriving (Eq, Ord, Show)
+
 data PreparedQueryFormula = PreparedQueryFormula
   { preparedQueryBody :: PreparedFormula,
     preparedQueryPolarity :: QueryPolarity,
-    preparedQueryUseOriginRuleIds :: Bool
+    preparedQueryRuleIdStrategy :: RuleIdStrategy
   }
 
 data PreparedQueryProperty = PreparedQueryProperty
@@ -181,7 +188,10 @@ prepareQueryProperty completionEvent typeEnvironment lemma
                   preparedRuleIdNames = M.empty
                 },
             preparedQueryPolarity = finalPolarity,
-            preparedQueryUseOriginRuleIds = initialPolarity == InvertResult
+            preparedQueryRuleIdStrategy =
+              if initialPolarity == InvertResult
+                then OriginRuleIds
+                else SharedRuleIdWhenSingle
           },
         queryFormulaFailure typeEnvironment formulaToRender
       )
@@ -441,8 +451,8 @@ mapPropertyOutcome transform (PropertyEmitted prepared) =
 mapPropertyOutcome _ (PropertyOmitted reason) = PropertyOmitted reason
 mapPropertyOutcome _ PropertyExcluded = PropertyExcluded
 
-annotatePreparedFormula :: Bool -> S.Set String -> PreparedFormula -> PreparedFormula
-annotatePreparedFormula useOriginRuleIds ruleIdEvents prepared =
+annotatePreparedFormula :: RuleIdStrategy -> S.Set String -> PreparedFormula -> PreparedFormula
+annotatePreparedFormula strategy ruleIdEvents prepared =
   prepared
     { preparedRuleIdNames = ruleIdNames,
       preparedKeepTimeVariables = prepared.preparedKeepTimeVariables || M.size ruleIdNames > 1
@@ -450,7 +460,7 @@ annotatePreparedFormula useOriginRuleIds ruleIdEvents prepared =
   where
     formula = prepared.preparedFormula
     ruleIdNames
-      | prepared.preparedHadTimepointSplit && useOriginRuleIds =
+      | prepared.preparedHadTimepointSplit && strategy == OriginRuleIds =
           ridOccurrenceNamesWithOrigins
             ruleIdEvents
             prepared.preparedTimeOrigins
@@ -472,7 +482,7 @@ annotateQueryProperty ruleIdEvents prepared =
       queryFormula
         { preparedQueryBody =
             annotatePreparedFormula
-              queryFormula.preparedQueryUseOriginRuleIds
+              queryFormula.preparedQueryRuleIdStrategy
               ruleIdEvents
               queryFormula.preparedQueryBody
         }
@@ -481,21 +491,25 @@ annotateAxiomProperty :: S.Set String -> PreparedAxiomProperty -> PreparedAxiomP
 annotateAxiomProperty ruleIdEvents prepared =
   prepared
     { preparedAxiomFormulas =
-        fmap (annotatePreparedFormula False ruleIdEvents) prepared.preparedAxiomFormulas
+        fmap (annotatePreparedFormula SharedRuleIdWhenSingle ruleIdEvents) prepared.preparedAxiomFormulas
     }
 
 annotateRestrictionProperty :: S.Set String -> PreparedRestrictionProperty -> PreparedRestrictionProperty
 annotateRestrictionProperty ruleIdEvents prepared =
   prepared
     { preparedRestrictionFormulas =
-        fmap (annotatePreparedFormula False ruleIdEvents) prepared.preparedRestrictionFormulas
+        fmap (annotatePreparedFormula SharedRuleIdWhenSingle ruleIdEvents) prepared.preparedRestrictionFormulas
     }
 
 preparedFormulaRuleIdEvents :: PreparedFormula -> S.Set String
 preparedFormulaRuleIdEvents prepared =
   formulaRuleIdEventsWithOrigins prepared.preparedTimeOrigins prepared.preparedFormula
 
-supportsUniversalFormula :: MonadFresh m => Bool -> LNFormula -> m Bool
+-- | Whether an existential conclusion is allowed in the checked fragment.
+data ConclusionFragment = AllowExistentialConclusion | ForbidExistentialConclusion
+  deriving (Eq, Ord, Show)
+
+supportsUniversalFormula :: MonadFresh m => ConclusionFragment -> LNFormula -> m Bool
 supportsUniversalFormula _ body
   | isQuantifierFree body = pure True
 supportsUniversalFormula _ (Conn Imp premise conclusion)
@@ -504,9 +518,9 @@ supportsUniversalFormula _ (Conn Imp premise conclusion)
       if existentialDisjunction
         then pure True
         else isNestedImplicationOk conclusion
-supportsUniversalFormula True quantified@(Qua Ex _ _) = do
+supportsUniversalFormula AllowExistentialConclusion quantified@(Qua Ex _ _) = do
   (_, _, body) <- openFormulaPrefix quantified
-  supportsUniversalFormula True body
+  supportsUniversalFormula AllowExistentialConclusion body
 supportsUniversalFormula _ _ = pure False
 
 supportsQueryFormula :: LNFormula -> Bool
@@ -521,7 +535,7 @@ supportsQueryFormula formula =
       pure (isQuantifierFree body)
     go fm@(Qua All _ _) = do
       (_, _, body) <- openFormulaPrefix fm
-      supportsUniversalFormula True body
+      supportsUniversalFormula AllowExistentialConclusion body
     go _ = pure False
 
 supportsAssumptionFormula :: LNFormula -> Bool
@@ -539,7 +553,7 @@ supportsAssumptionFormula formula
       pure (isQuantifierFree body)
     go fm@(Qua All _ _) = do
       (_, _, body) <- openFormulaPrefix fm
-      supportsUniversalFormula False body
+      supportsUniversalFormula ForbidExistentialConclusion body
     go _ = pure False
 
 hasNestedImplicationInConclusion :: LNFormula -> Bool
