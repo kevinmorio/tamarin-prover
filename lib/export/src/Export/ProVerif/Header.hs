@@ -7,6 +7,7 @@ module Export.ProVerif.Header
     filterHeaders,
     getProVerifHeaderIdentifier,
     checkDuplicates',
+    finalizeHeaders,
   )
 where
 
@@ -187,3 +188,8 @@ attribHeaders context headers = symbols ++ functions ++ equations
       | Type {} <- header = (equationDocs, functionDocs, renderHeader header : symbolDocs)
       where
         (equationDocs, functionDocs, symbolDocs) = splitHeaders rest
+
+-- | Deduplicate, filter, and validate the collected headers.
+finalizeHeaders :: Set.Set ProVerifHeader -> [Set.Set ProVerifHeader] -> IO [ProVerifHeader]
+finalizeHeaders theoryHeaders translationHeaders =
+  checkDuplicates' (filterHeaders (Set.unions (theoryHeaders : translationHeaders)))

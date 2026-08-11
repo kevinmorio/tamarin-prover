@@ -25,7 +25,7 @@ prettyDeepSecTheory replicationLimit thy =
       map (text . (._eText)) (lookupExportInfo "requests" thy)
     (macroProcesses, macroHeaders) = loadMacroProc renderSapicFormula context thy
     (equivalenceLemmas, equivalenceHeaders, _, _) = loadEquivProc renderSapicFormula context thy
-    comments = [text "(*" $$ text body $$ text "*)" | (_, body) <- theoryFormalComments thy]
+    comments = formalCommentDocs thy
     diagnostics = collectBuiltinDiagnostics thy
 
 deepSecTemplate :: (Document d) => [d] -> [d] -> [d] -> [d] -> [d] -> d

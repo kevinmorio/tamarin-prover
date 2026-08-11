@@ -1,7 +1,9 @@
 -- |
 -- Backend-neutral SAPIC export context shared by target renderers.
 module Export.Sapic
-  ( headerOfFunSym,
+  ( ensureAttackerContext,
+    formalCommentDocs,
+    headerOfFunSym,
     loadDiffProc,
     loadEquivProc,
     loadHeaders,
@@ -15,7 +17,6 @@ where
 
 import Control.Monad.Fresh
 import Data.ByteString.Char8 qualified as BC
-import Data.Char
 import Data.List as List
 import Data.Map qualified as M
 import Data.Maybe
@@ -217,20 +218,15 @@ ppAction ProcessAnnotation {pureState = True, isStateChannel = Just _} tc (New v
   )
 ppAction _ TranslationContext {trans} Rep | trans == ProVerif = (text "!", S.empty, False)
 ppAction _ TranslationContext {trans = DeepSec} Rep = (text "", S.empty, False)
-ppAction _ tc@TranslationContext {trans = ProVerif} (ChIn t1 t2 mvars) =
-  ( text "in(" <> pt1 <> text "," <> pt2 <> text ")",
-    sh1 `S.union` sh2,
-    True
-  )
+ppAction _ tc (ChIn t1 t2 mvars)
+  | trans tc == ProVerif || isPlainVar t2 =
+      ( text "in(" <> pt1 <> text "," <> pt2 <> text ")",
+        sh1 `S.union` sh2,
+        True
+      )
   where
-    (pt1, sh1) = getAttackerChannel tc t1
-    (pt2, sh2) = renderSapicTermWithPattern tc (S.map toLVar mvars) True t2
-ppAction _ tc@TranslationContext {trans = DeepSec} (ChIn t1 t2@(LIT (Var (SapicLVar _ _))) mvars) =
-  ( text "in(" <> pt1 <> text "," <> pt2 <> text ")",
-    sh1 `S.union` sh2,
-    True
-  )
-  where
+    isPlainVar (LIT (Var (SapicLVar _ _))) = True
+    isPlainVar _ = False
     (pt1, sh1) = getAttackerChannel tc t1
     (pt2, sh2) = renderSapicTermWithPattern tc (S.map toLVar mvars) True t2
 
@@ -595,21 +591,42 @@ addAttackerReportProc renderFormula tc thy p =
 -- Main printer for processes
 ------------------------------------------------------------------------------
 
+-- | Annotate and render one top-level process together with its attacker
+-- context, returning the extended context, the rendered process, the
+-- collected headers, and the (bound, unbound) state usage.
+loadSingleProc :: (LNFormula -> Doc) -> TranslationContext -> OpenTheory -> PlainProcess -> (TranslationContext, Doc, S.Set ProVerifHeader, (Bool, Bool))
+loadSingleProc renderFormula tc thy pr =
+  let (d, headers) = ppSapic renderFormula tc2 p
+   in (tc2, d, S.union hd headers, hasStates)
+  where
+    p = makeAnnotations thy pr
+    hasStates = hasBoundUnboundStates p
+    (tc2, hd) = mkAttackerContext tc {hasBoundStates = fst hasStates, hasUnboundStates = snd hasStates} p
+
 loadProc :: (LNFormula -> Doc) -> TranslationContext -> OpenTheory -> (Doc, S.Set ProVerifHeader, Bool, Bool)
 loadProc renderFormula tc thy = case theoryProcesses thy of
   [] -> (text "", S.empty, False, False)
   [pr] ->
-    let (d, headers) = ppSapic renderFormula tc2 p
-        finald =
-          if isNothing (List.find (== "locations-report") (theoryBuiltins thy))
-            then d
-            else addAttackerReportProc renderFormula tc2 thy d
-     in (finald, S.union hd headers, fst hasStates, snd hasStates)
-    where
-      p = makeAnnotations thy pr
-      hasStates = hasBoundUnboundStates p
-      (tc2, hd) = mkAttackerContext tc {hasBoundStates = fst hasStates, hasUnboundStates = snd hasStates} p
+    let (tc2, d, headers, hasStates) = loadSingleProc renderFormula tc thy pr
+        finald
+          | isNothing (List.find (== "locations-report") (theoryBuiltins thy)) = d
+          | otherwise = addAttackerReportProc renderFormula tc2 thy d
+     in (finald, headers, fst hasStates, snd hasStates)
   _ -> translationFail "Multiple sapic processes were defined."
+
+-- | Set up the attacker channel if it does not already exist.
+ensureAttackerContext ::
+  TranslationContext ->
+  LProcess (ProcessAnnotation LVar) ->
+  (TranslationContext, S.Set ProVerifHeader)
+ensureAttackerContext tc proc = case attackerChannel tc of
+  Nothing -> mkAttackerContext tc proc
+  Just _ -> (tc, S.empty)
+
+-- | Render the theory's formal comments as target comments.
+formalCommentDocs :: OpenTheory -> [Doc]
+formalCommentDocs thy =
+  [text "(*" $$ text body $$ text "*)" | (_, body) <- theoryFormalComments thy]
 
 loadMacroProc :: (LNFormula -> Doc) -> TranslationContext -> OpenTheory -> ([Doc], S.Set ProVerifHeader)
 loadMacroProc renderFormula tc thy = loadMacroProcs renderFormula tc thy (theoryProcessDefs thy)
@@ -637,22 +654,15 @@ loadMacroProcs renderFormula tc thy (p : q) =
     mainProc = makeAnnotations thy p._pBody
     extractType (SapicLVar _ ty) = ty
     hasStates = hasBoundUnboundStates mainProc
-    (tc2, hd) = case attackerChannel tc of
-      -- we set up the attacker channel if it does not already exists
-      Nothing -> mkAttackerContext tc mainProc
-      Just _ -> (tc, S.empty)
+    (tc2, hd) = ensureAttackerContext tc mainProc
     tc3 = tc2 {hasBoundStates = fst hasStates, hasUnboundStates = snd hasStates}
 
 loadDiffProc :: (LNFormula -> Doc) -> TranslationContext -> OpenTheory -> ([Doc], S.Set ProVerifHeader, Bool, Bool)
 loadDiffProc renderFormula tc thy = case theoryDiffEquivLemmas thy of
   [] -> ([], S.empty, False, False)
   [pr] ->
-    let (d, headers) = ppSapic renderFormula tc2 p
-     in ([text "process" $$ nest 4 d], S.union hd headers, fst hasStates, snd hasStates)
-    where
-      p = makeAnnotations thy pr
-      hasStates = hasBoundUnboundStates p
-      (tc2, hd) = mkAttackerContext tc {hasBoundStates = fst hasStates, hasUnboundStates = snd hasStates} p
+    let (_, d, headers, hasStates) = loadSingleProc renderFormula tc thy pr
+     in ([text "process" $$ nest 4 d], headers, fst hasStates, snd hasStates)
   _ -> translationFail "Multiple sapic processes were defined."
 
 loadEquivProc :: (LNFormula -> Doc) -> TranslationContext -> OpenTheory -> ([Doc], S.Set ProVerifHeader, Bool, Bool)
@@ -692,10 +702,7 @@ loadEquivProcs renderFormula tc thy ((p1, p2) : q) =
     hasStates2 = hasBoundUnboundStates mainProc2
     hasBoundSt = fst hasStates1 || fst hasStates2
     hasUnboundSt = snd hasStates1 || snd hasStates2
-    (tc2, hd) = case attackerChannel tc of
-      -- we set up the attacker channel if it does not already exists
-      Nothing -> mkAttackerContext tc mainProc2
-      Just _ -> (tc, S.empty)
+    (tc2, hd) = ensureAttackerContext tc mainProc2
     tc3 = tc2 {hasBoundStates = hasBoundSt, hasUnboundStates = snd hasStates1 || snd hasStates2}
 
 headersOfType :: [SapicType] -> S.Set ProVerifHeader

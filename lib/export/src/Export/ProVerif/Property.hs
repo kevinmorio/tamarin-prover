@@ -16,6 +16,7 @@ module Export.ProVerif.Property
     annotateQueryProperty,
     annotateRestrictionProperty,
     mapPropertyOutcome,
+    planOutcome,
     preparedFormulaRuleIdEvents,
     prepareProperty,
   )
@@ -90,6 +91,11 @@ data PropertyRole prepared where
   QueryProperty :: Lemma ProofSkeleton -> PropertyRole PreparedQueryProperty
   AxiomProperty :: Lemma ProofSkeleton -> PropertyRole PreparedAxiomProperty
   RestrictionProperty :: Restriction -> PropertyRole PreparedRestrictionProperty
+
+-- | The prepared outcome recorded for a property name; entries absent from
+-- the plan are explicitly excluded properties.
+planOutcome :: String -> [(String, PropertyOutcome a)] -> PropertyOutcome a
+planOutcome name plans = fromMaybe PropertyExcluded (lookup name plans)
 
 prepareProperty :: String -> TypingEnvironment -> PropertyRole prepared -> PropertyOutcome prepared
 prepareProperty completionEvent typeEnvironment = \case

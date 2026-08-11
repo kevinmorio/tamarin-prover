@@ -6,7 +6,7 @@ import Data.List (intersperse)
 import Data.Set qualified as Set
 import Export.Diagnostic
 import Export.ProVerif (loadQueries)
-import Export.ProVerif.Header (attribHeaders, checkDuplicates', filterHeaders, stateHeaders)
+import Export.ProVerif.Header (attribHeaders, finalizeHeaders, stateHeaders)
 import Export.ProVerif.Render (renderSapicFormula)
 import Export.Sapic
 import Export.Types
@@ -26,7 +26,7 @@ prettyProVerifEquivTheory (thy, typeEnvironment) =
             diffEquivalenceHeaders,
             macroHeaders
           ]
-    headers <- checkDuplicates' $ filterHeaders $ Set.unions $ theoryHeaders : translationHeaders
+    headers <- finalizeHeaders theoryHeaders translationHeaders
     processes <- finalProcesses
     pure $
       proVerifEquivalenceTemplate
@@ -52,7 +52,7 @@ prettyProVerifEquivTheory (thy, typeEnvironment) =
     (macroProcesses, macroHeaders)
       | hasBoundState = ([text ""], Set.empty)
       | otherwise = loadMacroProc renderSapicFormula context thy
-    comments = [text "(*" $$ text body $$ text "*)" | (_, body) <- theoryFormalComments thy]
+    comments = formalCommentDocs thy
     diagnostics = collectBuiltinDiagnostics thy <> collectTypingDiagnostics typeEnvironment
 
 proVerifEquivalenceTemplate :: (Document d) => [d] -> [d] -> [d] -> [d] -> [d] -> d

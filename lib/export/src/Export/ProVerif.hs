@@ -84,7 +84,7 @@ prettyProVerifTheory m options lemSel (thy', typEnv) =
             lemmaHeaders, -- headers from the lemmas
             restrictionHeaders -- headers from the restrictions
           ]
-    headers <- checkDuplicates' $ filterHeaders $ S.unions $ headersTheory : headersTranslation
+    headers <- finalizeHeaders headersTheory headersTranslation
     let hd = attribHeaders tc headers
     pure $ proverifTemplate (skipPrecise tc) hd queries proc' macroproc ruleproc restrictions axioms lemmas comments
   where
@@ -209,7 +209,7 @@ prettyProVerifTheory m options lemSel (thy', typEnv) =
     (macroproc, macroprochd) =
       -- if stateM is not empty, we have inlined the process calls, so we don't reoutput them
       if hasBoundState then ([text ""], S.empty) else loadMacroProc renderSapicFormula tc thy
-    comments = [text "(*" $$ text bd $$ text "*)" | (_, bd) <- theoryFormalComments thy]
+    comments = formalCommentDocs thy
     diagnostics =
       collectProVerifDiagnostics hasSpecificLemmas lemSel tc preparedQueryPlans preparedAxiomPlans preparedRestrictionPlans thy
         <> collectTypingDiagnostics typEnv
@@ -381,7 +381,7 @@ loadLemmas preparedQueryPlans preparedAxiomPlans sharedEventTags hasSpecificLemm
           sharedEventTags
           te
           lemma
-          (fromMaybe PropertyExcluded (lookup lemma._lName preparedAxiomPlans))
+          (planOutcome lemma._lName preparedAxiomPlans)
       | lemma <- axiomsLemmas
       ]
 
@@ -391,7 +391,7 @@ loadLemmas preparedQueryPlans preparedAxiomPlans sharedEventTags hasSpecificLemm
           sharedEventTags
           te
           lemma
-          (fromMaybe PropertyExcluded (lookup lemma._lName preparedQueryPlans))
+          (planOutcome lemma._lName preparedQueryPlans)
       | lemma <- queryLemmas
       ]
 
@@ -470,7 +470,7 @@ loadRestrictions sharedEventTags te preparedRestrictionPlans thy =
             sharedEventTags
             te
             restriction
-            (fromMaybe PropertyExcluded (lookup restriction._rstrName preparedRestrictionPlans))
+            (planOutcome restriction._rstrName preparedRestrictionPlans)
         | restriction <- rs
         ]
       allFacts =

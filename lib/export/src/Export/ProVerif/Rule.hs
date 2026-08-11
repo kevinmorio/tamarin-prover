@@ -242,13 +242,11 @@ makeHeadersFromProtoRule ruleIdEvents ru thy = S.unions [freeHeaders, tables, ev
     events = makeEventHeaders ruleIdEvents (notDiffRuleActs ru)
 
 makeFreeHeaders :: [LNFact] -> [LNFact] -> [LNFact] -> OpenTheory -> S.Set ProVerifHeader
-makeFreeHeaders rprems racts rconcls thy = headers
+makeFreeHeaders rprems racts rconcls thy =
+  makeFreeHeadersFromFacts rprems racts rconcls
+    `S.union` S.map (\x -> Sym "free" x ":bitstring" []) lemmaBitstrings
   where
-    termBitstrings = freeBitstringsFromFacts rprems racts rconcls
-    lemmas = (._lFormula) <$> theoryLemmas thy
-    lemmaBitstrings = foldMap searchLemmaForBitstrings lemmas
-    bitstrings = termBitstrings `S.union` lemmaBitstrings
-    headers = S.map (\x -> Sym "free" x ":bitstring" []) bitstrings
+    lemmaBitstrings = foldMap (searchLemmaForBitstrings . (._lFormula)) (theoryLemmas thy)
 
 makeFreeHeadersFromFacts :: [LNFact] -> [LNFact] -> [LNFact] -> S.Set ProVerifHeader
 makeFreeHeadersFromFacts rprems racts rconcls =
@@ -682,7 +680,7 @@ showFactName tag =
     else 't' : factTagName tag
 
 showEventName :: FactTag -> String
-showEventName tag = 'e' : factTagName tag
+showEventName = showEventNameFromName . factTagName
 
 translateTerm :: (Document d, Show l) => S.Set String -> Bool -> Term l -> d
 translateTerm vars checkEq t = text $ printTerm True vars checkEq t
