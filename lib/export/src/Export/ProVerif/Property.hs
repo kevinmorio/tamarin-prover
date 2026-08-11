@@ -2,7 +2,24 @@
 
 -- |
 -- Explicit semantic outcomes and prepared values for ProVerif properties.
-module Export.ProVerif.Property where
+module Export.ProVerif.Property
+  ( PreparedAxiomProperty (..),
+    PreparedFormula (..),
+    PreparedQueryFormula (..),
+    PreparedQueryProperty (..),
+    PreparedRestrictionProperty (..),
+    PropertyOutcome (..),
+    PropertyRole (..),
+    QueryPolarity (..),
+    QueryRecombination (..),
+    annotateAxiomProperty,
+    annotateQueryProperty,
+    annotateRestrictionProperty,
+    mapPropertyOutcome,
+    preparedFormulaRuleIdEvents,
+    prepareProperty,
+  )
+where
 
 import Control.Applicative ((<|>))
 import Control.Monad.Fresh (MonadFresh)

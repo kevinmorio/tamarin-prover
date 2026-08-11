@@ -1,6 +1,50 @@
 -- |
 -- Pure ProVerif formula normalization, fragment checks, and transformations.
-module Export.ProVerif.Formula where
+module Export.ProVerif.Formula
+  ( allImplExLessWoTmps,
+    applyRewriteForShape,
+    assumptionKnowledgeFragmentFailure,
+    buildConjunction,
+    classifyFormulaShape,
+    collectActionsWithTimepoints,
+    collectTemporalEqKeyPairs,
+    countQuantifierAlternations,
+    eliminateTemporalEqualities,
+    eventsSharingTimepoints,
+    expandNegatedTimepointComparisons,
+    flattenNestedImplications,
+    formulaContainsAction,
+    formulaContainsKUFact,
+    formulaHasSharedTimepoints,
+    hasNegatedEventInFormula,
+    hasNestedImplicationInConjunction,
+    hasVariableCaptureInNestedImplication,
+    isAllImpliesExists,
+    isExistentialDisjunction,
+    isExistsWithNegatedExistentials,
+    isKnowledgeFact,
+    isNegatedExistsWithConjunction,
+    isNestedImplicationOk,
+    isQuantifierFree,
+    isSimpleNegatedAction,
+    isSupportedPositivePremise,
+    makeBinderHintsGloballyUnique,
+    mapLits,
+    mapTopLevelConjunctsFormula,
+    moveConstraintsToConclusion,
+    moveNegatedActionsToConclusion,
+    normalizeAllTraceFormula,
+    pullNegationsToTop,
+    queryKnowledgeFragmentFailure,
+    rewrapBoundPrefix,
+    rewriteEventFreeExistsTrace,
+    rewriteFormulaForAxiomWithDiagnostic,
+    rewriteFormulaForQuery,
+    rewritePositiveWitnessExistsTrace,
+    splitTopLevel,
+    universalNegationAsExists,
+  )
+where
 
 import Control.Monad.Fresh
 import Control.Monad.Trans.PreciseFresh qualified as Precise

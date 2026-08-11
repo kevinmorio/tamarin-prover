@@ -1,6 +1,17 @@
 -- |
 -- Backend-neutral SAPIC export context shared by target renderers.
-module Export.Sapic where
+module Export.Sapic
+  ( headerOfFunSym,
+    loadDiffProc,
+    loadEquivProc,
+    loadHeaders,
+    loadMacroProc,
+    loadProc,
+    ppLNTerm,
+    ppLVar,
+    ppType,
+  )
+where
 
 import Control.Monad.Fresh
 import Data.ByteString.Char8 qualified as BC

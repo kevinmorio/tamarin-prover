@@ -1,6 +1,19 @@
 -- |
 -- ProVerif instrumentation planning, timepoint provenance, and target-name allocation.
-module Export.ProVerif.Instrumentation where
+module Export.ProVerif.Instrumentation
+  ( InstrumentationPlan (..),
+    collectEventTimeVars,
+    formulaRuleIdEventsWithOrigins,
+    formulaUsesRuleIdEvents,
+    guardSameActionConclusions,
+    instrumentationPropertyEvents,
+    makeTimeVarsDistinct,
+    makeTimeVarsDistinctWithOrigins,
+    ridOccurrenceNames,
+    ridOccurrenceNamesWithOrigins,
+    ridOccurrenceNamesWithOriginsPreservingSingle,
+  )
+where
 
 import Data.List as List
 import Data.Map qualified as M

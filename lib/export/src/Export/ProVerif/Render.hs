@@ -1,6 +1,12 @@
 -- |
 -- Checked rendering modes shared by ProVerif property printers.
-module Export.ProVerif.Render where
+module Export.ProVerif.Render
+  ( ppAxiomLemma,
+    ppLemma,
+    ppRestr,
+    renderSapicFormula,
+  )
+where
 
 import Control.Monad.Fresh
 import Control.Monad.Trans.PreciseFresh qualified as Precise
