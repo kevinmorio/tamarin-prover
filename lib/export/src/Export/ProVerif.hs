@@ -298,7 +298,10 @@ collectProVerifDiagnostics hasSpecificLemmas lemSel tc preparedQueryPlans prepar
               "PV-AXIOM-OMITTED"
               ChangedAssumptions
               (AxiomSubject lemma._lName)
-              ("was not emitted: " ++ reason)
+              ( "was not emitted; this may affect proof search but does not"
+                  ++ " make the trace model incomplete: "
+                  ++ reason
+              )
           ]
         Just (PropertyEmitted prepared) ->
           case prepared.preparedAxiomApproximation of
@@ -323,7 +326,9 @@ collectProVerifDiagnostics hasSpecificLemmas lemSel tc preparedQueryPlans prepar
                 "PV-RESTRICTION-OMITTED"
                 ChangedAssumptions
                 (RestrictionSubject restriction._rstrName)
-                ("was not emitted: " ++ reason)
+                ( "was not emitted; the translated trace model is incomplete: "
+                    ++ reason
+                )
             )
         Just (PropertyEmitted prepared) ->
           ExportDiagnostic

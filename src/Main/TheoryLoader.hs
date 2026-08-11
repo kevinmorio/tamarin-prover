@@ -834,17 +834,22 @@ prettyOpenTheoryByModule version report thyOpts thy = case thyOpts.outputModule 
       Right exportResult -> do
         let exportWarnings = Export.diagnosticsToWfReport exportResult.exportDiagnostics
             combinedReport = report ++ exportWarnings
-            baseDocument =
-              exportResult.exportDocument
-                Pretty.$--$ targetComment (wellformednessDoc report)
-                Pretty.$--$ targetComment (Pretty.text version)
             diagnosticDocument = Export.renderExportDiagnostics exportResult.exportDiagnostics
+            -- The source wellformedness block may only claim success when the
+            -- export diagnostics are also clean; when only export diagnostics
+            -- exist, their own warning banner carries the verdict. The
+            -- version trailer always comes last so that stripping it never
+            -- removes a diagnostic.
+            reportBlocks =
+              [wellformednessDoc report | not (null report) || null combinedReport]
+                ++ [diagnosticDocument | not (Pretty.isEmpty diagnosticDocument)]
         when (thyOpts.quitOnWarning && not (null combinedReport))
           (throwError $ WarningError combinedReport)
         pure $
-          if Pretty.isEmpty diagnosticDocument
-            then baseDocument
-            else baseDocument Pretty.$--$ targetComment diagnosticDocument
+          foldl
+            (\docAcc block -> docAcc Pretty.$--$ targetComment block)
+            exportResult.exportDocument
+            (reportBlocks ++ [Pretty.text version])
     targetComment document = Pretty.text "(*" Pretty.$$ document Pretty.$$ Pretty.text "*)"
     wellformednessDoc rep
       | null rep = Pretty.text "All wellformedness checks were successful."
