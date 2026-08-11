@@ -160,6 +160,11 @@ require_pattern '^event eRuleCompleted_1\(bitstring\)\.$' "$refactoring_completi
 require_pattern 'event eRuleCompleted\(x\);' "$refactoring_completion"
 require_pattern 'event eRuleCompleted_1\(rid_rUserCompletion\)\.' "$refactoring_completion"
 
+induction="$tmp_dir/induction.pv"
+export_lemma induction_composite "$induction"
+require_pattern '==> \(event\(eFirst\( x \)\)@j' "$induction"
+require_pattern '\)\[induction\]\.$' "$induction"
+
 equivalence="$tmp_dir/equivalence.pv"
 "$tamarin" -d=0 -m=proverifequiv "-o=$equivalence" "$equivalence_model" >/dev/null
 require_pattern '^equivalence$' "$equivalence"
@@ -179,6 +184,7 @@ if command -v proverif >/dev/null 2>&1; then
   proverif -parse-only "$refactoring_collision" >/dev/null
   proverif -parse-only "$refactoring_query_collision" >/dev/null
   proverif -parse-only "$refactoring_completion" >/dev/null
+  proverif -parse-only "$induction" >/dev/null
   proverif -parse-only "$equivalence" >/dev/null
 elif [ -n "${CI:-}" ]; then
   echo "proverif is required for export parser validation in CI" >&2

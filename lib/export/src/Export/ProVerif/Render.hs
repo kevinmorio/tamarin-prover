@@ -169,7 +169,7 @@ ppLFormula context ppAt =
 
     printArrow arrow premise conclusion = do
       (vsPremise, (premiseDoc, envPremise)) <- printPremise premise
-      (vsConclusion, (conclusionDoc, envConclusion)) <- printBare conclusion
+      (vsConclusion, (conclusionDoc, envConclusion)) <- printConclusion conclusion
       pure
         ( vsPremise ++ vsConclusion,
           ( sep [premiseDoc, text arrow <> conclusionDoc],
@@ -181,6 +181,20 @@ ppLFormula context ppAt =
     printPremise fm@(Conn Imp _ _) = printParenthesized fm
     printPremise fm@(Conn Iff _ _) = printParenthesized fm
     printPremise fm = printBare fm
+
+    -- A composite implication in conclusion position keeps its parentheses
+    -- as well: ProVerif attaches query attributes such as [induction] to the
+    -- conclusion, so @A ==> (B ==> C)[induction]@ must not lose its grouping.
+    printConclusion fm
+      | conclusionIsImplication fm = case fm of
+          Qua {} -> withParens (printLeaf fm)
+          _ -> printParenthesized fm
+      | otherwise = printBare fm
+
+    conclusionIsImplication (Qua _ _ body) = conclusionIsImplication body
+    conclusionIsImplication (Conn Imp _ _) = True
+    conclusionIsImplication (Conn Iff _ _) = True
+    conclusionIsImplication _ = False
 
     printChain connective operatorText fm = do
       rendered <- mapM printOperand (flattenSame connective fm)
