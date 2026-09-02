@@ -74,6 +74,15 @@ if grep -Eq 'event\(eFirst\( ([[:alnum:]_]+) \)\).*event\(eSecond\( \1 \)\)' "$s
   exit 1
 fi
 
+mixed_quantifiers="$tmp_dir/mixed-quantifier-negated-disjunct.pv"
+export_lemma mixed_quantifier_negated_disjunct "$mixed_quantifiers"
+require_pattern 'Lemma translation failed: formula has 2 quantifier alternations; ProVerif supports at most one' "$mixed_quantifiers"
+require_pattern 'Lemma `mixed_quantifier_negated_disjunct`: produced no ProVerif query.*\[PV-GOAL-OMITTED\]' "$mixed_quantifiers"
+if grep -q '^query ' "$mixed_quantifiers"; then
+  echo "mixed existential/universal negated disjunct produced an unsound query" >&2
+  exit 1
+fi
+
 restriction="$tmp_dir/restriction.pv"
 "$tamarin" -d=0 -m=proverif --lemma=no_link_chain "-o=$restriction" "$restriction_model" >/dev/null
 if [ "$(grep -c '==> false\.' "$restriction")" -ne 2 ]; then
@@ -189,6 +198,7 @@ if command -v proverif >/dev/null 2>&1; then
   proverif -parse-only "$tautology" >/dev/null
   proverif -parse-only "$temporal" >/dev/null
   proverif -parse-only "$shadowed" >/dev/null
+  proverif -parse-only "$mixed_quantifiers" >/dev/null
   proverif -parse-only "$restriction" >/dev/null
   proverif -parse-only "$knowledge_supported" >/dev/null
   proverif -parse-only "$refactoring_collision" >/dev/null

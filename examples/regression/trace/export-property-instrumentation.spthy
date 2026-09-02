@@ -39,4 +39,10 @@ lemma independent_shadowed_binders:
       & (Ex x #j. Second(x) @ j)
       & not (Ex #l. Consequence(z) @ l))"
 
+lemma mixed_quantifier_negated_disjunct:
+  "All z #k. Trigger(z) @ k ==>
+      (not (Ex x #i. First(x) @ i
+          & (All y #j. Second(y) @ j ==> Consequence(y) @ j)))
+      | Consequence(z) @ k"
+
 end

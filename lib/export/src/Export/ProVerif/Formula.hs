@@ -1318,12 +1318,10 @@ isAllImpliesExists (Qua All _ body) = isAllImpliesExists body
 isAllImpliesExists f@(Conn Imp p q) = isQuantifierFree f || (isQuantifierFree p && hasOnlyExistentials q)
   where
     hasOnlyExistentials (Qua Ex _ body') = isQuantifierFree body' || hasOnlyExistentials body'
-    hasOnlyExistentials (Conn Or (Qua Ex _ b1) (Qua Ex _ b2)) = isQuantifierFree b1 || isQuantifierFree b2
-    -- Allow temporal/equality constraints in disjunction with existentials
-    hasOnlyExistentials (Conn Or f1 f2) | isConstraintAtom f1 || isConstraintAtom f2 = hasOnlyExistentials f1 || hasOnlyExistentials f2 || isConstraintAtom f1 || isConstraintAtom f2
+    hasOnlyExistentials (Conn Or f1 f2) =
+      hasOnlyExistentials f1 && hasOnlyExistentials f2
     hasOnlyExistentials fm | isConstraintAtom fm = True
     hasOnlyExistentials _ = False
-    -- Check if a formula is a temporal or equality constraint
 isAllImpliesExists _ = False
 
 -- | All x1..xn. not(F) is equivalent to not(Ex x1..xn. F). Return the inner
@@ -1847,31 +1845,43 @@ expandNegatedTimepointComparisons p = p
 
 -- | Check if a formula is of the form All x1 ... xn. A ==> (not B1) | (not B2) | ... | C1 | C2 | ...
 -- where at least one disjunct is negated
--- IMPORTANT: We exclude formulas that contain equalities in negated disjuncts, as ProVerif doesn't support
--- equality constraints in reachability query premises
+-- Bare negated comparisons remain in the conclusion for later expansion.
+-- Quantified negated disjuncts move only when they have an existential-only
+-- prefix and a supported quantifier-free body.
 isAllImpliesDisjWithNegations :: LNFormula -> Bool
 isAllImpliesDisjWithNegations (Qua All _ body) = isAllImpliesDisjWithNegations body
-isAllImpliesDisjWithNegations (Conn Imp _ concl) = hasNegatedDisjunctWithoutComparison concl
+isAllImpliesDisjWithNegations (Conn Imp _ concl) = hasMovableNegatedDisjunct concl
   where
-    hasNegatedDisjunctWithoutComparison (Conn Or p q) =
-      hasNegatedDisjunctWithoutComparison p || hasNegatedDisjunctWithoutComparison q
-    hasNegatedDisjunctWithoutComparison (Not (Qua Ex _ _)) = True
-    hasNegatedDisjunctWithoutComparison (Not f) = not (containsComparison f)
-    hasNegatedDisjunctWithoutComparison _ = False
+    hasMovableNegatedDisjunct (Conn Or p q) =
+      hasMovableNegatedDisjunct p || hasMovableNegatedDisjunct q
+    hasMovableNegatedDisjunct (Not f) = isMovableNegatedDisjunctBody f
+    hasMovableNegatedDisjunct _ = False
+isAllImpliesDisjWithNegations _ = False
 
-    -- Check if a formula contains comparison constraints (EqE or Less)
-    -- We want to keep negations of comparisons in the conclusion
-    -- Equalities like (x = ch) are represented as Ato (EqE x ch)
-    -- Timepoint comparisons like (#i < #j) are represented as Ato (Less i j)
+-- | A negated disjunct may move to an implication premise when its body is
+-- quantifier-free, or has only a leading existential prefix over a supported
+-- quantifier-free premise. Universals below an existential would change the
+-- witness dependency when the existential is converted to a universal.
+isMovableNegatedDisjunctBody :: LNFormula -> Bool
+isMovableNegatedDisjunctBody formula@(Qua Ex _ _) =
+  maybe False isSupportedPositivePremise (stripExistentialPrefix formula)
+  where
+    stripExistentialPrefix (Qua Ex _ body) = stripExistentialPrefix body
+    stripExistentialPrefix body
+      | isQuantifierFree body = Just body
+      | otherwise = Nothing
+isMovableNegatedDisjunctBody formula =
+  isQuantifierFree formula
+    && isSupportedPositivePremise formula
+    && not (containsComparison formula)
+  where
+    -- Keep negated comparisons in the conclusion; they are expanded later.
     containsComparison (Ato (EqE _ _)) = True
     containsComparison (Ato (Less _ _)) = True
-    containsComparison (Ato (Last _)) = False
-    containsComparison (Ato (Action _ _)) = False
     containsComparison (Qua _ _ body) = containsComparison body
     containsComparison (Conn _ p q) = containsComparison p || containsComparison q
     containsComparison (Not p) = containsComparison p
     containsComparison _ = False
-isAllImpliesDisjWithNegations _ = False
 
 -- | Detect ∀x. (P ⇒ ¬Q₁ ∧ ¬Q₂ ∧ ...) pattern
 -- This pattern needs to be distributed into multiple queries:
@@ -1930,7 +1940,9 @@ moveNegatedDisjunctsToPremise fm = case fm of
       let (negsP, posP) = partitionDisjuncts p
           (negsQ, posQ) = partitionDisjuncts q
        in (negsP ++ negsQ, posP ++ posQ)
-    partitionDisjuncts (Not p) = ([p], [])  -- Remove the Not, add to negated terms
+    partitionDisjuncts negated@(Not p)
+      | isMovableNegatedDisjunctBody p = ([p], [])
+      | otherwise = ([], [negated])
     partitionDisjuncts p = ([], [p])  -- Add to positive terms
 
     -- Pull existential quantifiers from premise conjuncts to top level as universal
