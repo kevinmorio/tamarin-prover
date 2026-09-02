@@ -1076,10 +1076,11 @@ moveNegatedActionsToConclusion fm = case fm of
 --          = All x y. not(P(x) & Q(y)) | (Ex z. R(z))
 --          = All x y. (P(x) & Q(y)) => (Ex z. R(z))
 --
--- The key insight is that we only want to pull UNIVERSAL quantifiers from the disjunction,
--- not existentials. The existentials should stay where they are as separate disjuncts.
--- This is because (Ex r. A) | (Ex r. B) is semantically "there exists r for A OR there exists r for B"
--- while Ex r. (A | B) means "there exists ONE r that makes A OR B true" - different semantics!
+-- Pull only universal quantifiers here. Existential conclusion branches stay
+-- branch-local so the later partitioning and renderer preserve their original
+-- scopes. Over a nonempty term domain, (Ex r. A) | (Ex s. B) is equivalent to
+-- Ex r s. (A | B); keeping the scopes separate is a representation choice,
+-- not a claim that those formulas have different truth conditions.
 transformNotExistsConjToImplication :: LNFormula -> LNFormula
 transformNotExistsConjToImplication fm =
     -- Apply NNF (negation normal form) to push negation inside
@@ -1105,7 +1106,6 @@ transformNotExistsConjToImplication fm =
     pullUniversalsOnly (Conn And (Qua All x p) (Qua All x' q)) | x == x' = Qua All x (pullUniversalsOnly (p .&&. q))
     pullUniversalsOnly (Conn And (Qua All x p) q) = Qua All x (pullUniversalsOnly (p .&&. shiftFreeIndices 1 q))
     pullUniversalsOnly (Conn And p (Qua All x q)) = Qua All x (pullUniversalsOnly (shiftFreeIndices 1 p .&&. q))
-    pullUniversalsOnly (Conn Or (Qua All x p) (Qua All x' q)) | x == x' = Qua All x (pullUniversalsOnly (p .||. q))
     pullUniversalsOnly (Conn Or (Qua All x p) q) = Qua All x (pullUniversalsOnly (p .||. shiftFreeIndices 1 q))
     pullUniversalsOnly (Conn Or p (Qua All x q)) = Qua All x (pullUniversalsOnly (shiftFreeIndices 1 p .||. q))
     -- Don't pull existentials - leave them in place!

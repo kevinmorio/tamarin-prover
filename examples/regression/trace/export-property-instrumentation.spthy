@@ -32,4 +32,11 @@ lemma split_queries_notice:
   "(All x #i. Trigger(x) @ i ==> Consequence(x) @ i)
     & (All y #j. First(y) @ j ==> First(y) @ j)"
 
+lemma independent_shadowed_binders:
+  "not (Ex z #k.
+      Trigger(z) @ k
+      & (Ex x #i. First(x) @ i)
+      & (Ex x #j. Second(x) @ j)
+      & not (Ex #l. Consequence(z) @ l))"
+
 end

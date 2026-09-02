@@ -65,6 +65,15 @@ if grep -q '^WARNING: export omitted or approximated proof-relevant input\.$' "$
   exit 1
 fi
 
+shadowed="$tmp_dir/independent-shadowed-binders.pv"
+export_lemma independent_shadowed_binders "$shadowed"
+require_pattern 'event\(eFirst\( x \)\)' "$shadowed"
+require_pattern 'event\(eSecond\( x_1 \)\)' "$shadowed"
+if grep -Eq 'event\(eFirst\( ([[:alnum:]_]+) \)\).*event\(eSecond\( \1 \)\)' "$shadowed"; then
+  echo "independent universal disjunct binders were conflated" >&2
+  exit 1
+fi
+
 restriction="$tmp_dir/restriction.pv"
 "$tamarin" -d=0 -m=proverif --lemma=no_link_chain "-o=$restriction" "$restriction_model" >/dev/null
 if [ "$(grep -c '==> false\.' "$restriction")" -ne 2 ]; then
@@ -179,6 +188,7 @@ if command -v proverif >/dev/null 2>&1; then
   proverif -parse-only "$completion" >/dev/null
   proverif -parse-only "$tautology" >/dev/null
   proverif -parse-only "$temporal" >/dev/null
+  proverif -parse-only "$shadowed" >/dev/null
   proverif -parse-only "$restriction" >/dev/null
   proverif -parse-only "$knowledge_supported" >/dev/null
   proverif -parse-only "$refactoring_collision" >/dev/null
