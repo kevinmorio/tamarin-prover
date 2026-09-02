@@ -22,9 +22,21 @@ import Export.Name
 import Export.ProVerif.Formula
 import Theory
 
+-- | Theory-wide rule instrumentation needed to preserve relationships between
+-- Tamarin action occurrences when rendering ProVerif correspondence queries.
+-- Events in 'instrumentationRuleIdEvents' receive a fresh identifier for each
+-- rule execution, so occurrences split from the same Tamarin timepoint can
+-- still be correlated. Rules containing an event in
+-- 'instrumentationCompletionTriggers' also emit
+-- 'instrumentationCompletionEvent' after their other actions; this prevents a
+-- conclusion event from satisfying a query before the corresponding rule has
+-- completed.
 data InstrumentationPlan = InstrumentationPlan
-  { instrumentationCompletionEvent :: String,
+  { -- | Internal event name used to mark completion of an instrumented rule.
+    instrumentationCompletionEvent :: String,
+    -- | Source action names whose ProVerif events carry a rule-execution ID.
     instrumentationRuleIdEvents :: S.Set String,
+    -- | Source action names identifying rules that emit the completion event.
     instrumentationCompletionTriggers :: S.Set String
   }
   deriving (Eq, Show)

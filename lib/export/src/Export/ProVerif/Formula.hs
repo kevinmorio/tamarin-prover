@@ -96,45 +96,36 @@ isExistentialKAction formula =
     _ -> False
 
 formulaContainsAction :: LNFormula -> Bool
-formulaContainsAction =
-  foldFormula
-    (\case Action _ _ -> True; _ -> False)
-    (const False)
-    id
-    (\_ left right -> left || right)
-    (\_ _ body -> body)
+formulaContainsAction = not . null . formulaFacts
 
 isSupportedPositivePremise :: LNFormula -> Bool
-isSupportedPositivePremise (Ato (Action _ _)) = True
-isSupportedPositivePremise (Ato (EqE _ _)) = True
-isSupportedPositivePremise (Ato (Less _ _)) = True
-isSupportedPositivePremise (Not (Ato (EqE _ _))) = True
-isSupportedPositivePremise (Not (Ato (Less _ _))) = True
-isSupportedPositivePremise (Conn And left right) =
-  isSupportedPositivePremise left && isSupportedPositivePremise right
-isSupportedPositivePremise (Conn Or left right) =
-  isSupportedPositivePremise left && isSupportedPositivePremise right
-isSupportedPositivePremise (TF True) = True
-isSupportedPositivePremise _ = False
+isSupportedPositivePremise = isSupportedPositiveFormula PositivePremise
 
 -- | Positive formulas accepted in a correspondence conclusion.  Existential
 -- quantifiers are allowed, but positive universals and negated actions are
 -- not part of ProVerif's correspondence fragment.
 isSupportedPositiveConclusion :: LNFormula -> Bool
-isSupportedPositiveConclusion (Qua Ex _ body) =
-  isSupportedPositiveConclusion body
-isSupportedPositiveConclusion (Ato (Action _ _)) = True
-isSupportedPositiveConclusion (Ato (EqE _ _)) = True
-isSupportedPositiveConclusion (Ato (Less _ _)) = True
-isSupportedPositiveConclusion (Not (Ato (EqE _ _))) = True
-isSupportedPositiveConclusion (Not (Ato (Less _ _))) = True
-isSupportedPositiveConclusion (Conn And left right) =
-  isSupportedPositiveConclusion left && isSupportedPositiveConclusion right
-isSupportedPositiveConclusion (Conn Or left right) =
-  isSupportedPositiveConclusion left && isSupportedPositiveConclusion right
-isSupportedPositiveConclusion (TF True) = True
-isSupportedPositiveConclusion (TF False) = True
-isSupportedPositiveConclusion _ = False
+isSupportedPositiveConclusion = isSupportedPositiveFormula PositiveConclusion
+
+data PositiveFormulaPosition
+  = PositivePremise
+  | PositiveConclusion
+
+isSupportedPositiveFormula :: PositiveFormulaPosition -> LNFormula -> Bool
+isSupportedPositiveFormula PositiveConclusion (Qua Ex _ body) =
+  isSupportedPositiveFormula PositiveConclusion body
+isSupportedPositiveFormula _ (Ato (Action _ _)) = True
+isSupportedPositiveFormula _ (Ato (EqE _ _)) = True
+isSupportedPositiveFormula _ (Ato (Less _ _)) = True
+isSupportedPositiveFormula _ (Not (Ato (EqE _ _))) = True
+isSupportedPositiveFormula _ (Not (Ato (Less _ _))) = True
+isSupportedPositiveFormula position (Conn And left right) =
+  isSupportedPositiveFormula position left && isSupportedPositiveFormula position right
+isSupportedPositiveFormula position (Conn Or left right) =
+  isSupportedPositiveFormula position left && isSupportedPositiveFormula position right
+isSupportedPositiveFormula _ (TF True) = True
+isSupportedPositiveFormula PositiveConclusion (TF False) = True
+isSupportedPositiveFormula _ _ = False
 
 -- | Knowledge atoms need separate fragment checks before any query rewriting.
 -- KU is an internal message-deduction annotation and is outside the formal
