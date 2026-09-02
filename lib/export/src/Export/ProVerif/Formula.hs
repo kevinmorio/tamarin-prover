@@ -839,7 +839,10 @@ moveConstraintsToConclusion fm = case fm of
     isConstraint (Not (Ato (EqE _ _))) = True
     isConstraint _ = False
 
-    -- Extract constraints from a formula in the premise
+    -- Extract constraints from the current premise scope. Do not descend
+    -- through quantifiers: moving a constraint that mentions a bound variable
+    -- into the conclusion would either capture a different binder or leave an
+    -- out-of-scope de Bruijn index.
     -- Returns: (list of constraints, formula without constraints)
     extractConstraints :: LNFormula -> ([LNFormula], LNFormula)
     extractConstraints (Conn And p q)
@@ -853,9 +856,6 @@ moveConstraintsToConclusion fm = case fm of
           let (cs1, p') = extractConstraints p
               (cs2, q') = extractConstraints q
           in (cs1 ++ cs2, if null cs1 && null cs2 then Conn And p q else if null cs1 then Conn And p q' else if null cs2 then Conn And p' q else Conn And p' q')
-    extractConstraints (Qua Ex v p) =
-      let (cs, p') = extractConstraints p
-      in (cs, Qua Ex v p')
     extractConstraints f
       | isConstraint f = ([f], TF True)
       | otherwise = ([], f)

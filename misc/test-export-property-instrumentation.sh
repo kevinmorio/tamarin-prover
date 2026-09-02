@@ -8,6 +8,7 @@ restriction_model="$repo_dir/examples/regression/trace/export-restriction-disjun
 knowledge_model="$repo_dir/examples/regression/trace/export-knowledge-fragment.spthy"
 refactoring_model="$repo_dir/examples/regression/trace/export-refactoring-regressions.spthy"
 equivalence_model="$repo_dir/examples/regression/trace/export-backend-characterization.spthy"
+constraint_scope_model="$repo_dir/examples/regression/trace/export-constraint-scope.spthy"
 deepsec_model="$repo_dir/examples/sapic/export/toy-example.spthy"
 tamarin=${TAMARIN:-tamarin-prover}
 tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/tamarin-export-properties.XXXXXX")
@@ -80,6 +81,22 @@ require_pattern 'Lemma translation failed: formula has 2 quantifier alternations
 require_pattern 'Lemma `mixed_quantifier_negated_disjunct`: produced no ProVerif query.*\[PV-GOAL-OMITTED\]' "$mixed_quantifiers"
 if grep -q '^query ' "$mixed_quantifiers"; then
   echo "mixed existential/universal negated disjunct produced an unsound query" >&2
+  exit 1
+fi
+
+constraint_scope="$tmp_dir/existential-constraint-scope.pv"
+export_model_lemma "$constraint_scope_model" existential_constraint_scope "$constraint_scope"
+require_pattern 'Lemma translation failed: formula is outside the supported ProVerif query fragment' "$constraint_scope"
+if grep -q '^query ' "$constraint_scope"; then
+  echo "constraint escaped its existential scope" >&2
+  exit 1
+fi
+
+constraint_scope_reversed="$tmp_dir/existential-constraint-scope-reversed.pv"
+export_model_lemma "$constraint_scope_model" existential_constraint_scope_reversed "$constraint_scope_reversed"
+require_pattern 'Lemma translation failed: formula is outside the supported ProVerif query fragment' "$constraint_scope_reversed"
+if grep -q '^query ' "$constraint_scope_reversed"; then
+  echo "constraint escaped its reversed existential scope" >&2
   exit 1
 fi
 
@@ -199,6 +216,8 @@ if command -v proverif >/dev/null 2>&1; then
   proverif -parse-only "$temporal" >/dev/null
   proverif -parse-only "$shadowed" >/dev/null
   proverif -parse-only "$mixed_quantifiers" >/dev/null
+  proverif -parse-only "$constraint_scope" >/dev/null
+  proverif -parse-only "$constraint_scope_reversed" >/dev/null
   proverif -parse-only "$restriction" >/dev/null
   proverif -parse-only "$knowledge_supported" >/dev/null
   proverif -parse-only "$refactoring_collision" >/dev/null
